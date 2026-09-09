@@ -1,0 +1,24 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / tooling caches
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Charts and CSVs written by run_backtest.py (--outdir, default 'output')
+output/
+
+# OS noise
+.DS_Store
+
+# NOTE: data/*.csv is deliberately TRACKED -- the cached price history is what
+# makes `run_backtest.py --offline` work without a data feed.
