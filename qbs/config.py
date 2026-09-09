@@ -157,6 +157,42 @@ class VixBreakerParams:
 
 
 @dataclass
+class BookVolTargetParams:
+    """Volatility targeting applied to a WHOLE book, on its own realised vol.
+
+    `VolTargetParams` scales a single risk asset by *that asset's* volatility.
+    This scales an entire multi-name portfolio by *the portfolio's own*
+    realised volatility, which is a different and, for a concentrated book,
+    far more useful thing.
+
+    Why it matters for the Top-6 momentum strategy. That book runs at roughly
+    49% annualised volatility with a beta near 1.7 to QQQ: most of its
+    drawdown is leverage, not bad stock selection. Its two worst episodes had
+    completely different causes --
+
+      * a market-wide selloff (VIX 28-45), and
+      * a concentration blow-up with VIX at 16-20, i.e. a calm index,
+
+    -- and no index-level signal can see the second one. A VIX breaker and a
+    `QQQ > SMA(200)` filter both leave that drawdown untouched, because the
+    market was not the thing going wrong. The book's own realised vol rises in
+    BOTH cases, which is why targeting it works on both.
+
+    What this does NOT do is add return: it rescales risk. Sharpe is roughly
+    unchanged; what improves is Calmar, because de-levering cuts drawdown
+    faster than it cuts return. It also cannot help with an overnight gap in a
+    single name -- it manages sustained volatility, not jumps.
+    """
+    target_vol: float = 0.25     # annualised. 0.15 for a genuinely conservative book
+    halflife: int = 20           # EWMA halflife in trading days
+    min_periods: int = 20
+    max_weight: float = 1.0      # 1.0 = de-risk only, never lever the book up
+    rebalance_band: float = 0.05  # only retrade when the scalar moves this far
+    vol_floor: float = 0.05      # guards the divide when the book goes quiet
+    safe_asset: str = SAFE_ASSET  # unallocated weight parks here
+
+
+@dataclass
 class Config:
     tickers: List[str] = field(default_factory=lambda: list(TICKERS))
     backtest_start: str = BACKTEST_START
@@ -170,6 +206,7 @@ class Config:
     vol: VolTargetParams = field(default_factory=VolTargetParams)
     momentum: MomentumParams = field(default_factory=MomentumParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
+    book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -188,6 +225,7 @@ PALETTE = {
     "voltarget": "#1baf7a",   # slot 3 -- aqua
     "momentum":  "#eda100",   # slot 4 -- yellow (low contrast: always direct-labelled)
     "momentum_vix": "#e87ba4",  # slot 5 -- magenta
+    "momentum_vt": "#8a63d2",   # slot 6 -- violet
     "bh_qqq":    "#898781",   # benchmark -- muted
     "bh_boxx":   "#c3c2b7",   # benchmark -- fainter still
     "buy":       "#0ca30c",   # status: good
@@ -208,6 +246,7 @@ STRATEGY_LABELS = {
     "voltarget": "Vol-targeted QQQ",
     "momentum": "Top-6 NDX momentum",
     "momentum_vix": "Top-6 + VIX breaker",
+    "momentum_vt": "Top-6 vol-targeted",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",
 }

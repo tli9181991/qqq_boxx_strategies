@@ -1,6 +1,6 @@
 """qbs -- QQQ/BOXX strategy lab.
 
-Three strategies, one backtest engine, one chart system.
+Six strategies, one backtest engine, one chart system.
 
     from qbs import data, strategies, engine, metrics, plotting
 
@@ -11,13 +11,15 @@ Quick start::
 """
 
 from .config import (
-    Config, GEMParams, RSI2Params, VolTargetParams,
+    BookVolTargetParams, Config, GEMParams, MomentumParams, RSI2Params,
+    VixBreakerParams, VolTargetParams,
     RISK_ASSET, INTL_ASSET, SAFE_ASSET, TICKERS,
     BACKTEST_START, BACKTEST_END, PALETTE, STRATEGY_LABELS,
 )
 
 __all__ = [
-    "Config", "GEMParams", "RSI2Params", "VolTargetParams",
+    "BookVolTargetParams", "Config", "GEMParams", "MomentumParams",
+    "RSI2Params", "VixBreakerParams", "VolTargetParams",
     "RISK_ASSET", "INTL_ASSET", "SAFE_ASSET", "TICKERS",
     "BACKTEST_START", "BACKTEST_END", "PALETTE", "STRATEGY_LABELS",
 ]

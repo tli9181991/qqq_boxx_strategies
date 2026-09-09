@@ -1,6 +1,6 @@
 # QQQ / BOXX strategy lab
 
-Five trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
+Six trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
 that shows you where every signal fired.
 
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
@@ -8,6 +8,7 @@ that shows you where every signal fired.
 - **Volatility-targeting overlay** — scales QQQ exposure so forecast vol sits near target
 - **Top-6 Nasdaq-100 momentum** — cross-sectional 12-1 momentum with a hysteresis band
 - **Top-6 + VIX circuit breaker** — the same book, switched off entirely when VIX spikes
+- **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
 
 Backtest window: **2025-01-20 (inauguration) to today**, one-day execution lag,
 commission and slippage charged separately on turnover.
@@ -179,6 +180,55 @@ volatility — the same device as the momentum rank band, for the same reason.
 forecast risk; this is on/off. They compose — run `vol_target_overlay` on the result
 if you want both.
 
+### 6. Book vol targeting
+
+The drawdown control that works, and the one to reach for before the VIX breaker.
+
+```
+scalar = target_vol / the book's OWN realised vol,  clipped to [0, max_weight]
+```
+
+Every holding is multiplied by that single scalar, so relative position sizes never
+change: this decides *how much* of the strategy you hold, never *which* names. The
+freed weight parks in BOXX.
+
+**Why the book's vol and not VIX or a QQQ trend filter.** The Top-6 book has two
+different kinds of drawdown, and index signals only see one of them:
+
+| Episode | Book DD | VIX then | QQQ then |
+|---|---|---|---|
+| 2025 market selloff | −31% | 28–45 — visible | −22.8% |
+| 2026 concentration blow-up | −30% | **16–20** — invisible | −8.8% |
+
+In the second episode the book lost 7–8% on days QQQ lost about 1%, with VIX *below*
+its own median. Neither a VIX threshold nor `QQQ > SMA(200)` reduces that drawdown at
+all — measured on this sample the SMA(200) gate leaves max drawdown unchanged at
+−34.8% while costing half the return. The market was not what went wrong.
+
+The book's own realised vol rises in **both** cases, which is the whole argument for
+measuring the thing you actually hold. On the cached window, at a 25% target:
+
+| | CAGR | Vol | Sharpe | Max DD | Calmar |
+|---|---|---|---|---|---|
+| Top-6 unscaled | 46.1% | 49.0% | 0.94 | −34.8% | 1.32 |
+| **Top-6 vol-targeted 25%** | **26.4%** | 25.9% | 0.88 | **−18.8%** | **1.40** |
+| Buy & hold QQQ | 22.2% | 22.6% | 0.82 | −22.8% | 0.98 |
+
+Per episode the drawdown falls from −31.4% to −16.6% (the market selloff) and from
+−29.5% to −11.6% (the concentration blow-up).
+
+**It does not add return.** Sharpe is roughly unchanged — what improves is Calmar,
+because de-levering cuts drawdown faster than it cuts return. It lands ahead of QQQ
+only because the underlying book has the higher Sharpe to begin with, so shrinking it
+to QQQ-like volatility keeps some of the edge. It also cannot help with an overnight
+gap in one name: it responds to sustained volatility, not to jumps.
+
+`sweep_target_vol()` and notebook §9f sweep the target; §6f plots the book's vol
+against VIX so you can see the episodes an index signal misses. The dial is expected
+to be *boring* — a kink would mean the overlay is doing more than rescaling.
+
+---
+
 > ⚠️ **Read the default 17/16 as a warning, not a recommendation.** VIX's long-run
 > median sits near 17–18, so a trigger at 17 fires on ordinary conditions rather than
 > on stress: the breaker is engaged roughly half the time, which makes it a
@@ -200,14 +250,16 @@ qbs/
   data.py         yfinance download + CSV cache + synthetic market and VIX generators
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
-  strategies.py   the five strategies -> target weights + diagnostics + events
+  strategies.py   the six strategies -> target weights + diagnostics + events
   engine.py       one backtest function: lag, commission, slippage, equity curve
   metrics.py      CAGR, Sharpe/Sortino vs BOXX, drawdown, turnover, trade log
   plotting.py     the chart system
-  pipeline.py     load -> signals -> backtest in one call; sweep_band(), sweep_vix()
+  pipeline.py     load -> signals -> backtest in one call; sweep_band(),
+                  sweep_vix(), sweep_target_vol()
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
-tests/test_qbs.py 43 tests: indicators, engine, momentum and circuit-breaker invariants
+tests/test_qbs.py 52 tests: indicators, engine, momentum, circuit-breaker and
+                  vol-target invariants (including a shuffled-future look-ahead test)
 ```
 
 ### The one convention that matters
@@ -223,7 +275,8 @@ look-ahead would have been worth.
 ## Using it
 
 ```python
-from qbs.config import Config, MomentumParams, RSI2Params, VolTargetParams
+from qbs.config import (BookVolTargetParams, Config, MomentumParams,
+                        RSI2Params, VolTargetParams)
 from qbs.pipeline import run, sweep_band
 
 cfg = Config()
@@ -233,6 +286,7 @@ cfg.vol = VolTargetParams(target_vol=0.12, max_weight=1.5)   # allow gearing
 cfg.rsi2 = RSI2Params(entry_threshold=10)                    # trade more often
 cfg.momentum = MomentumParams(n_hold=8, exit_rank=20,        # wider band, less churn
                               rebalance="ME")                # monthly instead of daily
+cfg.book_vol = BookVolTargetParams(target_vol=0.15)          # a calmer momentum book
 
 lab = run(cfg)
 lab.summary_pretty
@@ -246,7 +300,7 @@ python run_backtest.py --sweep-vix --vix-exit 25    # where should the VIX trigg
 python tests/test_qbs.py
 ```
 
-Adding a sixth strategy means writing a function that returns a `StrategySignals`
+Adding a seventh strategy means writing a function that returns a `StrategySignals`
 and adding it to `pipeline.build_signals`. Everything downstream — engine, metrics,
 charts — works on it unchanged.
 
@@ -278,6 +332,10 @@ charts — works on it unchanged.
   overnight on an earnings miss. A sixth of the book in each name means a 5% portfolio
   hit from a single print, and a daily-rebalanced system cannot dodge it. Resting GTC
   stops at the broker are the mitigation, and they live outside this backtest.
+  The vol-target overlay is only a partial answer — it sizes the book down as its risk
+  rises, but it manages sustained volatility rather than gaps, and it does not
+  diversify. As of the last cached run all six holdings were semiconductors, and
+  nothing in the ranker prevents that.
 - **Short-term capital gains.** At the turnover the band sweep reports, a taxable
   account converts most of the return into income-taxed short-term gains. Compare the
   after-tax number with simply holding QQQ before concluding anything.

@@ -731,6 +731,130 @@ def plot_vix_sweep(sweep: pd.DataFrame, baseline_cagr: Optional[float] = None):
     return fig
 
 
+def plot_book_voltarget(
+    signals: StrategySignals,
+    target_vol: float,
+    start=None,
+    end=None,
+    title: str = "Book vol targeting — exposure follows the book's own risk",
+    vix: Optional[pd.Series] = None,
+):
+    """Three stacked panels: the book's realised vol, the scalar, and (optionally) VIX.
+
+    The third panel is the argument for the whole strategy. It plots VIX
+    underneath the book's own volatility on a shared x-axis, so you can see
+    the episodes where the book's risk climbed while the index stayed calm --
+    exactly the drawdowns a VIX breaker cannot see, and the reason this
+    overlay is measured on the book instead of on the market.
+
+    Stacked panels rather than twinned y-axes: two vol series on one axis with
+    different scalings would let the drawing choose the story.
+    """
+    d = signals.diagnostics.copy()
+    if start is not None:
+        d = d.loc[pd.Timestamp(start):]
+    if end is not None:
+        d = d.loc[:pd.Timestamp(end)]
+
+    n = 3 if vix is not None else 2
+    heights = [1.3, 1.0, 0.9][:n]
+    fig, axes = plt.subplots(n, 1, figsize=(11, 3.0 * n + 0.6), sharex=True,
+                             gridspec_kw=dict(height_ratios=heights, hspace=0.18))
+    ax1, ax2 = axes[0], axes[1]
+
+    ax1.plot(d.index, d["book_vol"], color=PALETTE["momentum_vt"], linewidth=2.0,
+             label="Book realised vol (EWMA, annualised)")
+    ax1.axhline(target_vol, color=PALETTE["ink_2"], linewidth=1.2, linestyle=(0, (4, 3)))
+    ax1.annotate(f"target {target_vol:.0%}", xy=(0.005, target_vol),
+                 xycoords=("axes fraction", "data"), xytext=(0, 4),
+                 textcoords="offset points", fontsize=8, color=PALETTE["ink_2"])
+    ax1.fill_between(d.index, target_vol, d["book_vol"],
+                     where=d["book_vol"] > target_vol,
+                     color=PALETTE["sell"], alpha=0.12, linewidth=0,
+                     label="Above target — de-risk")
+    ax1.set_ylabel("Annualised vol")
+    ax1.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax1.set_title(title)
+    ax1.legend(loc="upper left", ncols=2)
+
+    ax2.plot(d.index, d["raw_scalar"], color=PALETTE["muted"], linewidth=1.2,
+             linestyle=(0, (3, 3)), label="Unbanded scalar")
+    ax2.step(d.index, d["risk_weight"], where="post", color=PALETTE["momentum_vt"],
+             linewidth=2.0, label="Book weight actually held")
+    ax2.fill_between(d.index, 0, d["risk_weight"], step="post",
+                     color=PALETTE["momentum_vt"], alpha=0.14, linewidth=0)
+    ax2.plot(d.index, d["base_risk_weight"], color=PALETTE["momentum"], linewidth=1.4,
+             linestyle=(0, (5, 2)), label="Unscaled book")
+    # Headroom so the legend clears the 100% "unscaled book" reference line.
+    ax2.set_ylim(-0.02, 1.30)
+    ax2.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0])
+    ax2.set_ylabel("Weight in the book")
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax2.set_title("Exposure — the rest sits in BOXX", fontsize=10)
+    ax2.legend(loc="upper left", ncols=3)
+
+    if vix is not None:
+        ax3 = axes[2]
+        v = vix.reindex(d.index).ffill()
+        ax3.plot(d.index, v, color=PALETTE["momentum_vix"], linewidth=1.6, label="VIX close")
+        ax3.axhline(float(v.median()), color=PALETTE["axis"], linewidth=1.0,
+                    linestyle=(0, (4, 3)))
+        ax3.annotate("VIX median", xy=(0.005, float(v.median())),
+                     xycoords=("axes fraction", "data"), xytext=(0, 4),
+                     textcoords="offset points", fontsize=8, color=PALETTE["ink_2"])
+        ax3.set_ylabel("VIX")
+        ax3.set_title("The index signal, for comparison — calm VIX did not mean a calm book",
+                      fontsize=10)
+        ax3.legend(loc="upper left")
+
+    _tidy_dates(axes[-1])
+    for ax in axes:
+        ax.margins(x=0.01)
+    return fig
+
+
+def plot_target_vol_sweep(sweep: pd.DataFrame, baseline: Optional[Dict] = None):
+    """Return and drawdown against the vol target, as stacked panels.
+
+    `baseline` takes a dict with "CAGR" and "Max drawdown" for the unscaled
+    book, drawn as reference lines. The shape to look for is boring: both
+    curves rising smoothly with the target. A kink would mean the overlay is
+    doing something other than rescaling.
+    """
+    df = sweep.sort_values("Target vol")
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(9.5, 6.8), sharex=True,
+        gridspec_kw=dict(height_ratios=[1, 1], hspace=0.30))
+
+    ax1.plot(df["Target vol"], df["CAGR"], marker="o", markersize=7, linewidth=2.0,
+             color=PALETTE["momentum_vt"], label="vol-targeted",
+             markeredgecolor=PALETTE["surface"], markeredgewidth=1.2)
+    if baseline is not None and "CAGR" in baseline:
+        ax1.axhline(baseline["CAGR"], color=PALETTE["momentum"], linewidth=1.8,
+                    linestyle=(0, (5, 2)), label="unscaled book")
+    ax1.set_ylabel("CAGR")
+    ax1.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax1.set_title("What the vol target buys, and what it costs")
+    ax1.legend(loc="best")
+
+    ax2.plot(df["Target vol"], df["Max drawdown"], marker="o", markersize=7,
+             linewidth=2.0, color=PALETTE["momentum_vt"], label="vol-targeted",
+             markeredgecolor=PALETTE["surface"], markeredgewidth=1.2)
+    if baseline is not None and "Max drawdown" in baseline:
+        ax2.axhline(baseline["Max drawdown"], color=PALETTE["momentum"], linewidth=1.8,
+                    linestyle=(0, (5, 2)), label="unscaled book")
+    ax2.set_ylabel("Max drawdown")
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax2.set_xlabel("Annualised vol target")
+    ax2.set_title("…the drawdown you actually have to sit through", fontsize=10)
+    ax2.legend(loc="best")
+
+    for ax in (ax1, ax2):
+        ax.margins(x=0.06)
+        ax.xaxis.set_major_formatter(PercentFormatter(1.0))
+    return fig
+
+
 def plot_band_sensitivity(sweep: pd.DataFrame, n_hold: Optional[int] = None):
     """Turnover and Sharpe against band width, as stacked panels sharing an x-axis.
 

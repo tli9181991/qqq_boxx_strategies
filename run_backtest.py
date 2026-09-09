@@ -55,6 +55,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="skip the VIX circuit-breaker strategy")
     p.add_argument("--sweep-vix", action="store_true",
                    help="also print the VIX trigger-level sensitivity table")
+    p.add_argument("--target-vol-book", type=float, default=None,
+                   help="annualised vol target for the whole momentum book "
+                        "(default 0.25; this is the drawdown control that works)")
+    p.add_argument("--no-book-vt", dest="book_vt", action="store_false", default=True,
+                   help="skip the vol-targeted variant of the momentum book")
+    p.add_argument("--sweep-target-vol", action="store_true",
+                   help="also print the book vol-target sensitivity table")
     p.add_argument("--synthetic", action="store_true", help="use generated prices, no network")
     p.add_argument("--offline", action="store_true", help="use only the CSV cache")
     p.add_argument("--refresh", action="store_true", help="re-download, ignoring the cache")
@@ -104,6 +111,8 @@ def main(argv=None) -> int:
         cfg.vix.park_after_days = args.vix_park_after
     if args.vix_min_cash is not None:
         cfg.vix.min_cash_days = args.vix_min_cash
+    if args.target_vol_book is not None:
+        cfg.book_vol.target_vol = args.target_vol_book
     if cfg.momentum.exit_rank < cfg.momentum.n_hold:
         print("exit-rank must be >= n-hold (the band cannot be negative)", file=sys.stderr)
         return 2
@@ -116,8 +125,8 @@ def main(argv=None) -> int:
     try:
         lab = run(cfg, offline=args.offline, refresh=args.refresh,
                   use_synthetic=args.synthetic, with_momentum=args.momentum,
-                  with_vix=args.vix, fetch_universe=args.fetch_universe,
-                  pit_membership=pit)
+                  with_vix=args.vix, with_book_vt=args.book_vt,
+                  fetch_universe=args.fetch_universe, pit_membership=pit)
     except ImportError:
         print("yfinance is not installed. Either `pip install yfinance` or run "
               "with --synthetic to exercise the pipeline without a data feed.",
@@ -167,6 +176,23 @@ def main(argv=None) -> int:
             print(f"  ** the trigger sits inside the VIX distribution -- this is a "
                   f"mostly-out-of-market strategy, not a crash filter. Run --sweep-vix. **")
 
+    if "momentum_vt" in lab.signals:
+        d = lab.signals["momentum_vt"].diagnostics
+        rv = lab.results["momentum_vt"]
+        d = d.loc[rv.start:rv.end]
+        base_dd = lab.results["momentum"].drawdown.min()
+        print(f"\nBook vol target {cfg.book_vol.target_vol:.0%}: "
+              f"avg book weight {d['risk_weight'].mean():.0%} "
+              f"(book vol averaged {d['book_vol'].mean():.0%}), "
+              f"max drawdown {rv.drawdown.min():.1%} vs {base_dd:.1%} unscaled")
+
+    if args.sweep_target_vol and "momentum_vt" in lab.signals:
+        from qbs.pipeline import sweep_target_vol as _sweep_tv
+        stv = _sweep_tv(lab)
+        print("\nBook vol-target sensitivity (expect a smooth dial, not a peak):")
+        with pd.option_context("display.width", 200):
+            print(stv.round(4).to_string(index=False))
+
     if args.sweep_vix and "momentum_vix" in lab.signals:
         from qbs.pipeline import sweep_vix as _sweep_vix
         svx = _sweep_vix(lab)
@@ -212,6 +238,12 @@ def main(argv=None) -> int:
                 figs["10_vix_sweep"] = P.plot_vix_sweep(
                     svx, baseline_cagr=lab.summary.loc[
                         STRATEGY_LABELS["momentum"], "CAGR"])
+        if "momentum_vt" in lab.signals:
+            figs["11_book_voltarget"] = P.plot_book_voltarget(
+                lab.signals["momentum_vt"], cfg.book_vol.target_vol, s, e, vix=lab.vix)
+            if args.sweep_target_vol:
+                figs["12_target_vol_sweep"] = P.plot_target_vol_sweep(
+                    stv, baseline=lab.summary.loc[STRATEGY_LABELS["momentum"]].to_dict())
         for name, fig in figs.items():
             path = os.path.join(args.outdir, f"{name}.png")
             fig.savefig(path, bbox_inches="tight", dpi=140)

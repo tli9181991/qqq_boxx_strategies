@@ -15,8 +15,8 @@ from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
 from .engine import BacktestResult, run_backtest
 from .metrics import format_summary, summary_table
 from .strategies import (
-    StrategySignals, buy_and_hold, connors_rsi2, cross_sectional_momentum,
-    gem, vix_circuit_breaker, vol_target_overlay,
+    StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
+    cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
 )
 from .universe import (
     load_universe, load_universe_prices, membership_mask, synthetic_universe,
@@ -64,6 +64,7 @@ def run(
     use_synthetic: bool = False,
     with_momentum: bool = True,
     with_vix: bool = True,
+    with_book_vt: bool = True,
     vix: Optional[pd.Series] = None,
     fetch_universe: bool = True,
     pit_membership: Optional[pd.DataFrame] = None,
@@ -72,6 +73,7 @@ def run(
 
     `with_momentum=False` skips the Nasdaq-100 download, which is much the
     slowest part -- useful while iterating on the other three strategies.
+    `with_book_vt=False` drops the vol-targeted variant of the momentum book.
     `pit_membership` takes a point-in-time membership frame (see
     `universe.load_pit_universe`) to remove survivorship bias from the ranking.
     """
@@ -133,10 +135,21 @@ def run(
                 signals["momentum_vix"] = vix_circuit_breaker(
                     mom_sig, vix, cfg.vix, name="momentum_vix")
 
+        # ---- the same book, scaled by its OWN realised volatility --------
+        # The momentum book runs near 49% vol at beta ~1.7 to QQQ, so most of
+        # its drawdown is leverage rather than selection. Unlike the VIX
+        # breaker this reacts to the book's own risk, which is why it also
+        # cuts the drawdowns that happen while the index stays calm.
+        if with_book_vt:
+            signals["momentum_vt"] = book_vol_target(
+                mom_sig, combined, cfg.book_vol, lag=cfg.execution_lag,
+                name="momentum_vt")
+
     # ---- backtest everything on identical assumptions -------------------
     results: Dict[str, BacktestResult] = {}
     for key, sig in signals.items():
-        book = combined if key in ("momentum", "momentum_vix") else prices
+        book = (combined if key in ("momentum", "momentum_vix", "momentum_vt")
+                else prices)
         results[key] = run_backtest(
             book, sig, start=cfg.backtest_start, end=cfg.backtest_end,
             lag=cfg.execution_lag, cost_bps=cfg.cost_bps,
@@ -228,5 +241,45 @@ def sweep_vix(
             "CAGR": s["CAGR"], "Ann. vol": s["Ann. vol"],
             "Sharpe": s["Sharpe (vs BOXX)"], "MaxDD": s["Max drawdown"],
             "Ann. turnover": s["Ann. turnover"],
+        })
+    return pd.DataFrame(rows)
+
+
+def sweep_target_vol(
+    lab: Lab,
+    targets: List[float] = (0.15, 0.20, 0.25, 0.30, 0.35, 0.40),
+    base_key: str = "momentum",
+) -> pd.DataFrame:
+    """Re-run the book vol-target overlay across annualised vol targets.
+
+    Unlike `sweep_vix`, this dial is expected to be smooth: a lower target is
+    simply less of the same book, so CAGR and drawdown should both fall
+    monotonically and Calmar should stay roughly flat. Read it that way --
+    a *kink* would mean something is wrong, and the column that matters when
+    choosing is `Max drawdown`, because that is the one you have to sit
+    through. `Avg exposure` tells you how much of the book you are actually
+    holding to get there.
+    """
+    from .metrics import summarise
+    from .config import BookVolTargetParams
+
+    if lab.combined is None or base_key not in lab.signals:
+        raise ValueError("run(with_momentum=True) first")
+
+    cfg = lab.config
+    rows = []
+    for tv in targets:
+        p = BookVolTargetParams(**{**cfg.book_vol.__dict__, "target_vol": float(tv)})
+        sig = book_vol_target(lab.signals[base_key], lab.combined, p,
+                              lag=cfg.execution_lag)
+        res = run_backtest(lab.combined, sig, start=cfg.backtest_start,
+                           end=cfg.backtest_end, lag=cfg.execution_lag,
+                           cost_bps=cfg.cost_bps, slippage_bps=cfg.slippage_bps)
+        s = summarise(res, rf=lab.rf)
+        rows.append({
+            "Target vol": tv, "CAGR": s["CAGR"], "Ann. vol": s["Ann. vol"],
+            "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
+            "Calmar": s["Calmar"], "Ann. turnover": s["Ann. turnover"],
+            "Avg exposure": s["Avg risk exposure"],
         })
     return pd.DataFrame(rows)

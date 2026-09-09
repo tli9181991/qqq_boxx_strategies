@@ -1,4 +1,4 @@
-"""The three strategies.
+"""The strategies.
 
 Each builder takes prices and parameters and returns a `StrategySignals`:
 
@@ -21,8 +21,8 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    GEMParams, MomentumParams, RSI2Params, SAFE_ASSET, VixBreakerParams,
-    VolTargetParams,
+    BookVolTargetParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
+    SAFE_ASSET, TRADING_DAYS, VixBreakerParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
 
@@ -597,6 +597,116 @@ def vix_circuit_breaker(
     sig = StrategySignals(name or f"{base.name}_vix", weights, diagnostics, ev,
                           params=p.__dict__.copy())
     sig.holding = regime
+    sig.holdings_log = base.holdings_log
+    sig.momentum = base.momentum
+    return sig
+
+
+# ==========================================================================
+# 6. Book-level volatility targeting -- scale a whole portfolio by its own vol
+# ==========================================================================
+
+def book_vol_target(
+    base: StrategySignals,
+    prices: pd.DataFrame,
+    params: Optional[BookVolTargetParams] = None,
+    lag: int = EXECUTION_LAG,
+    name: Optional[str] = None,
+) -> StrategySignals:
+    """Scale an entire book so its *own* realised volatility sits near target.
+
+        scalar = target_vol / realised_book_vol,  clipped to [0, max_weight]
+
+    Every risk weight is multiplied by that one scalar; the freed weight parks
+    in the safe asset. Relative position sizes within the book are untouched --
+    this changes how much of the strategy you hold, never which names.
+
+    Why this and not a VIX breaker or an index trend filter
+    -------------------------------------------------------
+    Those are *index* signals, and a concentrated book has two distinct kinds
+    of drawdown. One is a market selloff, which they can see. The other is the
+    book's own holdings decoupling from a calm index -- on the Top-6 momentum
+    strategy the worst such episode ran while VIX sat at 16-20, below its own
+    median, and QQQ was barely moving. No threshold on VIX or on QQQ's SMA(200)
+    reduces that drawdown at all, because the market was not what went wrong.
+
+    The book's realised volatility rises in *both* cases, which is the whole
+    argument for measuring the thing you actually hold.
+
+    What it does not do
+    -------------------
+    It does not add return -- it rescales risk, so Sharpe is roughly unchanged
+    and what improves is Calmar. It also cannot protect against an overnight
+    gap in a single name: it responds to sustained volatility, not to jumps.
+
+    Causality
+    ---------
+    The vol estimate at date `t` is built from returns the book had actually
+    *earned* by the close of `t`: weights are shifted by `lag` before being
+    multiplied by returns, exactly as `engine.run_backtest` does it. The
+    resulting scalar then modifies the weight *decided* at `t`, which the
+    engine lags again before trading it. Nothing here can see the future --
+    `tests/test_qbs.py` pins this with a shuffled-future test.
+    """
+    p = params or BookVolTargetParams()
+    safe = p.safe_asset
+
+    w = base.weights.reindex(prices.index).ffill().fillna(0.0)
+    if safe not in w.columns:
+        w[safe] = 0.0
+    risk_cols = [c for c in w.columns if c != safe]
+
+    rets = prices.reindex(columns=w.columns).ffill().pct_change().fillna(0.0)
+
+    # Realised book return, on the same convention the engine uses.
+    book_ret = (w.shift(lag) * rets).sum(axis=1)
+    vol = (book_ret.ewm(halflife=p.halflife, min_periods=p.min_periods).std()
+           * np.sqrt(TRADING_DAYS))
+    raw = (p.target_vol / vol.clip(lower=p.vol_floor)).clip(0.0, p.max_weight)
+
+    # No-trade band: hold the last scalar until the target has drifted far
+    # enough to be worth the turnover. Same device as VolTargetParams.
+    out = np.full(len(raw), np.nan)
+    current = np.nan
+    for i, r in enumerate(raw.to_numpy()):
+        if np.isnan(r):
+            continue
+        if np.isnan(current) or abs(r - current) >= p.rebalance_band:
+            current = r
+        out[i] = current
+    # Leading NaN is the warm-up: no vol estimate yet means no position.
+    scalar = pd.Series(out, index=raw.index, name="scalar").ffill().fillna(0.0)
+
+    weights = w.copy()
+    weights[risk_cols] = w[risk_cols].mul(scalar, axis=0)
+    weights[safe] = 1.0 - weights[risk_cols].sum(axis=1)
+
+    risk_weight = weights[risk_cols].sum(axis=1)
+    diagnostics = pd.DataFrame({
+        "book_vol": vol,
+        "raw_scalar": raw,
+        "scalar": scalar,
+        "base_risk_weight": w[risk_cols].sum(axis=1),
+        "risk_weight": risk_weight,
+    })
+
+    # Events: one row each time the scalar actually moves the book.
+    moved = scalar.diff().abs() > 1e-9
+    ev_rows = []
+    for dt in scalar.index[moved.fillna(False)]:
+        prev, now = float(scalar.shift().loc[dt]), float(scalar.loc[dt])
+        ev_rows.append(dict(
+            date=dt,
+            action="buy" if now > prev else "sell",
+            asset="BOOK",
+            price=float(vol.loc[dt]) if not np.isnan(vol.loc[dt]) else np.nan,
+            reason=f"book vol {vol.loc[dt]:.1%} -> scale {prev:.0%} to {now:.0%}",
+        ))
+    ev = pd.DataFrame(ev_rows) if ev_rows else _empty_events()
+
+    sig = StrategySignals(name or f"{base.name}_vt", weights, diagnostics, ev,
+                          params=p.__dict__.copy())
+    sig.holding = base.holding
     sig.holdings_log = base.holdings_log
     sig.momentum = base.momentum
     return sig

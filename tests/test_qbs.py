@@ -16,15 +16,16 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.config import (
-    Config, GEMParams, MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
+    BookVolTargetParams, Config, GEMParams, MomentumParams, RSI2Params,
+    VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
 from qbs.indicators import drawdown, sma, wilder_rsi
 from qbs.metrics import summarise
-from qbs.pipeline import build_signals, run, sweep_band, sweep_vix
+from qbs.pipeline import build_signals, run, sweep_band, sweep_target_vol, sweep_vix
 from qbs.strategies import (
-    buy_and_hold, connors_rsi2, cross_sectional_momentum, gem,
+    book_vol_target, buy_and_hold, connors_rsi2, cross_sectional_momentum, gem,
     vix_circuit_breaker, vol_target_overlay,
 )
 from qbs.universe import membership_mask, synthetic_universe
@@ -503,6 +504,122 @@ def test_full_pipeline_runs_and_aligns():
     lengths = {k: len(r.returns) for k, r in lab.results.items()}
     assert len(set(lengths.values())) == 1, f"strategies ran on different windows: {lengths}"
     assert lab.summary.shape[0] == len(lab.results)
+
+
+# --------------------------------------------------------------------------
+# Book-level vol targeting
+# --------------------------------------------------------------------------
+
+def _mom_book(seed_prices=None):
+    """A small momentum book plus the safe asset, for the overlay tests."""
+    px = seed_prices if seed_prices is not None else synthetic_prices()
+    uni = synthetic_universe(n=25, start="2023-06-01")
+    uni = uni.reindex(px.index).ffill().dropna(axis=1, how="all")
+    p = MomentumParams(n_hold=4, exit_rank=8, min_history=200)
+    sig = cross_sectional_momentum(uni, px["BOXX"], p)
+    book = uni.copy()
+    book["BOXX"] = px["BOXX"]
+    return px, book, sig
+
+
+def test_book_vol_target_weights_stay_a_valid_book():
+    _, book, sig = _mom_book()
+    vt = book_vol_target(sig, book, BookVolTargetParams(target_vol=0.20))
+    total = vt.weights.sum(axis=1)
+    assert np.allclose(total, 1.0), "weights must always sum to 1 (risk + safe)"
+    assert (vt.weights >= -1e-9).all().all(), "no negative weights -- this book is long-only"
+    risk = vt.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risk <= 1.0 + 1e-9).all(), "max_weight=1.0 must forbid leverage"
+
+
+def test_book_vol_target_only_scales_never_reselects():
+    """The overlay changes how much of the book is held, never which names."""
+    _, book, sig = _mom_book()
+    vt = book_vol_target(sig, book, BookVolTargetParams(target_vol=0.20))
+    names = [c for c in sig.weights.columns if c != "BOXX"]
+    base, scaled = sig.weights[names], vt.weights[names]
+    held_base = (base > 1e-9)
+    held_vt = (scaled > 1e-9)
+    # Any name the overlay holds must be one the base strategy chose.
+    assert not (held_vt & ~held_base).any().any(), "overlay introduced a name the base never held"
+    # Within each date the relative sizes are unchanged.
+    for dt in base.index[::40]:
+        b, v = base.loc[dt], scaled.loc[dt]
+        if b.sum() > 0 and v.sum() > 0:
+            assert np.allclose(b / b.sum(), v / v.sum(), atol=1e-9), \
+                f"relative position sizes changed on {dt}"
+
+
+def test_book_vol_target_lowers_volatility_and_drawdown():
+    px, book, sig = _mom_book()
+    base = run_backtest(book, sig, start="2025-01-20")
+    tight = run_backtest(book, book_vol_target(
+        sig, book, BookVolTargetParams(target_vol=0.10)), start="2025-01-20")
+    b, t = summarise(base), summarise(tight)
+    assert t["Ann. vol"] < b["Ann. vol"], "a lower target must reduce realised vol"
+    assert t["Max drawdown"] > b["Max drawdown"], "a lower target must shrink the drawdown"
+
+
+def test_book_vol_target_is_monotone_in_the_target():
+    """The dial must be smooth: more target vol, more exposure. A kink is a bug."""
+    _, book, sig = _mom_book()
+    expos = []
+    for tv in (0.10, 0.20, 0.30, 0.40):
+        vt = book_vol_target(sig, book, BookVolTargetParams(target_vol=tv))
+        expos.append(float(vt.weights.drop(columns=["BOXX"]).sum(axis=1).mean()))
+    assert expos == sorted(expos), f"exposure is not monotone in the target: {expos}"
+
+
+def test_book_vol_target_has_no_look_ahead():
+    """Rewriting the future must not change any weight decided before it.
+
+    The overlay reads the book's realised returns, so a lag mistake here is
+    invisible in the equity curve but would still be look-ahead. Perturbing
+    the tail of the price history and checking that earlier weights are
+    bit-identical catches it.
+    """
+    px, book, sig = _mom_book()
+    cut = book.index[len(book) // 2]
+
+    tampered = book.copy()
+    rng = np.random.default_rng(0)
+    after = tampered.index > cut
+    tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
+
+    p = BookVolTargetParams(target_vol=0.20)
+    a = book_vol_target(sig, book, p).weights.loc[:cut]
+    b = book_vol_target(sig, tampered, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_book_vol_target_band_reduces_turnover():
+    _, book, sig = _mom_book()
+    loose = book_vol_target(sig, book, BookVolTargetParams(rebalance_band=0.25))
+    tight = book_vol_target(sig, book, BookVolTargetParams(rebalance_band=0.0))
+    n_loose = int((loose.diagnostics["scalar"].diff().abs() > 1e-12).sum())
+    n_tight = int((tight.diagnostics["scalar"].diff().abs() > 1e-12).sum())
+    assert n_loose < n_tight, "a wider no-trade band must move the scalar less often"
+
+
+def test_book_vol_target_respects_max_weight():
+    _, book, sig = _mom_book()
+    vt = book_vol_target(sig, book, BookVolTargetParams(target_vol=5.0, max_weight=1.0))
+    risk = vt.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert risk.max() <= 1.0 + 1e-9, "an absurd target must still be capped by max_weight"
+
+
+def test_pipeline_exposes_the_vol_targeted_book():
+    lab = run(use_synthetic=True)
+    assert "momentum_vt" in lab.results, "pipeline should build the vol-targeted book"
+    assert len(lab.results["momentum_vt"].returns) == len(lab.results["momentum"].returns)
+
+
+def test_sweep_target_vol_is_ordered():
+    lab = run(use_synthetic=True)
+    sw = sweep_target_vol(lab, targets=[0.10, 0.20, 0.30])
+    assert len(sw) == 3
+    assert sw["Avg exposure"].is_monotonic_increasing, \
+        "higher vol targets must hold more of the book"
 
 
 if __name__ == "__main__":
