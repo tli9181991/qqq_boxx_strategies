@@ -1,0 +1,14 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+matplotlib>=3.7
+
+# Data feed (only needed for live prices; --synthetic runs without it)
+yfinance>=0.2.40
+
+# Notebook
+jupyterlab>=4.0
+ipykernel>=6.25
+
+# Optional: nicer test runner. The suite also runs with plain `python tests/test_qbs.py`
+pytest>=7.4
