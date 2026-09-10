@@ -28,3 +28,6 @@ var/
 *.db
 *.db-wal
 *.db-shm
+
+# Docker deployment secrets (IB login, VNC password)
+deploy/docker/.env

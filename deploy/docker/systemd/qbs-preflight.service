@@ -1,0 +1,25 @@
+[Unit]
+Description=QBS morning preflight (no orders) (Docker)
+Documentation=file:/opt/qbs/deploy/docker/README.md
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qbs
+
+# --rm so a failed run leaves no stopped container behind. The phase name is
+# the whole command because the image's ENTRYPOINT is the runner.
+ExecStart=/usr/bin/docker compose -f /opt/qbs/deploy/docker/docker-compose.yml run --rm qbs preflight
+
+TimeoutStartSec=900
+Restart=on-failure
+RestartSec=120
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-preflight
+
+[Install]
+WantedBy=multi-user.target

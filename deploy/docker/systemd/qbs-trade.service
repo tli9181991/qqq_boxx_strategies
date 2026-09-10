@@ -1,0 +1,25 @@
+[Unit]
+Description=QBS rank and submit MOC (Docker)
+Documentation=file:/opt/qbs/deploy/docker/README.md
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qbs
+
+# --rm so a failed run leaves no stopped container behind. The phase name is
+# the whole command because the image's ENTRYPOINT is the runner.
+ExecStart=/usr/bin/docker compose -f /opt/qbs/deploy/docker/docker-compose.yml run --rm qbs trade
+
+TimeoutStartSec=780
+# Deliberately NO Restart. A retry would recompute and resubmit against a
+# book the first attempt may already have moved.
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-trade
+
+[Install]
+WantedBy=multi-user.target

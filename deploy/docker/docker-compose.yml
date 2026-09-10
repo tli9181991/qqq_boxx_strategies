@@ -1,0 +1,70 @@
+# IB Gateway plus the live trader, on one Docker network.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d ib-gateway
+#   docker compose -f deploy/docker/docker-compose.yml run --rm qbs preflight
+#
+# Only the Gateway is a long-running service. The trader is three short phases
+# that each run to completion, so it sits behind a profile and is invoked with
+# `run --rm` -- `up` must never start it.
+
+name: qbs
+
+services:
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    container_name: ib-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TRADING_MODE: paper
+      READ_ONLY_API: "no"
+      TZ: America/New_York
+    ports:
+      # Bound to 127.0.0.1, NOT 0.0.0.0. The API port has no authentication
+      # beyond IB's trusted-IP list, and the VNC port has only a password --
+      # neither belongs on a public interface. Reach them over an SSH tunnel.
+      - "127.0.0.1:4002:4002"
+      - "127.0.0.1:5900:5900"
+    networks:
+      - qbsnet
+
+  qbs:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: qbs-live:latest
+    container_name: qbs-live
+    # Keeps `docker compose up` from ever starting the trader. `run` enables
+    # the profile automatically for the service it names.
+    profiles:
+      - cli
+    # Run as the host user so files written into the bind-mounted var/ and
+    # data/ are owned by you, not by root. Set QBS_UID/QBS_GID in .env.
+    user: "${QBS_UID:-1000}:${QBS_GID:-1000}"
+    depends_on:
+      - ib-gateway
+    environment:
+      # Inside the network the Gateway is a hostname, not localhost. This is
+      # the single most common thing to get wrong when moving a working
+      # host-side script into a container.
+      QBS_IB_HOST: ib-gateway
+      QBS_IB_PORT: "4002"
+      QBS_STATE_DIR: /app/var
+      QBS_NOTIONAL: "${QBS_NOTIONAL:-100000}"
+      QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"
+      # Leave DRY_RUN on until you have watched a few sessions.
+      QBS_DRY_RUN: "${QBS_DRY_RUN:-1}"
+      TZ: America/New_York
+    # Note there is no `env_file: .env` here on purpose: the trader has no need
+    # of the IB login, and passing it in would put the account password in the
+    # environment of a container that never uses it.
+    volumes:
+      - ../../var:/app/var      # run log, state -- must persist
+      - ../../data:/app/data    # price cache -- persists downloads
+    networks:
+      - qbsnet
+
+networks:
+  qbsnet:
+    name: qbs-net

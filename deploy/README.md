@@ -25,7 +25,14 @@ Local-time equivalents, since the timers follow US daylight saving:
 
 ---
 
-## Install
+## Two ways to install
+
+**Docker** — if IB Gateway runs in a container (`gnzsnz/ib-gateway`), follow
+**[`deploy/docker/README.md`](docker/README.md)** instead of this page. Same
+three phases and the same timers; the units call `docker compose run` rather
+than a venv.
+
+**Native** — Gateway installed on the host:
 
 ```bash
 git clone https://github.com/tli9181991/qqq_boxx_strategies.git
