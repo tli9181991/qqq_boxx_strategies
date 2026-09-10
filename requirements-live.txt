@@ -1,11 +1,12 @@
 # Live deployment only. The backtest needs none of this.
 #
-# ib_insync is unmaintained upstream since 2024, so both it and its event
-# library are pinned: an incompatible eventkit or nest_asyncio release is the
-# most likely way this deployment breaks without any code change.
-ib_insync==0.9.86
-eventkit==1.0.3
-nest_asyncio==1.6.0
+# ib_async is the maintained community fork of ib_insync (which has been
+# unmaintained upstream since 2024). Same API, still worth pinning: this is the
+# layer that places orders, and it should only ever move when you decide it
+# does. It pulls aeventkit, nest_asyncio and tzdata itself.
+#
+# Needs Python >= 3.10.
+ib_async==2.1.0
 
 # Shared with the backtest, repeated here so the VM can install from this file
 # alone without pulling jupyter and matplotlib onto a 2 GB box.

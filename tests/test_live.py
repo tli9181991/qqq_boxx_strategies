@@ -5,8 +5,11 @@ That is the point of keeping `orders.py` and `signals.py` pure: the code that
 decides what to send to a broker unattended is exactly the code you most need
 to be able to test on a laptop.
 
-The broker wrapper itself is not tested here -- it is a thin translation into
-ib_insync calls, and a mock of it would only assert that the mock was called.
+The broker wrapper is covered only where it has real logic of its own -- the
+live-port refusal, filtering non-stock positions, the dry-run path -- against a
+stub standing in for ib_async's IB. The parts that are a straight translation
+into library calls are not mocked, because such a test asserts nothing beyond
+"the mock was called".
 """
 
 from __future__ import annotations
@@ -402,3 +405,184 @@ def test_orders_csv_gets_a_header_once():
         lines = open(p).read().strip().split("\n")
         assert len(lines) == 3, "header + two rows"
         assert lines[0].startswith("at,asof,symbol")
+
+
+# --------------------------------------------------------------------------
+# Broker: only the logic that is genuinely its own
+# --------------------------------------------------------------------------
+
+class _Ctr:
+    def __init__(self, symbol, sec_type="STK", con_id=1):
+        self.symbol, self.secType, self.conId = symbol, sec_type, con_id
+
+
+class _Pos:
+    def __init__(self, symbol, qty, sec_type="STK"):
+        self.contract, self.position = _Ctr(symbol, sec_type), qty
+
+
+class _Val:
+    def __init__(self, tag, value, currency="USD"):
+        self.tag, self.value, self.currency = tag, value, currency
+
+
+class _Status:
+    def __init__(self, status):
+        self.status = status
+
+
+class _IBOrder:
+    def __init__(self, order_id=1, action="BUY", qty=1):
+        self.orderId, self.action, self.totalQuantity = order_id, action, qty
+
+
+class _Trade:
+    def __init__(self, status="Submitted", order_id=1):
+        self.orderStatus, self.order, self.log = _Status(status), _IBOrder(order_id), []
+        self.contract = _Ctr("X")
+
+
+class StubIB:
+    """Stands in for ib_async.IB. Records what the broker asked it to do."""
+    instances = []
+
+    def __init__(self):
+        self.connected = False
+        self.placed = []
+        self.cancelled = []
+        self._positions = []
+        self._values = []
+        self._status = "Submitted"
+        StubIB.instances.append(self)
+
+    def connect(self, host, port, clientId=None, timeout=None):
+        self.connected = True
+
+    def isConnected(self):
+        return self.connected
+
+    def disconnect(self):
+        self.connected = False
+
+    def managedAccounts(self):
+        return ["DU111"]
+
+    def positions(self, account=None):
+        return self._positions
+
+    def accountValues(self, account=None):
+        return self._values
+
+    def qualifyContracts(self, *cs):
+        for c in cs:
+            c.conId = 42
+        return list(cs)
+
+    def placeOrder(self, contract, order):
+        self.placed.append((contract.symbol, order.action, order.totalQuantity,
+                            order.orderType))
+        return _Trade(self._status)
+
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
+
+    def openTrades(self):
+        return []
+
+    def fills(self):
+        return []
+
+    def sleep(self, _):
+        pass
+
+
+@pytest.fixture
+def stub_ib(monkeypatch):
+    import ib_async
+    StubIB.instances = []
+    monkeypatch.setattr(ib_async, "IB", StubIB)
+    return StubIB
+
+
+def test_broker_refuses_a_live_port(stub_ib):
+    from qbs.live.broker import BrokerError, IBBroker
+    with pytest.raises(BrokerError, match="LIVE trading port"):
+        IBBroker(LiveConfig(ib_port=4001)).connect()
+    assert not stub_ib.instances, "must refuse before constructing a connection"
+
+
+def test_broker_allows_a_live_port_only_when_told_to(stub_ib):
+    from qbs.live.broker import IBBroker
+    IBBroker(LiveConfig(ib_port=4001, allow_live_account=True)).connect()
+    assert stub_ib.instances[0].connected
+
+
+def test_broker_ignores_non_stock_positions(stub_ib):
+    """An option or future in the account belongs to something else entirely."""
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    b.ib._positions = [_Pos("AMD", 10), _Pos("SPY", 5, sec_type="OPT"),
+                       _Pos("EUR", 1000, sec_type="CASH")]
+    assert b.positions() == {"AMD": 10}
+
+
+def test_broker_drops_flat_positions(stub_ib):
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    b.ib._positions = [_Pos("AMD", 10), _Pos("MU", 0)]
+    assert b.positions() == {"AMD": 10}
+
+
+def test_broker_reads_usd_net_liquidation(stub_ib):
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    b.ib._values = [_Val("NetLiquidation", "250000", "EUR"),
+                    _Val("BuyingPower", "1000"),
+                    _Val("NetLiquidation", "123456.78")]
+    assert b.net_liquidation() == pytest.approx(123456.78)
+
+
+def test_broker_sends_moc_orders(stub_ib):
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    b.submit_moc([Order("AMD", "BUY", 11, 505.0), Order("MU", "SELL", 6, 1000.0)])
+    assert b.ib.placed == [("AMD", "BUY", 11, "MOC"), ("MU", "SELL", 6, "MOC")]
+
+
+def test_broker_dry_run_sends_nothing(stub_ib):
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig(dry_run=True))
+    b.connect()
+    out = b.submit_moc([Order("AMD", "BUY", 11, 505.0)])
+    assert b.ib.placed == [], "dry run must not reach placeOrder"
+    assert [f.status for f in out] == ["DryRun"]
+
+
+def test_broker_raises_when_ib_rejects_an_order(stub_ib):
+    """A rejection must stop the run, not be logged and stepped over."""
+    from qbs.live.broker import BrokerError, IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    b.ib._status = "Inactive"
+    with pytest.raises(BrokerError, match="rejected"):
+        b.submit_moc([Order("AMD", "BUY", 11, 505.0)])
+
+
+def test_broker_rejects_an_account_the_gateway_does_not_serve(stub_ib):
+    from qbs.live.broker import BrokerError, IBBroker
+    with pytest.raises(BrokerError, match="not served by this Gateway"):
+        IBBroker(LiveConfig(ib_account="DU999")).connect()
+
+
+def test_broker_qualifies_each_symbol_once(stub_ib):
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig())
+    b.connect()
+    first = b.qualify(["AMD", "MU"])
+    again = b.qualify(["AMD", "MU", "INTC"])
+    assert set(first) == {"AMD", "MU"}
+    assert set(again) == {"AMD", "MU", "INTC"}

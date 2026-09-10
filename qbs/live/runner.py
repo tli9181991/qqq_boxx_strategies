@@ -60,7 +60,7 @@ def setup_logging(verbose: bool = False, logfile: Optional[str] = None) -> None:
         handlers.append(logging.FileHandler(logfile))
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
                         format=fmt, handlers=handlers, force=True)
-    logging.getLogger("ib_insync").setLevel(logging.WARNING)
+    logging.getLogger("ib_async").setLevel(logging.WARNING)
 
 
 def market_today(tz: str) -> datetime:

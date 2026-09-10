@@ -316,7 +316,7 @@ qbs/live/
   config.py    deployment settings: account, sizing, safety limits
   signals.py   today's target weights -- calls the SAME functions as the backtest
   orders.py    weights -> shares -> deltas -> guards (pure, no IB, no clock)
-  broker.py    the ib_insync layer: positions, MOC orders, fills
+  broker.py    the ib_async layer: positions, MOC orders, fills
   state.py     run records and the order/fill audit trail
   runner.py    three phases: preflight / trade / reconcile
 deploy/        systemd units + timers, installer, runbook

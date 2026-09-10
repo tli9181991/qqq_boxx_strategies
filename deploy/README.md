@@ -38,6 +38,16 @@ service user, syncs the repo to `/opt/qbs`, builds a venv from
 `requirements-live.txt`, and installs the systemd units — but **starts
 nothing**. Walk through the checklist it prints.
 
+The broker layer uses [`ib_async`](https://github.com/ib-api-reloaded/ib_async),
+the maintained fork of `ib_insync`. If your existing paper-trade script imports
+`ib_insync`, only the import line changes — the API is the same. Do not install
+both into the same environment: they patch asyncio the same way and whichever
+imports second wins.
+
+**Needs Python 3.10+** (an `ib_async` requirement). Ubuntu 22.04 and 24.04 are
+fine; Amazon Linux 2 ships 3.7, so install `python3.11` and run the installer as
+`PYTHON=python3.11 sudo -E ./deploy/install.sh`.
+
 ### Why the swapfile
 
 A t3.small has 2 GB. IB Gateway's JVM takes most of 1 GB, and the trade job

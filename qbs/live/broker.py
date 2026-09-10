@@ -1,4 +1,4 @@
-"""The ib_insync layer. Everything that talks to IB Gateway lives here.
+"""The ib_async layer. Everything that talks to IB Gateway lives here.
 
 Kept deliberately thin and free of strategy logic, so the parts that decide
 what to trade (`signals.py`, `orders.py`) stay testable without a Gateway.
@@ -11,9 +11,11 @@ assumes the fill happens in the closing auction -- that gap is exactly what
 IB requires MOC orders in well before the auction (the cutoff is around
 15:45-15:50 ET for US stocks), which is why the job submits at 15:40.
 
-A note on ib_insync: it is unmaintained upstream since 2024. It works, and it
-is what this deployment targets, but pin the version -- an incompatible
-pandas or eventkit release is the likely way this breaks.
+A note on the library: this targets `ib_async`, the maintained community fork
+of `ib_insync` (unmaintained upstream since 2024). The API is the same, so the
+calls below read identically either way, but the package name is not -- and
+the two must never be installed side by side, since both register the same
+asyncio patching and whichever imports second wins.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ class Fill:
 
 
 class IBBroker:
-    """Thin ib_insync wrapper with a context-manager lifecycle.
+    """Thin ib_async wrapper with a context-manager lifecycle.
 
     Usage::
 
@@ -69,10 +71,10 @@ class IBBroker:
 
     def connect(self) -> None:
         try:
-            from ib_insync import IB
+            from ib_async import IB
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise BrokerError(
-                "ib_insync is not installed. `pip install -r requirements-live.txt`"
+                "ib_async is not installed. `pip install -r requirements-live.txt`"
             ) from exc
 
         if not self.cfg.is_paper_port and not self.cfg.allow_live_account:
@@ -146,12 +148,12 @@ class IBBroker:
     def qualify(self, symbols: List[str]) -> Dict[str, object]:
         """Resolve symbols to IB contracts, once per session.
 
-        SMART routing with USD currency and a primary exchange hint: without
-        the hint, ambiguous symbols raise rather than resolving, which is the
-        behaviour we want -- an unqualified symbol must stop the run, not
-        route somewhere unexpected.
+        SMART routing, USD. Anything IB does not resolve to a contract with a
+        conId is reported as missing and raises, rather than being dropped from
+        the order list -- a silently skipped symbol would leave the book
+        half-built while every log line claimed success.
         """
-        from ib_insync import Stock
+        from ib_async import Stock
 
         todo = [s for s in symbols if s not in self._contracts]
         if not todo:
@@ -177,7 +179,7 @@ class IBBroker:
         status here is the expected success case -- the actual fill is picked
         up by the reconcile phase after the close.
         """
-        from ib_insync import Order as IBOrder
+        from ib_async import Order as IBOrder
 
         if not orders:
             log.info("no orders to submit")

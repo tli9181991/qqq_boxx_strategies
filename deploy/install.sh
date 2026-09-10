@@ -53,6 +53,16 @@ else
 fi
 [[ -f /usr/share/zoneinfo/America/New_York ]] || die "tzdata did not provide America/New_York"
 
+# ib_async requires Python 3.10+. Amazon Linux 2 ships 3.7, so check here and
+# say so plainly rather than letting pip fail with a resolver error 40 lines
+# into the install.
+PY_VER="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+  die "python3 is $PY_VER but ib_async needs 3.10+. On Amazon Linux 2 install python3.11 \
+(sudo dnf install python3.11) and re-run as: PYTHON=python3.11 sudo -E ./deploy/install.sh"
+fi
+log "python3 is $PY_VER"
+
 # --------------------------------------------------------------------------
 # 3. Service account and directories
 # --------------------------------------------------------------------------
@@ -73,9 +83,10 @@ rsync -a --delete \
 # --------------------------------------------------------------------------
 # 4. Virtualenv
 # --------------------------------------------------------------------------
+PYTHON="${PYTHON:-python3}"
 if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
-  log "creating virtualenv"
-  python3 -m venv "$APP_DIR/.venv"
+  log "creating virtualenv with $PYTHON"
+  "$PYTHON" -m venv "$APP_DIR/.venv"
 fi
 log "installing dependencies (this is the slow step)"
 "$APP_DIR/.venv/bin/pip" install --quiet --upgrade pip
