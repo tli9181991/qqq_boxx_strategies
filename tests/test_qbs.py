@@ -622,6 +622,131 @@ def test_sweep_target_vol_is_ordered():
         "higher vol targets must hold more of the book"
 
 
+# --------------------------------------------------------------------------
+# The notebook's trend-template screen (qbs/screens.py)
+# --------------------------------------------------------------------------
+
+def _screen_inputs(n=30):
+    px = synthetic_prices()
+    uni = synthetic_universe(n=n, start="2023-06-01").reindex(px.index).ffill()
+    return uni, px["QQQ"], px["BOXX"]
+
+
+def test_rolling_log_slope_matches_polyfit():
+    """The vectorised slope must equal the notebook's np.polyfit, not approximate it."""
+    from qbs.screens import rolling_log_slope
+
+    rng = np.random.default_rng(0)
+    s = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, 400))))
+    mine = rolling_log_slope(s.to_frame("X"), 100)["X"]
+    for i in (150, 250, 399):
+        y = np.log(s.iloc[i - 99:i + 1].values)
+        theirs = np.polyfit(np.arange(100), y, 1)[0]
+        assert abs(mine.iloc[i] - theirs) < 1e-12
+
+
+def test_screen_weights_are_a_valid_long_only_book():
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(n_hold=6))
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+    assert (sig.weights >= -1e-9).all().all()
+    risk = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risk <= 1.0 + 1e-9).all(), "a screen must never lever the book"
+
+
+def test_screen_parks_in_the_safe_asset_when_nothing_passes():
+    """A screen is an absolute test -- on a bad day the answer is 'none', and
+    that has to mean cash rather than a forced allocation."""
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    # An impossible criterion: nothing is ever within 0% of its 52-week high
+    # while also above a rising 200-day average, on synthetic data.
+    p = TrendScreenParams(n_hold=6, within_52w_high_pct=-1.0)
+    sig = trend_template_screen(uni, mkt, safe, p)
+    assert np.allclose(sig.weights["BOXX"], 1.0), "must be fully in cash"
+    assert sig.diagnostics["n_passing"].max() == 0
+
+
+def test_screen_holds_everything_passing_when_n_hold_is_zero():
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(n_hold=0))
+    d = sig.diagnostics
+    live = d["n_passing"] > 0
+    assert (d.loc[live, "n_held"] == d.loc[live, "n_passing"]).all()
+
+
+def test_screen_caps_the_book_at_n_hold():
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(n_hold=4))
+    assert sig.diagnostics["n_held"].max() <= 4
+
+
+def test_screen_has_no_look_ahead():
+    """Rewriting the future must not change any weight decided before it."""
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    cut = uni.index[len(uni) // 2]
+    rng = np.random.default_rng(1)
+    tampered = uni.copy()
+    after = tampered.index > cut
+    tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
+
+    p = TrendScreenParams(n_hold=6)
+    a = trend_template_screen(uni, mkt, safe, p).weights.loc[:cut]
+    b = trend_template_screen(tampered, mkt, safe, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_screen_sector_filter_only_ever_removes_names():
+    """The fifth criterion is a filter: enabling it cannot admit a new name."""
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    p = TrendScreenParams(n_hold=0)
+    base = trend_template_screen(uni, mkt, safe, p)
+
+    sectors = {t: ("AAA" if i % 2 else "BBB") for i, t in enumerate(uni.columns)}
+    sec_px = pd.DataFrame({"AAA": mkt * 1.5, "BBB": mkt * 0.5}, index=uni.index)
+    withs = trend_template_screen(uni, mkt, safe, p, sector_map=sectors,
+                                  sector_prices=sec_px)
+    assert withs.params["sector_filter_applied"] is True
+    assert base.params["sector_filter_applied"] is False
+    for dt in uni.index[::40]:
+        assert set(withs.holdings_log[dt]) <= set(base.holdings_log[dt])
+
+
+def test_screen_records_rank_and_score_like_the_momentum_book():
+    """So the live run log stores selections from either strategy identically."""
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(n_hold=6))
+    assert {"rank", "score"} <= set(sig.events.columns)
+    assert sig.held_ranks is not None
+    buys = sig.events[sig.events["action"] == "buy"]
+    if not buys.empty:
+        assert (buys["rank"] >= 1).all()
+
+
+def test_screen_runs_through_the_shared_engine():
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(n_hold=6))
+    book = uni.copy()
+    book["BOXX"] = safe
+    res = run_backtest(book, sig, start="2025-01-20")
+    s = summarise(res)
+    assert np.isfinite(s["CAGR"]) and -1.0 <= s["Max drawdown"] <= 0.0
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(list(globals().items())):
