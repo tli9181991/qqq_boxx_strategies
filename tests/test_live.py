@@ -33,6 +33,7 @@ from qbs.live.orders import (
 )
 from qbs.live.signals import SignalError, check_data_quality, compute_targets
 from qbs.live import state as st
+from qbs.live import store
 from qbs.universe import synthetic_universe
 
 
@@ -396,16 +397,6 @@ def test_kill_switch_detection():
         assert st.kill_switch_engaged(p)
 
 
-def test_orders_csv_gets_a_header_once():
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, "orders.csv")
-        o = [Order("AAA", "BUY", 10, 100.0, "entry")]
-        st.log_orders(p, pd.Timestamp("2026-09-09"), o, {"AAA": "Submitted"})
-        st.log_orders(p, pd.Timestamp("2026-09-10"), o, {"AAA": "Submitted"})
-        lines = open(p).read().strip().split("\n")
-        assert len(lines) == 3, "header + two rows"
-        assert lines[0].startswith("at,asof,symbol")
-
 
 # --------------------------------------------------------------------------
 # Broker: only the logic that is genuinely its own
@@ -586,3 +577,197 @@ def test_broker_qualifies_each_symbol_once(stub_ib):
     again = b.qualify(["AMD", "MU", "INTC"])
     assert set(first) == {"AMD", "MU"}
     assert set(again) == {"AMD", "MU", "INTC"}
+
+
+# --------------------------------------------------------------------------
+# The run log
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def db(tmp_path):
+    return str(tmp_path / "qbs.db")
+
+
+def test_store_creates_all_tables_on_demand(db):
+    assert store.summary(db) == {"trade_events": 0, "selection_events": 0,
+                                 "position_closes": 0, "portfolio_nav": 0,
+                                 "signal_runs": 0}
+
+
+def test_store_refuses_a_newer_schema(db):
+    import sqlite3
+    with store.connect(db):
+        pass
+    con = sqlite3.connect(db)
+    con.execute(f"PRAGMA user_version={store.SCHEMA_VERSION + 5}")
+    con.commit()
+    con.close()
+    with pytest.raises(RuntimeError, match="Upgrade the code"):
+        store.summary(db)
+
+
+def test_trade_events_are_append_only(db):
+    """A phase that ran twice really did submit twice; the log must say so."""
+    o = [Order("AMD", "BUY", 11, 505.0, "entry")]
+    store.log_orders(db, "2026-09-09", "trade", o, {"AMD": "Submitted"})
+    store.log_orders(db, "2026-09-09", "trade", o, {"AMD": "Submitted"})
+    rows = store.trades_on(db, "2026-09-09")
+    assert len(rows) == 2, "the event log must not deduplicate"
+    assert rows[0]["notional"] == pytest.approx(11 * 505.0)
+    assert rows[0]["event"] == "submitted"
+
+
+def test_daily_snapshots_upsert_instead_of_duplicating(db):
+    """Re-running reconcile for one session must correct the row, not double it."""
+    for mv in (1000.0, 1234.0):
+        store.log_position_closes(db, "2026-09-09", [
+            {"symbol": "AMD", "shares": 11, "close_price": mv / 11,
+             "market_value": mv, "unrealized_pnl": 0.0}])
+        store.log_portfolio_nav(db, "2026-09-09", total_market_value=mv,
+                                n_positions=1, source="ib")
+    closes = store.closes_on(db, "2026-09-09")
+    nav = store.nav_history(db)
+    assert len(closes) == 1 and closes[0]["market_value"] == 1234.0
+    assert len(nav) == 1 and nav[0]["total_market_value"] == 1234.0
+
+
+def test_selection_events_upsert_per_event_type(db):
+    """One name can exit on one date and enter on another; both must survive."""
+    store.log_selection(db, "2026-09-09", [
+        {"symbol": "MRVL", "event": "entry", "rank": 4, "score": 0.51},
+        {"symbol": "NVDA", "event": "exit", "rank": 14, "score": 0.10},
+        {"symbol": "AMD", "event": "hold", "rank": 2, "score": 0.63},
+    ])
+    store.log_selection(db, "2026-09-10", [
+        {"symbol": "MRVL", "event": "exit", "rank": 12, "score": 0.08}])
+    rows = store.selection_history(db)
+    assert len(rows) == 4
+    mrvl = sorted([r for r in rows if r["symbol"] == "MRVL"],
+                  key=lambda r: r["session_date"])
+    assert [r["event"] for r in mrvl] == ["entry", "exit"]
+
+
+def test_selection_rerun_is_idempotent(db):
+    """The ranking is deterministic, so logging it twice must change nothing."""
+    rows = [{"symbol": "AMD", "event": "hold", "rank": 2, "score": 0.63}]
+    store.log_selection(db, "2026-09-09", rows)
+    store.log_selection(db, "2026-09-09", rows)
+    assert store.summary(db)["selection_events"] == 1
+
+
+def test_nav_history_comes_back_oldest_first(db):
+    for d, mv in (("2026-09-07", 1.0), ("2026-09-09", 3.0), ("2026-09-08", 2.0)):
+        store.log_portfolio_nav(db, d, total_market_value=mv)
+    assert [r["total_market_value"] for r in store.nav_history(db)] == [1.0, 2.0, 3.0]
+
+
+def test_guard_trips_and_skips_are_recorded_as_events(db):
+    """A refused session must leave a trace, or the log shows a silent no-op day."""
+    store.log_note(db, "2026-09-09", "trade", "guard_tripped", "turnover 300%")
+    rows = store.trades_on(db, "2026-09-09")
+    assert len(rows) == 1
+    assert rows[0]["event"] == "guard_tripped" and "300%" in rows[0]["reason"]
+
+
+def test_fills_are_logged_with_average_price(db):
+    from qbs.live.broker import Fill
+    store.log_fills(db, "2026-09-09", [Fill("AMD", "BUY", 11, 504.25, "Filled", 77)])
+    r = store.trades_on(db, "2026-09-09")[0]
+    assert (r["event"], r["price"], r["order_id"]) == ("filled", 504.25, 77)
+
+
+def test_dry_run_orders_are_flagged_in_the_log(db):
+    store.log_orders(db, "2026-09-09", "trade", [Order("AMD", "BUY", 11, 505.0)],
+                     dry_run=True)
+    assert store.trades_on(db, "2026-09-09")[0]["dry_run"] == 1
+
+
+def test_store_rejects_an_unknown_table_name(db):
+    with pytest.raises(ValueError, match="unknown table"):
+        store.to_frame(db, "trade_events; DROP TABLE trade_events")
+
+
+def test_to_frame_round_trips_through_pandas(db):
+    store.log_orders(db, "2026-09-09", "trade", [Order("AMD", "BUY", 11, 505.0)])
+    df = store.to_frame(db, "trade_events")
+    assert list(df["symbol"]) == ["AMD"] and df["quantity"].iloc[0] == 11
+
+
+def test_signal_runs_keep_one_row_per_phase(db):
+    """Preflight and trade both keep a row, so you can see the intraday drift."""
+    class _B:
+        asof = pd.Timestamp("2026-09-09")
+        scalar, book_vol, risk_weight = 0.36, 0.62, 0.36
+        n_rankable, universe_size = 88, 99
+        raw_holdings = ["LRCX", "MU"]
+    store.log_signal_run(db, "2026-09-09", "preflight", _B())
+    store.log_signal_run(db, "2026-09-09", "trade", _B())
+    rows = store.to_frame(db, "signal_runs")
+    assert set(rows["phase"]) == {"preflight", "trade"}
+    assert rows["holdings"].iloc[0] == "LRCX,MU"
+
+
+# --------------------------------------------------------------------------
+# Selection rows come from the strategy, not from re-derivation
+# --------------------------------------------------------------------------
+
+def _book_with_selection():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame["BOXX"] = px["BOXX"]
+    return compute_targets(cfg, frame, requested=list(uni.columns),
+                           max_staleness_days=10_000, min_coverage=0.5,
+                           now=frame.index[-1]), cfg
+
+
+def test_selection_covers_every_held_name():
+    book, cfg = _book_with_selection()
+    covered = {r["symbol"] for r in book.selection if r["event"] in ("entry", "hold")}
+    assert set(book.raw_holdings) <= covered, "every held name needs a selection row"
+    assert all(r["event"] in ("entry", "exit", "hold") for r in book.selection)
+
+
+def test_selection_ranks_are_the_strategy_own_ranks():
+    """Holds carry the rank the strategy ranked them at, not a re-derived one."""
+    from qbs.strategies import cross_sectional_momentum
+
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    mom = cross_sectional_momentum(uni, px["BOXX"], cfg.momentum)
+    asof = mom.weights.index[-1]
+    truth = (mom.held_ranks or {}).get(asof, {})
+
+    frame = uni.copy()
+    frame["BOXX"] = px["BOXX"]
+    book = compute_targets(cfg, frame, requested=list(uni.columns),
+                           max_staleness_days=10_000, min_coverage=0.5, now=asof)
+    for r in book.selection:
+        if r["event"] == "hold" and r["rank"] is not None:
+            assert r["rank"] == int(truth[r["symbol"]]), f"{r['symbol']} rank drifted"
+
+
+def test_momentum_events_expose_rank_and_score_as_columns():
+    """Structured, so the run log never has to parse them back out of prose."""
+    from qbs.strategies import cross_sectional_momentum
+
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    ev = cross_sectional_momentum(uni, px["BOXX"], cfg.momentum).events
+    assert {"rank", "score"} <= set(ev.columns)
+    buys = ev[ev["action"] == "buy"]
+    assert (buys["rank"] >= 1).all() and buys["score"].notna().all()
+
+
+def test_selection_survives_a_round_trip_through_the_store(db):
+    book, _ = _book_with_selection()
+    store.log_selection(db, book.asof, book.selection)
+    rows = store.selection_history(db, limit=500)
+    assert len(rows) == len(book.selection)
+    assert {r["symbol"] for r in rows} == {r["symbol"] for r in book.selection}

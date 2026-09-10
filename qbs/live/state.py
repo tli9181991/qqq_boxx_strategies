@@ -7,13 +7,15 @@ next run would still produce exactly the right orders. That is intentional: a
 state file that fed back into the signal would be a way for one bad run to
 poison every run after it.
 
-What it does hold: what happened, when, so that a morning post-mortem does not
-require reading systemd logs.
+What it does hold: a small rolling record of run outcomes, enough for a phase
+to see what the previous one did. The *analytical* record -- every trade,
+selection and end-of-day mark -- lives in the SQLite run log (`store.py`),
+which is the thing to query when you want to know what the strategy has been
+doing rather than whether last night's run succeeded.
 """
 
 from __future__ import annotations
 
-import csv
 import json
 import logging
 import os
@@ -88,55 +90,6 @@ def record_run(
     state["last_" + phase] = {"at": utc_now_iso(), "status": status, **detail}
     save_state(path, state)
     return state
-
-
-def append_csv(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    """Append rows to a CSV, writing the header if the file is new."""
-    if not rows:
-        return
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    new = not os.path.exists(path) or os.path.getsize(path) == 0
-    with open(path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if new:
-            w.writeheader()
-        w.writerows(rows)
-
-
-ORDER_FIELDS = ["at", "asof", "symbol", "action", "quantity", "price_hint",
-                "notional", "reason", "status", "order_id", "dry_run"]
-FILL_FIELDS = ["at", "symbol", "action", "quantity", "avg_price", "order_id"]
-
-
-def log_orders(path: str, asof, orders, statuses: Optional[Dict[str, str]] = None,
-               dry_run: bool = False) -> None:
-    statuses = statuses or {}
-    now = utc_now_iso()
-    append_csv(path, [{
-        "at": now,
-        "asof": f"{asof:%Y-%m-%d}" if hasattr(asof, "strftime") else str(asof),
-        "symbol": o.symbol,
-        "action": o.action,
-        "quantity": o.quantity,
-        "price_hint": round(o.price_hint, 4),
-        "notional": round(o.notional, 2),
-        "reason": o.reason,
-        "status": statuses.get(o.symbol, ""),
-        "order_id": "",
-        "dry_run": dry_run,
-    } for o in orders], ORDER_FIELDS)
-
-
-def log_fills(path: str, fills) -> None:
-    now = utc_now_iso()
-    append_csv(path, [{
-        "at": now,
-        "symbol": f.symbol,
-        "action": f.action,
-        "quantity": f.quantity,
-        "avg_price": round(f.avg_price, 4),
-        "order_id": f.order_id,
-    } for f in fills], FILL_FIELDS)
 
 
 def kill_switch_engaged(path: str) -> bool:

@@ -50,6 +50,7 @@ class TargetBook:
     n_rankable: int = 0
     universe_size: int = 0
     diagnostics: Dict[str, float] = field(default_factory=dict)
+    selection: List[Dict] = field(default_factory=list)     # entry/exit/hold, with rank
 
     @property
     def risk_weight(self) -> float:
@@ -166,6 +167,66 @@ def check_data_quality(
     }
 
 
+
+def _selection_rows(mom, asof: pd.Timestamp, held: List[str]) -> List[Dict]:
+    """Today's stock-selection decisions, as structured rows.
+
+    Three event types, and the boring one matters most. `entry` and `exit` are
+    what changed; `hold` is every name that survived, with the rank it survived
+    at. Without the holds you cannot answer "how close was that name to being
+    dropped" after the fact, which is the question you actually have when a
+    position turns out badly.
+
+    Rank and score come from the strategy itself -- entries and exits from its
+    event rows, holds from the rank map it records on each rebalance. Nothing
+    is recomputed here: doing so would mean reimplementing the eligibility and
+    absolute-momentum filters, and a copy of that logic drifting out of sync is
+    exactly the failure this whole live layer exists to prevent.
+    """
+    rows: List[Dict] = []
+    hurdle = None
+    if "safe_momentum" in getattr(mom, "diagnostics", pd.DataFrame()).columns:
+        v = mom.diagnostics.loc[asof, "safe_momentum"]
+        hurdle = None if pd.isna(v) else float(v)
+
+    ev = mom.events
+    today = (ev[ev["date"] == asof] if ev is not None and not ev.empty
+             else pd.DataFrame())
+
+    def _num(v):
+        return None if v is None or pd.isna(v) else float(v)
+
+    changed = set()
+    for _, r in today.iterrows():
+        sym = str(r["asset"])
+        changed.add(sym)
+        rows.append(dict(
+            symbol=sym,
+            event="entry" if r["action"] == "buy" else "exit",
+            rank=None if _num(r.get("rank")) is None else int(r["rank"]),
+            score=_num(r.get("score")),
+            hurdle=hurdle,
+            reason=str(r.get("reason", "")),
+        ))
+
+    # Everything still held that did not change today, at the rank the
+    # strategy actually ranked it -- not a re-derived one.
+    scores = mom.momentum.loc[asof] if mom.momentum is not None else None
+    ranks = (mom.held_ranks or {}).get(asof, {})
+    for sym in held:
+        if sym in changed:
+            continue
+        r = _num(ranks.get(sym))
+        rows.append(dict(
+            symbol=sym, event="hold",
+            rank=None if r is None else int(r),
+            score=_num(scores.get(sym)) if scores is not None else None,
+            hurdle=hurdle,
+            reason="still within the exit band",
+        ))
+    return rows
+
+
 def compute_targets(
     cfg: Config,
     prices: pd.DataFrame,
@@ -206,6 +267,7 @@ def compute_targets(
 
     vdiag = vt.diagnostics.loc[asof]
     held = list((mom.holdings_log or {}).get(asof, []))
+    selection = _selection_rows(mom, asof, held)
 
     last_px = prices.loc[asof]
     px_map = {t: float(last_px[t]) for t in weights if t in last_px.index
@@ -224,6 +286,7 @@ def compute_targets(
         n_rankable=int(mom.diagnostics.loc[asof, "n_rankable"]),
         universe_size=uni.shape[1],
         diagnostics={k: v for k, v in diag.items()},
+        selection=selection,
     )
 
     total = sum(book.weights.values())

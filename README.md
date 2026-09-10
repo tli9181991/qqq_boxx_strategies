@@ -317,15 +317,22 @@ qbs/live/
   signals.py   today's target weights -- calls the SAME functions as the backtest
   orders.py    weights -> shares -> deltas -> guards (pure, no IB, no clock)
   broker.py    the ib_async layer: positions, MOC orders, fills
-  state.py     run records and the order/fill audit trail
-  runner.py    three phases: preflight / trade / reconcile
+  state.py     small rolling record of run outcomes
+  store.py     the run log: trades, selections, closes and NAV as SQL tables
+  runner.py    phases: preflight / trade / reconcile, plus signal and report
 deploy/        systemd units + timers, installer, runbook
 ```
 
 ```bash
 python -m qbs.live.runner signal --offline   # what would it hold today?
+python -m qbs.live.runner report             # the run log: trades, picks, closes
 sudo ./deploy/install.sh                     # provision the VM
 ```
+
+Everything the live book does is logged to SQLite at `var/qbs.db` — a
+`trade_events` log plus daily `selection_events`, `position_closes`,
+`portfolio_nav` and `signal_runs` snapshots. `store.to_frame(db, table)` hands
+any of them to pandas.
 
 Three systemd timers anchored to `America/New_York`, so US daylight saving
 moves them for you: preflight at 08:50 (proves the whole path works, sends

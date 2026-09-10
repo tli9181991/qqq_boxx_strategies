@@ -121,12 +121,9 @@ class LiveConfig:
         return os.path.join(self.state_dir, "state.json")
 
     @property
-    def orders_log_path(self) -> str:
-        return os.path.join(self.state_dir, "orders.csv")
-
-    @property
-    def fills_log_path(self) -> str:
-        return os.path.join(self.state_dir, "fills.csv")
+    def db_path(self) -> str:
+        """The run log: trades, selections, closes and NAV, as SQL tables."""
+        return os.path.join(self.state_dir, "qbs.db")
 
     # ---- loading ---------------------------------------------------------
     @classmethod

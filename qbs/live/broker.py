@@ -144,6 +144,37 @@ class IBBroker:
     def open_orders(self) -> List[object]:
         return list(self.ib.reqAllOpenOrders())
 
+    def portfolio_marks(self) -> List[Dict[str, float]]:
+        """Per-position market price and value, as IB marks them.
+
+        Used by the reconcile phase for the end-of-day close log. Taken from
+        the broker rather than re-fetched from yfinance because at 16:15 ET the
+        official close may not have propagated to a free feed yet, and because
+        a mark that disagrees with the account it is supposed to describe is
+        worse than no mark at all.
+        """
+        out: List[Dict[str, float]] = []
+        for it in self.ib.portfolio(self.account):
+            c = it.contract
+            if getattr(c, "secType", None) != "STK":
+                continue
+            out.append(dict(
+                symbol=c.symbol,
+                shares=float(it.position),
+                close_price=float(it.marketPrice),
+                market_value=float(it.marketValue),
+                avg_cost=float(it.averageCost),
+                unrealized_pnl=float(it.unrealizedPNL),
+                source="ib",
+            ))
+        return out
+
+    def cash_balance(self) -> float:
+        for v in self.ib.accountValues(self.account):
+            if v.tag == "TotalCashValue" and v.currency == "USD":
+                return float(v.value)
+        return float("nan")
+
     # ---- contracts -------------------------------------------------------
     def qualify(self, symbols: List[str]) -> Dict[str, object]:
         """Resolve symbols to IB contracts, once per session.

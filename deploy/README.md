@@ -68,8 +68,8 @@ QBS_DRY_RUN=1
 ```
 
 Every phase then runs in full — downloads, ranks, reconciles against real IB
-positions, computes the exact order list, writes it to `var/orders.csv` — and
-sends nothing. Compare a few sessions against `python run_backtest.py` on the
+positions, computes the exact order list, writes it to the run log with
+`dry_run=1` — and sends nothing. Compare a few sessions against `python run_backtest.py` on the
 same day. When the order lists stop surprising you, delete the line and
 `sudo systemctl restart qbs-trade.timer`.
 
@@ -125,10 +125,72 @@ sudo systemctl start qbs-preflight.service
 journalctl -u qbs-trade -n 100 --no-pager
 
 # The audit trail
-column -s, -t /opt/qbs/var/orders.csv | less
-column -s, -t /opt/qbs/var/fills.csv  | less
+sudo -u qbs /opt/qbs/.venv/bin/python -m qbs.live.runner report --days 20
+sqlite3 -header -column /opt/qbs/var/qbs.db "SELECT * FROM portfolio_nav ORDER BY 1 DESC LIMIT 10"
 jq '.last_trade' /opt/qbs/var/state.json
 ```
+
+---
+
+## The run log
+
+Every trade, selection and end-of-day mark goes into one SQLite file,
+`/opt/qbs/var/qbs.db`. `runner report` prints it; anything more specific is a
+query.
+
+| Table | One row per | Holds |
+|---|---|---|
+| `trade_events` | thing that happened | submissions, fills, cancellations, guard trips, skipped sessions |
+| `selection_events` | (date, symbol, event) | `entry` / `exit` / `hold`, with the rank and 12-1 momentum the strategy actually used |
+| `position_closes` | (date, symbol) | shares, close price, market value, unrealised P&L, target vs actual weight |
+| `portfolio_nav` | date | book market value, NetLiquidation, cash, risk weight, the vol scalar |
+| `signal_runs` | (date, phase) | what the signal said, kept for preflight *and* trade so you can see the intraday drift |
+
+`trade_events` is **append-only** — a phase that ran twice really did submit
+twice, and the log should say so. Everything else **upserts on its natural
+key**, so re-running reconcile for a session corrects the row instead of
+doubling it.
+
+**Why `hold` rows and not just entries and exits.** The boring rows are the
+ones you want later: when a position turns out badly, the question is how close
+it was to being dropped, and that is only answerable if the rank was recorded
+every day it survived. Those ranks come from the strategy's own rank map, not
+from re-ranking afterwards — a re-derivation would have to reimplement the
+eligibility and absolute-momentum filters, and a second copy of that logic is
+exactly what drifts.
+
+Some useful queries:
+
+```sql
+-- equity curve
+SELECT session_date, total_market_value, net_liquidation, risk_weight, scalar
+FROM portfolio_nav ORDER BY session_date;
+
+-- how long each name was held, and at what rank it came in
+SELECT symbol, session_date, event, rank, score
+FROM selection_events WHERE event IN ('entry','exit') ORDER BY symbol, session_date;
+
+-- submitted vs filled, to see auction slippage
+SELECT s.symbol, s.quantity, s.price AS decided, f.price AS filled,
+       (f.price - s.price) / s.price AS slip
+FROM trade_events s JOIN trade_events f
+  ON s.symbol = f.symbol AND s.session_date = f.session_date
+WHERE s.event = 'submitted' AND f.event = 'filled';
+
+-- every session the guards refused, and why
+SELECT session_date, reason FROM trade_events WHERE event = 'guard_tripped';
+```
+
+In the notebook, `store.to_frame(db, "portfolio_nav")` hands any table straight
+to pandas.
+
+Close prices are **IB's own portfolio marks**, not a re-fetch from yfinance. At
+16:15 ET the official close may not have reached a free feed yet, and a mark
+that disagrees with the account it describes is worse than no mark.
+
+As with `state.json`, nothing in this database feeds the signal. Delete it and
+the next run still trades exactly the same book; you lose the history, not the
+strategy.
 
 ### Kill switch
 

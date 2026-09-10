@@ -42,6 +42,7 @@ from qbs.live.config import LiveConfig
 from qbs.live.orders import GuardTripped, build_orders, format_order_table
 from qbs.live.signals import compute_targets, load_live_prices
 from qbs.live import state as st
+from qbs.live import store
 
 log = logging.getLogger("qbs.live")
 
@@ -186,6 +187,9 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
         st.record_run(live.state_path, "preflight", "error", {"reason": str(exc)})
         return EXIT_CONFIG
 
+    session = market_today(live.market_tz).date()
+    store.log_signal_run(live.db_path, session, "preflight", book)
+    store.log_selection(live.db_path, book.asof, book.selection)
     st.record_run(live.state_path, "preflight", "ok", {
         "asof": f"{book.asof:%Y-%m-%d}",
         "scalar": round(book.scalar, 4),
@@ -224,11 +228,20 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
     if not _bar_is_today(book, live.market_tz) and not force:
         log.warning("last bar is %s, not today (%s) -- market closed or data late. "
                     "Not trading.", book.asof.date(), market_today(live.market_tz).date())
+        store.log_signal_run(live.db_path, market_today(live.market_tz).date(),
+                             "trade", book, "skipped", "no bar for today")
         st.record_run(live.state_path, "trade", "skipped",
                       {"reason": "no bar for today", "asof": f"{book.asof:%Y-%m-%d}"})
         return EXIT_OK
 
     log.info("target book:\n%s", book.describe())
+
+    session = market_today(live.market_tz).date()
+    # Logged before anything is sent: the selection is what the strategy
+    # decided, and it stays true whether or not the orders make it out.
+    store.log_signal_run(live.db_path, session, "trade", book)
+    n_sel = store.log_selection(live.db_path, book.asof, book.selection)
+    log.info("logged %d selection events for %s", n_sel, book.asof.date())
 
     from qbs.live.broker import BrokerError, IBBroker
     try:
@@ -260,6 +273,8 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
                     "Tomorrow's run recomputes from scratch and will correct the book.")
 
             if not orders:
+                store.log_note(live.db_path, session, "trade", "no_change",
+                               "live book already matches the target")
                 st.record_run(live.state_path, "trade", "flat", {
                     "asof": f"{book.asof:%Y-%m-%d}", "n_orders": 0,
                     "scalar": round(book.scalar, 4)})
@@ -267,15 +282,21 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
 
             results = broker.submit_moc(orders)
             statuses = {r.symbol: r.status for r in results}
-            st.log_orders(live.orders_log_path, book.asof, orders, statuses,
-                          dry_run=live.dry_run)
+            store.log_orders(live.db_path, session, "trade", orders, statuses,
+                             dry_run=live.dry_run)
 
     except GuardTripped as exc:
         log.error("GUARD TRIPPED, nothing sent: %s", exc)
+        # A refused session is a trading event: without a row here the log
+        # shows a day that simply did nothing, with no record of why.
+        store.log_note(live.db_path, session, "trade", "guard_tripped", str(exc))
+        store.log_signal_run(live.db_path, session, "trade", book, "guard", str(exc))
         st.record_run(live.state_path, "trade", "guard", {"reason": str(exc)})
         return EXIT_GUARD
     except BrokerError as exc:
         log.error("broker problem: %s", exc)
+        store.log_note(live.db_path, session, "trade", "error", str(exc))
+        store.log_signal_run(live.db_path, session, "trade", book, "error", str(exc))
         st.record_run(live.state_path, "trade", "error", {"reason": str(exc)})
         return EXIT_CONFIG
 
@@ -294,8 +315,16 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
 
 
 def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
-    """After the close: what filled, what the book is now, cancel any straggler."""
+    """After the close: what filled, what the book is worth, cancel any straggler.
+
+    This is the phase that writes the end-of-day marks, so it is the one that
+    builds the equity curve. Prices come from IB's own portfolio marks rather
+    than a re-fetch: at 16:15 the official close may not have reached a free
+    feed yet, and a mark that disagrees with the account it describes is worse
+    than no mark.
+    """
     log.info("=== RECONCILE ===")
+    session = market_today(live.market_tz).date()
 
     from qbs.live.broker import BrokerError, IBBroker
     try:
@@ -303,33 +332,70 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
             cancelled = broker.cancel_all_open()
             if cancelled:
                 log.warning("cancelled %d order(s) still open after the close", cancelled)
+                store.log_note(live.db_path, session, "reconcile", "cancelled",
+                               f"{cancelled} order(s) still open after the close")
 
             fills = broker.todays_fills()
-            st.log_fills(live.fills_log_path, fills)
+            store.log_fills(live.db_path, session, fills)
             for f in fills:
                 log.info("fill: %s %s %s @ %.4f", f.action, f.quantity, f.symbol,
                          f.avg_price)
             if not fills:
                 log.info("no fills reported this session")
 
+            marks = broker.portfolio_marks()
             positions = broker.positions()
             nlv = broker.net_liquidation()
-            log.info("end-of-day positions: %s", positions or "(flat)")
-            log.info("NetLiquidation: $%s", f"{nlv:,.0f}")
+            cash = broker.cash_balance()
 
-            # Did the auction actually leave us where the signal wanted? A
-            # symbol the trade phase sent that is still not at its target is
-            # an unfilled or partially-filled MOC, which is worth seeing in
-            # the morning rather than discovering from a P&L discrepancy.
+            total_mv = sum(m["market_value"] for m in marks)
+            total_pnl = sum(m["unrealized_pnl"] for m in marks
+                            if m["unrealized_pnl"] == m["unrealized_pnl"])
+
+            # Actual weights are measured against the book we intended to run,
+            # not against NLV: the whole point of a fixed notional is that
+            # target and actual are comparable on the same denominator.
+            denom = live.notional or total_mv or 1.0
             last = st.load_state(live.state_path).get("last_trade") or {}
+            for m in marks:
+                m["actual_weight"] = m["market_value"] / denom
+            store.log_position_closes(live.db_path, session, marks)
+
+            risk_mv = sum(m["market_value"] for m in marks
+                          if m["symbol"] != live.safe_asset)
+            store.log_portfolio_nav(
+                live.db_path, session,
+                total_market_value=total_mv,
+                net_liquidation=None if nlv != nlv else nlv,
+                cash=None if cash != cash else cash,
+                n_positions=len(marks),
+                risk_weight=risk_mv / denom,
+                scalar=last.get("scalar"),
+                book_vol=last.get("book_vol"),
+                unrealized_pnl=total_pnl,
+                source="ib",
+            )
+
+            log.info("end-of-day positions: %s", positions or "(flat)")
+            log.info("marked book $%s across %d positions (risk %.0f%%), "
+                     "NetLiquidation $%s",
+                     f"{total_mv:,.0f}", len(marks), 100 * risk_mv / denom,
+                     f"{nlv:,.0f}")
+
+            # Did the auction leave us where the signal wanted? A symbol the
+            # trade phase sent that is still not held is an unfilled MOC, worth
+            # seeing in the morning rather than from a P&L discrepancy.
             if last.get("status") == "submitted" and not last.get("dry_run"):
                 expected = last.get("holdings") or []
                 missing = [t for t in expected if positions.get(t, 0) == 0]
                 if missing:
                     log.warning("signal wanted %s but the book holds none of: %s",
                                 expected, missing)
+                    store.log_note(live.db_path, session, "reconcile", "unfilled",
+                                   f"no position in {', '.join(missing)}")
     except BrokerError as exc:
         log.error("broker problem: %s", exc)
+        store.log_note(live.db_path, session, "reconcile", "error", str(exc))
         st.record_run(live.state_path, "reconcile", "error", {"reason": str(exc)})
         return EXIT_CONFIG
 
@@ -338,8 +404,60 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
         "cancelled": cancelled,
         "positions": positions,
         "net_liquidation": round(nlv, 2) if nlv == nlv else None,
+        "total_market_value": round(total_mv, 2),
     })
     log.info("reconcile OK")
+    return EXIT_OK
+
+
+def phase_report(live: LiveConfig, days: int = 10) -> int:
+    """Print the run log. No broker, no network -- just the tables."""
+    counts = store.summary(live.db_path)
+    print(f"\nrun log: {live.db_path}")
+    print("  " + "   ".join(f"{k}={v}" for k, v in counts.items()) + "\n")
+
+    nav = store.nav_history(live.db_path, limit=days)
+    if nav:
+        print("PORTFOLIO CLOSES")
+        print(f"  {'date':<12}{'market value':>14}{'NAV':>14}{'risk':>7}"
+              f"{'scalar':>8}{'positions':>11}{'unreal P&L':>13}")
+        for r in nav:
+            print(f"  {r['session_date']:<12}"
+                  f"{(r['total_market_value'] or 0):>14,.0f}"
+                  f"{(r['net_liquidation'] or 0):>14,.0f}"
+                  f"{(r['risk_weight'] or 0):>7.0%}"
+                  f"{(r['scalar'] or 0):>8.2f}"
+                  f"{(r['n_positions'] or 0):>11}"
+                  f"{(r['unrealized_pnl'] or 0):>13,.0f}")
+        print()
+
+    sel = store.selection_history(live.db_path, limit=40)
+    if sel:
+        print("STOCK SELECTION")
+        print(f"  {'date':<12}{'symbol':<8}{'event':<7}{'rank':>6}{'12-1 mom':>11}"
+              f"  reason")
+        for r in sel:
+            rank = "" if r["rank"] is None else f"{r['rank']:.0f}"
+            score = "" if r["score"] is None else f"{r['score']:+.1%}"
+            print(f"  {r['session_date']:<12}{r['symbol']:<8}{r['event']:<7}"
+                  f"{rank:>6}{score:>11}  {r['reason'] or ''}")
+        print()
+
+    trades = store.recent_trades(live.db_path, limit=40)
+    if trades:
+        print("TRADING EVENTS (most recent first)")
+        print(f"  {'date':<12}{'phase':<11}{'event':<14}{'symbol':<8}{'side':<6}"
+              f"{'qty':>8}{'price':>11}{'notional':>12}")
+        for r in trades:
+            print(f"  {r['session_date']:<12}{r['phase']:<11}{r['event']:<14}"
+                  f"{(r['symbol'] or ''):<8}{(r['action'] or ''):<6}"
+                  f"{(r['quantity'] or 0):>8.0f}"
+                  f"{(r['price'] or 0):>11,.2f}{(r['notional'] or 0):>12,.0f}"
+                  + (f"  {r['reason']}" if r["event"] in
+                     ("guard_tripped", "error", "unfilled", "no_change") else ""))
+        print()
+    if not any((nav, sel, trades)):
+        print("(the run log is empty -- no phase has written to it yet)")
     return EXIT_OK
 
 
@@ -350,9 +468,11 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("phase", choices=["preflight", "trade", "reconcile", "signal"],
-                   help="which phase to run ('signal' prints the target book and exits, "
-                        "touching no broker)")
+    p.add_argument("phase",
+                   choices=["preflight", "trade", "reconcile", "signal", "report"],
+                   help="which phase to run. 'signal' prints the target book and "
+                        "exits, touching no broker; 'report' prints the run log "
+                        "and touches neither broker nor network")
     p.add_argument("--config", default=None,
                    help="path to the live JSON config (or set QBS_LIVE_CONFIG)")
     p.add_argument("--notional", type=float, default=None,
@@ -363,6 +483,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="signal phase only: use the CSV cache, no network")
     p.add_argument("--force", action="store_true",
                    help="trade even if the feed has no bar for today (debugging only)")
+    p.add_argument("--days", type=int, default=10,
+                   help="report: how many sessions of closes to show")
     p.add_argument("--logfile", default=None, help="also write the run log here")
     p.add_argument("-v", "--verbose", action="store_true")
     return p
@@ -398,6 +520,8 @@ def main(argv=None) -> int:
             return EXIT_ERROR
         print(book.describe())
         return EXIT_OK
+    if args.phase == "report":
+        return phase_report(live, days=args.days)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":

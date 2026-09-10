@@ -37,6 +37,7 @@ class StrategySignals:
     holding: Optional[pd.Series] = None       # which asset(s) held on each day
     holdings_log: Optional[Dict] = None       # momentum: date -> list of tickers
     momentum: Optional[pd.DataFrame] = None   # momentum: the ranking scores
+    held_ranks: Optional[Dict] = None         # momentum: date -> {ticker: rank}
 
     def exposure(self, asset: str) -> pd.Series:
         if asset not in self.weights.columns:
@@ -45,7 +46,8 @@ class StrategySignals:
 
 
 def _empty_events() -> pd.DataFrame:
-    return pd.DataFrame(columns=["date", "action", "asset", "price", "reason"])
+    return pd.DataFrame(columns=["date", "action", "asset", "price", "reason",
+                                 "rank", "score"])
 
 
 # ==========================================================================
@@ -402,6 +404,7 @@ def cross_sectional_momentum(
     held: List[str] = []
     events: List[Dict] = []
     holdings_log: Dict[pd.Timestamp, List[str]] = {}
+    held_ranks: Dict[pd.Timestamp, Dict[str, float]] = {}
     n_cash_slots: Dict[pd.Timestamp, int] = {}
 
     for dt in px.index:
@@ -428,6 +431,11 @@ def cross_sectional_momentum(
                         price=float(px.at[dt, t]) if t in px.columns else np.nan,
                         reason=(f"rank {rank.get(t, float('nan')):.0f} > {p.exit_rank}"
                                 if t in rank.index else "no longer eligible"),
+                        # Structured alongside the prose: the live run log stores
+                        # these as columns, and parsing them back out of `reason`
+                        # would break the first time the wording changed.
+                        rank=float(rank.get(t, np.nan)),
+                        score=float(row.get(t, np.nan)),
                     ))
 
             for t in order.index:
@@ -438,8 +446,15 @@ def cross_sectional_momentum(
                     events.append(dict(
                         date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
                         reason=f"rank {rank[t]:.0f}, 12-1 mom {order[t]:+.1%}",
+                        rank=float(rank[t]),
+                        score=float(order[t]),
                     ))
             held = keep
+            # The rank each held name survived at, recorded where it is known
+            # exactly. Recomputing this outside the loop would mean redoing the
+            # eligibility and absolute-momentum filters, and a copy of that
+            # logic is precisely what drifts.
+            held_ranks[dt] = {t: float(rank.get(t, np.nan)) for t in held}
 
         holdings_log[dt] = list(held)
         n_cash_slots[dt] = p.n_hold - len(held)
@@ -474,6 +489,7 @@ def cross_sectional_momentum(
     sig = StrategySignals(name, weights, diagnostics, ev, params=p.__dict__.copy())
     sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
     sig.holdings_log = holdings_log
+    sig.held_ranks = held_ranks
     sig.momentum = mom
     return sig
 
@@ -598,6 +614,7 @@ def vix_circuit_breaker(
                           params=p.__dict__.copy())
     sig.holding = regime
     sig.holdings_log = base.holdings_log
+    sig.held_ranks = base.held_ranks
     sig.momentum = base.momentum
     return sig
 
@@ -708,6 +725,7 @@ def book_vol_target(
                           params=p.__dict__.copy())
     sig.holding = base.holding
     sig.holdings_log = base.holdings_log
+    sig.held_ranks = base.held_ranks
     sig.momentum = base.momentum
     return sig
 
