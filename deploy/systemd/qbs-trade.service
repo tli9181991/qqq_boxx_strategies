@@ -1,0 +1,33 @@
+[Unit]
+Description=QBS Top-6 vol-targeted: rank and submit MOC
+Documentation=file:/opt/qbs/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=qbs
+Group=qbs
+WorkingDirectory=/opt/qbs
+EnvironmentFile=-/etc/qbs/live.env
+ExecStart=/opt/qbs/.venv/bin/python -m qbs.live.runner trade
+
+# Hard stop well before the 15:45 MOC cutoff. A run still going at 15:44 has
+# already failed at its job; the runner's own cutoff check is the polite
+# version of this, and this is the backstop.
+TimeoutStartSec=780
+
+# Deliberately NO Restart. A retry would recompute and resubmit orders against
+# a book the first attempt may already have moved. One shot; if it fails, the
+# next session recomputes from scratch and corrects.
+Restart=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-trade
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qbs/var /opt/qbs/data

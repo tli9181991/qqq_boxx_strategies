@@ -1,0 +1,22 @@
+{
+  "ib_host": "127.0.0.1",
+  "ib_port": 4002,
+  "ib_client_id": 17,
+  "ib_account": "",
+
+  "notional": 100000.0,
+  "hold_safe_asset": true,
+
+  "min_order_notional": 250.0,
+  "max_order_notional": 40000.0,
+  "max_gross_turnover": 1.6,
+  "max_positions": 12,
+  "moc_cutoff_hhmm": "15:45",
+  "max_price_staleness_days": 5,
+  "min_universe_coverage": 0.85,
+
+  "state_dir": "/opt/qbs/var",
+  "market_tz": "America/New_York",
+  "dry_run": false,
+  "allow_live_account": false
+}

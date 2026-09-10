@@ -1,0 +1,30 @@
+[Unit]
+Description=QBS Top-6 vol-targeted: morning preflight (no orders)
+Documentation=file:/opt/qbs/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=qbs
+Group=qbs
+WorkingDirectory=/opt/qbs
+EnvironmentFile=-/etc/qbs/live.env
+ExecStart=/opt/qbs/.venv/bin/python -m qbs.live.runner preflight
+TimeoutStartSec=900
+
+# The Gateway may still be logging in when this fires; retry rather than
+# failing the morning over a few seconds of startup.
+Restart=on-failure
+RestartSec=120
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-preflight
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qbs/var /opt/qbs/data

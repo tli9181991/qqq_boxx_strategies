@@ -1,0 +1,16 @@
+[Unit]
+Description=QBS preflight at 08:50 ET (5 min after the instance starts)
+
+[Timer]
+# All three timers are anchored to exchange local time, so US daylight saving
+# moves them automatically and the HK-local equivalents shift with it.
+OnCalendar=Mon-Fri *-*-* 08:50:00 America/New_York
+
+# Persistent=true is safe here and only here: preflight sends no orders, so a
+# late catch-up run after a delayed boot is merely a late health check.
+Persistent=true
+AccuracySec=30s
+Unit=qbs-preflight.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,27 @@
+[Unit]
+Description=QBS Top-6 vol-targeted: post-close reconcile
+Documentation=file:/opt/qbs/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=qbs
+Group=qbs
+WorkingDirectory=/opt/qbs
+EnvironmentFile=-/etc/qbs/live.env
+ExecStart=/opt/qbs/.venv/bin/python -m qbs.live.runner reconcile
+TimeoutStartSec=300
+Restart=on-failure
+RestartSec=60
+StartLimitBurst=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-reconcile
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qbs/var /opt/qbs/data

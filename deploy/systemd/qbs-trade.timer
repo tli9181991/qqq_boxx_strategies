@@ -1,0 +1,16 @@
+[Unit]
+Description=QBS rank + submit MOC at 15:30 ET
+
+[Timer]
+OnCalendar=Mon-Fri *-*-* 15:30:00 America/New_York
+
+# Persistent=false is critical. With Persistent=true, an instance that booted
+# late -- or a maintenance reboot at 16:30 -- would fire this immediately and
+# submit MOC orders against a signal for an auction that has already happened.
+# A missed session must stay missed; tomorrow's run recomputes and corrects.
+Persistent=false
+AccuracySec=1s
+Unit=qbs-trade.service
+
+[Install]
+WantedBy=timers.target

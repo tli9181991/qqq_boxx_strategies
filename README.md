@@ -306,6 +306,40 @@ charts — works on it unchanged.
 
 ---
 
+## Running it live
+
+The Top-6 vol-targeted book can be deployed to IB paper on a small VM. See
+**[`deploy/README.md`](deploy/README.md)** for the runbook.
+
+```
+qbs/live/
+  config.py    deployment settings: account, sizing, safety limits
+  signals.py   today's target weights -- calls the SAME functions as the backtest
+  orders.py    weights -> shares -> deltas -> guards (pure, no IB, no clock)
+  broker.py    the ib_insync layer: positions, MOC orders, fills
+  state.py     run records and the order/fill audit trail
+  runner.py    three phases: preflight / trade / reconcile
+deploy/        systemd units + timers, installer, runbook
+```
+
+```bash
+python -m qbs.live.runner signal --offline   # what would it hold today?
+sudo ./deploy/install.sh                     # provision the VM
+```
+
+Three systemd timers anchored to `America/New_York`, so US daylight saving
+moves them for you: preflight at 08:50 (proves the whole path works, sends
+nothing), rank-and-submit-MOC at 15:30, reconcile at 16:15.
+
+**The signal is recomputed from full price history on every run.** Nothing in
+the state file feeds it -- delete the file and the next run still produces
+exactly the right orders. Both the hysteresis band and the vol scalar are
+path-dependent, so carrying yesterday's state forward would let one missed run
+silently fork the live book from the strategy. Recomputing costs seconds and
+makes a missed session self-healing; never replay one by hand.
+
+---
+
 ## Chart conventions
 
 - **One y-axis per panel, never two.** Price and RSI, or price and vol and exposure,

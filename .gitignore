@@ -22,3 +22,6 @@ output/
 
 # NOTE: data/*.csv is deliberately TRACKED -- the cached price history is what
 # makes `run_backtest.py --offline` work without a data feed.
+
+# Live runner state, order and fill logs (host-local, never committed)
+var/

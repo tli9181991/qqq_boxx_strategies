@@ -1,0 +1,11 @@
+[Unit]
+Description=QBS post-close reconcile at 16:15 ET
+
+[Timer]
+OnCalendar=Mon-Fri *-*-* 16:15:00 America/New_York
+Persistent=false
+AccuracySec=30s
+Unit=qbs-reconcile.service
+
+[Install]
+WantedBy=timers.target
