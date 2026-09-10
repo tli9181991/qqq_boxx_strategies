@@ -242,6 +242,14 @@ to be *boring* — a kink would mean the overlay is doing more than rescaling.
 
 ---
 
+## How it fits together
+
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)** walks through every module --
+what it does, why it is shaped that way, and the code that carries the decision.
+Start there if you are reading this codebase for the first time.
+
+---
+
 ## Layout
 
 ```
