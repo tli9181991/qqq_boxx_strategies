@@ -48,7 +48,12 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     image: qbs-live:latest
-    container_name: qbs-live
+    # Deliberately no container_name. Every phase is a `run --rm`, so Compose
+    # names each one uniquely and two can coexist. With a fixed name they
+    # cannot: a preflight that hung and was retried by systemd could still be
+    # alive at 15:30, and the trade phase would then die on a name collision
+    # rather than submit. Nothing needs to address this container by name.
+    #
     # Keeps `docker compose up` from ever starting the trader. `run` enables
     # the profile automatically for the service it names.
     profiles:
