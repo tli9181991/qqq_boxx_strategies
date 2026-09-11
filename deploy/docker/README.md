@@ -180,16 +180,16 @@ Then point a VNC client at `localhost:5900` with your `VNC_PASSWORD`. Use this
 to confirm the API is enabled and to clear any dialog the Gateway is stuck on.
 Close the tunnel when you are done.
 
-## Step 6 — Prove the connection, both ways
+## Step 6 — Prove the connection
 
-From the host first — this is the simpler failure to diagnose:
+First, cheaply: did the Gateway publish the port at all? No Python involved.
 
 ```bash
-pip install --user ib_async
-python3 deploy/docker/test_ib.py
+sudo ss -tlnp | grep 4002        # expect a LISTEN line on 127.0.0.1:4002
 ```
 
-Then from inside the compose network, which is what the trader actually does:
+Then the test that matters — from inside the compose network, which is exactly
+the path the trader takes:
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml build
@@ -197,8 +197,26 @@ docker compose -f deploy/docker/docker-compose.yml run --rm \
   --entrypoint python qbs test_ib.py
 ```
 
-Both must print `Connected` and a `DU…` account number. The script warns if the
-account does not look like a paper account.
+It must print `Connected` and a `DU…` account number; the script warns if the
+account does not look like a paper one. The image already has `ib_async` pinned,
+so nothing needs installing on the host for this.
+
+### Optionally, the same test from the host
+
+Useful only to split "the Gateway is broken" from "the compose network is
+broken". Do **not** `pip install --user` — Ubuntu 24.04 and later mark the
+system Python as externally managed (PEP 668) and will refuse. Use a venv:
+
+```bash
+sudo apt-get install -y python3-venv          # if it is not already there
+python3 -m venv ~/.venv-qbs
+~/.venv-qbs/bin/pip install -q ib_async
+~/.venv-qbs/bin/python deploy/docker/test_ib.py
+```
+
+Never reach for `--break-system-packages` on this box. Ubuntu's own tooling runs
+on that interpreter, and apt is not something you want to repair on a machine
+that is supposed to be trading unattended.
 
 **If the host test passes and the container test fails**, it is the hostname:
 inside the network the Gateway is `ib-gateway`, never `127.0.0.1`.
