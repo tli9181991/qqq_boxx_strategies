@@ -59,12 +59,37 @@ cd /opt/qbs
 
 Everything below runs from `/opt/qbs`.
 
-## Step 2 — Swap, before anything else
+## Step 2 — Disk, then swap
 
-A t3.small has 2 GB. The Gateway's JVM takes most of 1 GB, and the trade phase
-holds a ~100-ticker × 1500-row price frame. It fits, but without swap the OOM
-killer will eventually take the Python process mid-session — and it does that
-silently. You would find out from a missing auction, not an error.
+A t3.small has 2 GB of RAM. The Gateway's JVM takes most of 1 GB, and the trade
+phase holds a ~100-ticker × 1500-row price frame. It fits, but without swap the
+OOM killer will eventually take the Python process mid-session — and it does
+that silently. You would find out from a missing auction, not an error.
+
+**Check the disk first.** A 2 GB swapfile needs 2 GB of free disk, and the
+default 8 GB root volume plus the `ib-gateway` image (1–2 GB) does not leave it:
+
+```bash
+df -h /
+docker system df        # images are usually what filled it
+```
+
+If free space is under ~2.5 GB, deal with that before going further:
+
+```bash
+# Best: grow the volume. 8 GB is too small for Gateway + this app + swap.
+# 30 GB is still free-tier eligible. Modify the EBS volume in the console, then:
+lsblk
+sudo growpart /dev/nvme0n1 1      # use the device lsblk actually shows
+sudo resize2fs /dev/nvme0n1p1     # or: sudo xfs_growfs /
+df -h /
+
+# Or reclaim:
+docker system prune -a
+sudo apt-get clean && sudo journalctl --vacuum-size=100M
+```
+
+Then create the swapfile:
 
 ```bash
 sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
@@ -74,6 +99,14 @@ sudo sysctl -w vm.swappiness=10
 echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
 free -h        # confirm 2.0Gi of swap
 ```
+
+If `fallocate` fails with **"No space left on device"**, stop and fix the disk —
+and check for a partial file first, because a half-written swapfile is holding
+space you need: `sudo swapoff /swapfile 2>/dev/null; sudo rm -f /swapfile`.
+
+> **Do not run `deploy/install.sh`.** That is the native install path. It builds
+> a venv and installs systemd units with the *same names* as the Docker ones, so
+> whichever you install last silently wins. Everything you need is on this page.
 
 ## Step 3 — Fill in the environment file
 

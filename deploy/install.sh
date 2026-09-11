@@ -23,10 +23,62 @@ die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 # 1. Swap. A t3.small has 2 GB, and IB Gateway's JVM wants most of 1 GB of it.
 #    Add pandas plus a 100-ticker download and the OOM killer becomes a real
 #    risk -- and it will pick the Python process, mid-session, silently.
+#
+#    Check free disk BEFORE allocating. The obvious `fallocate || dd` fallback
+#    is actively dangerous on a nearly-full root volume: fallocate fails fast
+#    and cleanly, but dd then writes zeros until the disk is 100% full, which
+#    breaks far more than the install it was trying to rescue. So: refuse up
+#    front if the space is not there, and delete any partial file on failure.
 # --------------------------------------------------------------------------
-if [[ ! -f /swapfile ]]; then
-  log "creating a 2G swapfile (t3.small has only 2G of RAM)"
-  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+SWAP_GB="${SWAP_GB:-2}"
+SWAP_HEADROOM_MB=512     # never take the volume to completely full
+
+make_swapfile() {
+  local gb="$1"
+  if fallocate -l "${gb}G" /swapfile 2>/dev/null; then
+    return 0
+  fi
+  # fallocate is unsupported on some filesystems (older ext3, ZFS), which is a
+  # different failure from "no room" -- and one dd genuinely can rescue, now
+  # that free space has already been checked.
+  log "fallocate unsupported here, falling back to dd"
+  dd if=/dev/zero of=/swapfile bs=1M count=$((gb * 1024)) status=none
+}
+
+if swapon --show=NAME --noheadings 2>/dev/null | grep -q .; then
+  log "swap already active, skipping ($(free -h | awk '/Swap:/ {print $2}') total)"
+elif [[ -f /swapfile ]]; then
+  log "/swapfile exists but is not active; leaving it alone. Remove it and"
+  log "  re-run if you want it rebuilt:  sudo rm -f /swapfile"
+else
+  avail_mb=$(df -Pm / | awk 'NR==2 {print $4}')
+  need_mb=$((SWAP_GB * 1024 + SWAP_HEADROOM_MB))
+  if (( avail_mb < need_mb )); then
+    die "$(cat <<MSG
+only ${avail_mb} MB free on / but a ${SWAP_GB}G swapfile needs ${need_mb} MB
+(including ${SWAP_HEADROOM_MB} MB headroom). Nothing was written.
+
+Pick one:
+  1. Grow the volume. 8 GB is too small for Gateway + this app + swap; 30 GB
+     is still free-tier eligible. Modify the EBS volume in the console, then:
+       lsblk
+       sudo growpart /dev/nvme0n1 1     # use the device lsblk shows
+       sudo resize2fs /dev/nvme0n1p1    # or: sudo xfs_growfs /
+  2. Reclaim space:
+       docker system df                 # usually the culprit
+       docker system prune -a
+       sudo apt-get clean && sudo journalctl --vacuum-size=100M
+  3. Use a smaller swapfile, thinner than ideal but better than none:
+       SWAP_GB=1 sudo -E ./deploy/install.sh
+MSG
+)"
+  fi
+
+  log "creating a ${SWAP_GB}G swapfile (${avail_mb} MB free on /)"
+  if ! make_swapfile "$SWAP_GB"; then
+    rm -f /swapfile
+    die "could not allocate /swapfile; the partial file has been removed"
+  fi
   chmod 600 /swapfile
   mkswap /swapfile >/dev/null
   swapon /swapfile
@@ -34,8 +86,6 @@ if [[ ! -f /swapfile ]]; then
   # Prefer reclaiming page cache over swapping the Gateway out from under itself.
   sysctl -w vm.swappiness=10 >/dev/null
   grep -q '^vm.swappiness' /etc/sysctl.conf || echo 'vm.swappiness=10' >> /etc/sysctl.conf
-else
-  log "swapfile already present, skipping"
 fi
 
 # --------------------------------------------------------------------------

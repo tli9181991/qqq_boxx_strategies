@@ -25,12 +25,23 @@ Local-time equivalents, since the timers follow US daylight saving:
 
 ---
 
-## Two ways to install
+## Which path are you on?
 
-**Docker** — if IB Gateway runs in a container (`gnzsnz/ib-gateway`), follow
-**[`deploy/docker/README.md`](docker/README.md)** instead of this page. Same
-three phases and the same timers; the units call `docker compose run` rather
-than a venv.
+Two install paths. **Pick one and use only its files** — both install systemd
+units with the same names, so installing both means whichever ran last silently
+wins.
+
+| | **Docker** | **Native** |
+|---|---|---|
+| Gateway runs | in a container (`gnzsnz/ib-gateway`) | installed on the host |
+| Follow | **[`deploy/docker/README.md`](docker/README.md)** | this page |
+| Config | `deploy/docker/.env.example` → `deploy/docker/.env` | `deploy/live.env.example` → `/etc/qbs/live.env` |
+| Units | `deploy/docker/systemd/` | `deploy/systemd/` |
+| Installer | none — the runbook is the installer | `sudo ./deploy/install.sh` |
+
+The quick way to tell the config files apart: only the Docker `.env` holds
+`TWS_USERID` / `TWS_PASSWORD`, because there the Gateway is a container that
+needs the login passed in. On the native path the Gateway holds its own.
 
 **Native** — Gateway installed on the host:
 
