@@ -67,6 +67,12 @@ services:
       # container -- not the 4002 published to the host.
       QBS_IB_PORT: "${IBG_PAPER_PORT:-4004}"
       QBS_STATE_DIR: /app/var
+      # The container runs as your host UID, which has no home directory in
+      # the image, so yfinance cannot create its timezone cache under / and
+      # logs two permission errors per run. Harmless -- it falls back to
+      # fetching tz data each time -- but it is noise in the journal, and at
+      # 15:30 you want a clean log where a real error stands out.
+      HOME: /tmp
       QBS_NOTIONAL: "${QBS_NOTIONAL:-100000}"
       QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"
       # Leave DRY_RUN on until you have watched a few sessions.
