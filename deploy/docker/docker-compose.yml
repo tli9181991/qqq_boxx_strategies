@@ -1,11 +1,19 @@
 # IB Gateway plus the live trader, on one Docker network.
 #
 #   docker compose -f deploy/docker/docker-compose.yml up -d ib-gateway
-#   docker compose -f deploy/docker/docker-compose.yml run --rm qbs preflight
+#   docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
 #
 # Only the Gateway is a long-running service. The trader is three short phases
 # that each run to completion, so it sits behind a profile and is invoked with
 # `run --rm` -- `up` must never start it.
+#
+# Always pass --no-deps to `run`. Without it Compose re-evaluates the Gateway's
+# configuration on every single phase, and since the Gateway reads the whole of
+# .env, changing any variable in that file -- QBS_DRY_RUN, say -- makes its
+# config hash differ and Compose recreates it. That throws away a logged-in
+# session, which takes minutes to rebuild and may happen at 15:30 with the
+# auction fifteen minutes away. The Gateway is `restart: unless-stopped` and
+# already running, so there is nothing for `run` to start anyway.
 
 name: qbs
 

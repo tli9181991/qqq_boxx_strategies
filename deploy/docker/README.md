@@ -210,7 +210,7 @@ the path the trader takes:
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml build
-docker compose -f deploy/docker/docker-compose.yml run --rm \
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
   --entrypoint python qbs test_ib.py
 ```
 
@@ -240,8 +240,16 @@ inside the network the Gateway is `ib-gateway`, never `127.0.0.1`.
 
 ## Step 7 — Check the signal, with no broker involved
 
+> Every `run` below passes `--no-deps`, and so do the systemd units. That flag
+> is not cosmetic: the trader `depends_on` the Gateway, so without it Compose
+> re-evaluates the Gateway's configuration on each phase. The Gateway reads the
+> whole of `.env`, so editing *any* variable there — including `QBS_DRY_RUN`,
+> which only the trader uses — changes its config hash and Compose recreates the
+> container, discarding a logged-in session. `--no-deps` makes that impossible,
+> and costs nothing: the Gateway is already up.
+
 ```bash
-docker compose -f deploy/docker/docker-compose.yml run --rm qbs signal --offline
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs signal --offline
 ```
 
 This touches neither the network nor IB — it ranks the cached price history and
@@ -251,13 +259,13 @@ plumbing, and you have separated the two.
 Then the live-data version:
 
 ```bash
-docker compose -f deploy/docker/docker-compose.yml run --rm qbs signal
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs signal
 ```
 
 ## Step 8 — Full preflight
 
 ```bash
-docker compose -f deploy/docker/docker-compose.yml run --rm qbs preflight
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
 ```
 
 This is the whole path: downloads, ranks, connects to IB, reads your positions,
@@ -268,7 +276,7 @@ Confirm the run log was written and is yours, not root's:
 
 ```bash
 ls -l var/
-docker compose -f deploy/docker/docker-compose.yml run --rm qbs report
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs report
 ```
 
 ## Step 9 — Install the timers
@@ -289,7 +297,7 @@ The timers now run with `QBS_DRY_RUN=1` from your `.env`. **Leave it that way
 for a few sessions.** Compare each day's order list against the backtest:
 
 ```bash
-docker compose -f deploy/docker/docker-compose.yml run --rm qbs report --days 10
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs report --days 10
 ```
 
 When the order lists stop surprising you, set `QBS_DRY_RUN=0` in
@@ -327,8 +335,8 @@ C="docker compose -f deploy/docker/docker-compose.yml"
 
 $C ps                                    # is the Gateway up
 $C logs --tail 50 ib-gateway
-$C run --rm qbs report --days 20         # trades, picks, closes
-$C run --rm qbs signal --offline         # what would it hold today
+$C run --rm --no-deps qbs report --days 20         # trades, picks, closes
+$C run --rm --no-deps qbs signal --offline         # what would it hold today
 
 systemctl list-timers 'qbs-*'
 journalctl -u qbs-trade -n 100 --no-pager

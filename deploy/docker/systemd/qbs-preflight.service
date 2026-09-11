@@ -10,7 +10,7 @@ WorkingDirectory=/opt/qbs
 
 # --rm so a failed run leaves no stopped container behind. The phase name is
 # the whole command because the image's ENTRYPOINT is the runner.
-ExecStart=/usr/bin/docker compose -f /opt/qbs/deploy/docker/docker-compose.yml run --rm qbs preflight
+ExecStart=/usr/bin/docker compose -f /opt/qbs/deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
 
 TimeoutStartSec=900
 Restart=on-failure
