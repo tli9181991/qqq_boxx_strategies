@@ -131,6 +131,31 @@ appear before you ever push.
 
 ## Step 4 — Start the Gateway
 
+Clear out anything left from an earlier attempt first. This matters more than it
+looks: `container_name: ib-gateway` is fixed in the compose file, so a container
+of that name from a previous run blocks the new one with *"container name
+already in use"*. And `docker compose down` will **not** remove it if it came
+from a different compose file — Compose only touches containers carrying its own
+project label — so the removal has to be by name.
+
+```bash
+docker ps -a                                          # look before you delete
+docker compose -f deploy/docker/docker-compose.yml down --remove-orphans
+docker rm -f ib-gateway trading-bot 2>/dev/null || true
+```
+
+If this VM is dedicated to the trader and you would rather start from nothing:
+
+```bash
+docker rm -f $(docker ps -aq) 2>/dev/null || true     # removes EVERY container
+```
+
+Only on a box you are sure about — that takes out containers belonging to
+anything else running here. It removes containers, not images, so nothing has to
+be re-pulled.
+
+Now start it:
+
 ```bash
 docker compose -f deploy/docker/docker-compose.yml up -d ib-gateway
 docker compose -f deploy/docker/docker-compose.yml logs -f ib-gateway
