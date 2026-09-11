@@ -306,20 +306,57 @@ runs.
 
 ## Step 10 — The instance schedule
 
-Two EventBridge Scheduler rules against the EC2 API, both in
-`America/New_York` so they track DST with the timers:
+EventBridge Scheduler rules against the EC2 API. The simplest shape is one
+window covering the whole trading day:
 
 ```
 qbs-start   cron(45 8 ? * MON-FRI *)    ec2:StartInstances
 qbs-stop    cron(20 16 ? * MON-FRI *)   ec2:StopInstances
 ```
 
-Make sure the Gateway container comes back on boot — `restart: unless-stopped`
-handles that only if the Docker service is enabled:
+Prefer `America/New_York` for the rules so they track DST alongside the timers.
+UTC rules also work, but then you must check both DST states by hand: a window
+that comfortably contains 15:30 and 16:15 New York in March may not in
+November, when New York moves an hour further from UTC.
+
+Two narrower windows — one for the morning health check, one for the session —
+cost less and are equally valid, as long as each window contains the timers that
+fire inside it **with margin**. Thirty minutes between boot and the trade phase
+is the practical floor: the instance boots, Docker starts, the Gateway's JVM
+comes up, and IBC logs in, and only then is the API listening. That is why the
+preflight timer fires twice (08:50 and 15:05 ET) — each window gets a run that
+walks the entire path and sends nothing, so a Gateway that came back without
+logging in shows up in the journal while there is still time to act.
+
+### What must survive a stop
+
+Everything on the EBS volume does: `/opt/qbs`, `var/` (run log and state),
+`data/` (the price cache), the installed systemd units and their enabled state,
+and the built image. The one thing that does not is the Gateway's logged-in
+session, which has to be rebuilt on every boot. `restart: unless-stopped`
+handles that **only if the Docker service itself starts at boot**:
 
 ```bash
 sudo systemctl enable docker
 ```
+
+Without that line the second window comes up with no Gateway at all, and the
+trade phase fails on connect. Prove it once, rather than discovering it at
+15:30:
+
+```bash
+sudo reboot
+# wait a minute, ssh back in
+cd /opt/qbs
+docker compose -f deploy/docker/docker-compose.yml ps          # Gateway Up?
+docker compose -f deploy/docker/docker-compose.yml logs --tail 30 ib-gateway
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
+  --entrypoint python qbs test_ib.py
+```
+
+The log must reach `Login has completed` and `Configuration tasks completed`,
+and the test must print a `DU…` account. A reboot is the same cold start the
+schedule performs, so this is the real rehearsal.
 
 Neither rule knows about market holidays. That is harmless: the trade phase sees
 no bar for today and exits 0 without trading. You pay for idle hours, not for a

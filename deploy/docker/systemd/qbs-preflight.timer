@@ -1,9 +1,18 @@
 [Unit]
-Description=QBS preflight at 08:50 ET
+Description=QBS preflight at 08:50 and 15:05 ET (no orders)
 
 [Timer]
 # Anchored to exchange local time, so US daylight saving moves it for you.
+#
+# Two entries, one per instance window. If the box is stopped between sessions
+# the Gateway that 08:50 validated no longer exists by 15:30, and the trade
+# phase would be the first thing to touch a freshly booted, freshly logged-in
+# Gateway -- fifteen minutes before the MOC cutoff, with no time to diagnose a
+# login that did not complete. 15:05 makes the second window self-verifying:
+# it walks the whole path and sends nothing, so a failure shows up in the
+# journal twenty-five minutes before it would have mattered.
 OnCalendar=Mon-Fri *-*-* 08:50:00 America/New_York
+OnCalendar=Mon-Fri *-*-* 15:05:00 America/New_York
 # Safe here and only here: preflight sends no orders, so a late catch-up run
 # after a delayed boot is merely a late health check.
 Persistent=true
