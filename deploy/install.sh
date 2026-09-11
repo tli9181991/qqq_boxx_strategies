@@ -60,10 +60,12 @@ only ${avail_mb} MB free on / but a ${SWAP_GB}G swapfile needs ${need_mb} MB
 
 Pick one:
   1. Grow the volume. 8 GB is too small for Gateway + this app + swap; 30 GB
-     is still free-tier eligible. Modify the EBS volume in the console, then:
-       lsblk
-       sudo growpart /dev/nvme0n1 1     # use the device lsblk shows
-       sudo resize2fs /dev/nvme0n1p1    # or: sudo xfs_growfs /
+     is still free-tier eligible. Modify the EBS volume in the console, then
+     run lsblk -- the device name depends on the instance family:
+       Nitro (t3, t4g, m5...):  /dev/nvme0n1   part /dev/nvme0n1p1
+       Xen   (t2, m4...):       /dev/xvda      part /dev/xvda1
+       sudo growpart /dev/xvda 1        # substitute what lsblk shows
+       sudo resize2fs /dev/xvda1        # or: sudo xfs_growfs /
   2. Reclaim space:
        docker system df                 # usually the culprit
        docker system prune -a

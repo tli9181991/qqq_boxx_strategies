@@ -78,10 +78,13 @@ If free space is under ~2.5 GB, deal with that before going further:
 
 ```bash
 # Best: grow the volume. 8 GB is too small for Gateway + this app + swap.
-# 30 GB is still free-tier eligible. Modify the EBS volume in the console, then:
+# 30 GB is still free-tier eligible. Modify the EBS volume in the console, then
+# find your device with lsblk -- the name depends on the instance family:
+#   Nitro (t3, t4g, m5...):  /dev/nvme0n1  partition /dev/nvme0n1p1
+#   Xen   (t2, m4...):       /dev/xvda     partition /dev/xvda1
 lsblk
-sudo growpart /dev/nvme0n1 1      # use the device lsblk actually shows
-sudo resize2fs /dev/nvme0n1p1     # or: sudo xfs_growfs /
+sudo growpart /dev/nvme0n1 1      # <-- substitute what lsblk shows
+sudo resize2fs /dev/nvme0n1p1     # <-- likewise; or: sudo xfs_growfs /
 df -h /
 
 # Or reclaim:
