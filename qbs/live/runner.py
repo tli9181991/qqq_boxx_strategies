@@ -29,6 +29,7 @@ import argparse
 import logging
 import os
 import sys
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -52,6 +53,33 @@ EXIT_OK, EXIT_ERROR, EXIT_CONFIG, EXIT_GUARD = 0, 1, 2, 3
 # --------------------------------------------------------------------------
 # Setup
 # --------------------------------------------------------------------------
+
+def check_state_dir(state_dir: str) -> Optional[str]:
+    """Return an actionable message if the state directory is unusable.
+
+    Every phase writes here: the state file, the run-log database, the fill
+    records. When it is a bind mount owned by a different uid than the
+    container runs as, the first write fails deep inside whatever was already
+    happening -- often inside an *error handler*, where a PermissionError
+    traceback then buries the problem the handler was reporting. Probing up
+    front costs one file create and turns that into one sentence.
+    """
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=state_dir, suffix=".probe")
+        os.close(fd)
+        os.unlink(tmp)
+        return None
+    except OSError as exc:
+        return (
+            f"state directory {state_dir} is not writable as uid {os.getuid()}:"
+            f"{os.getgid()} ({type(exc).__name__}: {exc}). Every phase records "
+            "its run and its orders here, so nothing can run until this is "
+            "fixed. Under Docker this path is a bind mount of var/ in the "
+            "checkout and the container runs as QBS_UID:QBS_GID from .env, so "
+            "on the host: sudo chown -R $(id -u):$(id -g) var data -- and check "
+            "that QBS_UID and QBS_GID match your own id -u and id -g.")
+
 
 def setup_logging(verbose: bool = False, logfile: Optional[str] = None) -> None:
     fmt = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -504,7 +532,10 @@ def main(argv=None) -> int:
         live.notional = args.notional
     if args.dry_run:
         live.dry_run = True
-    os.makedirs(live.state_dir, exist_ok=True)
+    problem = check_state_dir(live.state_dir)
+    if problem:
+        log.error("%s", problem)
+        return EXIT_CONFIG
 
     cfg = Config()   # strategy parameters: identical to the backtest's defaults
 

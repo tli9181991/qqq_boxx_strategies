@@ -831,3 +831,54 @@ def test_selection_survives_a_round_trip_through_the_store(db):
     rows = store.selection_history(db, limit=500)
     assert len(rows) == len(book.selection)
     assert {r["symbol"] for r in rows} == {r["symbol"] for r in book.selection}
+
+
+# --------------------------------------------------------------------------
+# The state directory has to be writable before anything else is attempted
+# --------------------------------------------------------------------------
+
+def test_writable_state_dir_passes_and_is_created():
+    from qbs.live.runner import check_state_dir
+
+    with tempfile.TemporaryDirectory() as d:
+        nested = os.path.join(d, "var")
+        assert check_state_dir(nested) is None
+        assert os.path.isdir(nested)      # created, not merely accepted
+
+
+def test_unwritable_state_dir_is_reported_before_any_work():
+    """The message has to name the fix, not just the errno.
+
+    This failure shows up in production as a PermissionError raised inside an
+    exception handler, where it replaces the error being handled. Whoever reads
+    that log at 15:30 sees a tempfile traceback and no mention of ownership.
+    """
+    from qbs.live.runner import check_state_dir
+
+    # A path *under a regular file* is unusable for every uid, root included,
+    # so this asserts the same branch the container hits without needing the
+    # suite to run unprivileged.
+    with tempfile.TemporaryDirectory() as d:
+        blocker = os.path.join(d, "not-a-dir")
+        open(blocker, "w").close()
+        locked = os.path.join(blocker, "var")
+        msg = check_state_dir(locked)
+
+    assert msg is not None
+    assert locked in msg
+    assert "chown" in msg                 # the actual remedy
+    assert "QBS_UID" in msg               # and where the uid comes from
+
+
+def test_main_refuses_to_run_a_phase_on_an_unwritable_state_dir(monkeypatch):
+    from qbs.live import runner
+
+    monkeypatch.setattr(runner, "check_state_dir", lambda d: "nope")
+    called = []
+    monkeypatch.setattr(runner, "phase_preflight",
+                        lambda *a, **k: called.append("ran") or 0)
+
+    rc = runner.main(["preflight"])
+
+    assert rc == runner.EXIT_CONFIG
+    assert not called, "the phase ran despite an unusable state directory"
