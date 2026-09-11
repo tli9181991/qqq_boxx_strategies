@@ -69,7 +69,12 @@ class LiveConfig:
     # ---- connection ------------------------------------------------------
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002          # 4002 = Gateway paper, 4001 = Gateway live,
-                                 # 7497 = TWS paper, 7496 = TWS live
+                                 # 7497 = TWS paper, 7496 = TWS live.
+                                 # Containerised Gateways often differ: the
+                                 # gnzsnz image serves paper on 4004.
+    paper_ports: List[int] = field(default_factory=lambda: [4002, 7497, 4004])
+    paper_account_prefixes: List[str] = field(
+        default_factory=lambda: ["DU", "DF"])  # IB paper accounts
     ib_client_id: int = 17
     ib_account: str = ""         # blank -> whichever account the Gateway serves
     connect_timeout: float = 30.0
@@ -113,8 +118,19 @@ class LiveConfig:
     # ---- derived ---------------------------------------------------------
     @property
     def is_paper_port(self) -> bool:
-        """IB's paper ports. 4001/7496 are the live ones and are refused by default."""
-        return self.ib_port in (4002, 7497)
+        """A pre-connect heuristic only -- the account check is the real guard.
+
+        Port numbers are a weak proxy for "is this paper": they are convention,
+        not protocol, and a containerised Gateway may publish the paper API
+        anywhere. The authoritative test is the account number the Gateway
+        reports once connected, which `IBBroker.connect` checks. This list only
+        avoids opening a socket to something obviously live.
+        """
+        return self.ib_port in self.paper_ports
+
+    def looks_like_paper_account(self, account: str) -> bool:
+        """IB paper accounts are DU (individual) or DF (advisor); live are U/F."""
+        return account.upper().startswith(tuple(self.paper_account_prefixes))
 
     @property
     def state_path(self) -> str:
@@ -148,6 +164,9 @@ class LiveConfig:
         cfg = cls(**data)
         cfg.ib_host = os.environ.get("QBS_IB_HOST", cfg.ib_host)
         cfg.ib_port = _env_int("QBS_IB_PORT", cfg.ib_port)
+        if os.environ.get("QBS_PAPER_PORTS"):
+            cfg.paper_ports = [int(p) for p in
+                               os.environ["QBS_PAPER_PORTS"].replace(",", " ").split()]
         cfg.ib_client_id = _env_int("QBS_IB_CLIENT_ID", cfg.ib_client_id)
         cfg.ib_account = os.environ.get("QBS_IB_ACCOUNT", cfg.ib_account)
         cfg.notional = _env_float("QBS_NOTIONAL", cfg.notional)

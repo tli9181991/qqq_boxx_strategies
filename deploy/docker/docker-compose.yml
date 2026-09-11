@@ -24,7 +24,13 @@ services:
       # Bound to 127.0.0.1, NOT 0.0.0.0. The API port has no authentication
       # beyond IB's trusted-IP list, and the VNC port has only a password --
       # neither belongs on a public interface. Reach them over an SSH tunnel.
-      - "127.0.0.1:4002:4002"
+      #
+      # Container-side port is ${IBG_PAPER_PORT:-4004}: this image serves the
+      # paper API on 4004, not the 4002 a host-installed Gateway uses. Confirm
+      # yours with:
+      #   docker exec ib-gateway cat /proc/net/tcp | grep -i ' 0A '
+      # and read column 2 as hex -- 0FA2 is 4002, 0FA4 is 4004.
+      - "127.0.0.1:4002:${IBG_PAPER_PORT:-4004}"
       - "127.0.0.1:5900:5900"
     networks:
       - qbsnet
@@ -49,7 +55,9 @@ services:
       # the single most common thing to get wrong when moving a working
       # host-side script into a container.
       QBS_IB_HOST: ib-gateway
-      QBS_IB_PORT: "4002"
+      # Container to container, so this is the port INSIDE the Gateway
+      # container -- not the 4002 published to the host.
+      QBS_IB_PORT: "${IBG_PAPER_PORT:-4004}"
       QBS_STATE_DIR: /app/var
       QBS_NOTIONAL: "${QBS_NOTIONAL:-100000}"
       QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"

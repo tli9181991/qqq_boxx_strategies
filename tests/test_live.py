@@ -342,8 +342,24 @@ def test_live_config_refuses_a_bad_notional():
 def test_live_config_knows_the_paper_ports():
     assert LiveConfig(ib_port=4002).is_paper_port
     assert LiveConfig(ib_port=7497).is_paper_port
+    assert LiveConfig(ib_port=4004).is_paper_port, "the gnzsnz image serves paper here"
     assert not LiveConfig(ib_port=4001).is_paper_port
     assert not LiveConfig(ib_port=7496).is_paper_port
+
+
+def test_paper_ports_are_configurable():
+    """A containerised Gateway can publish the paper API anywhere."""
+    cfg = LiveConfig(ib_port=5555, paper_ports=[5555])
+    assert cfg.is_paper_port
+    assert not LiveConfig(ib_port=5555).is_paper_port
+
+
+def test_paper_account_prefixes():
+    cfg = LiveConfig()
+    assert cfg.looks_like_paper_account("DU1234567")
+    assert cfg.looks_like_paper_account("DF1234567")
+    assert not cfg.looks_like_paper_account("U1234567"), "live individual"
+    assert not cfg.looks_like_paper_account("F1234567"), "live advisor"
 
 
 def test_live_config_rejects_unknown_json_keys():
@@ -497,7 +513,7 @@ def stub_ib(monkeypatch):
 
 def test_broker_refuses_a_live_port(stub_ib):
     from qbs.live.broker import BrokerError, IBBroker
-    with pytest.raises(BrokerError, match="LIVE trading port"):
+    with pytest.raises(BrokerError, match="not a known paper port"):
         IBBroker(LiveConfig(ib_port=4001)).connect()
     assert not stub_ib.instances, "must refuse before constructing a connection"
 
@@ -561,6 +577,50 @@ def test_broker_raises_when_ib_rejects_an_order(stub_ib):
     b.ib._status = "Inactive"
     with pytest.raises(BrokerError, match="rejected"):
         b.submit_moc([Order("AMD", "BUY", 11, 505.0)])
+
+
+def test_broker_refuses_a_live_account_even_on_a_paper_port(stub_ib):
+    """The port is convention; the account number is what IB actually says.
+
+    A Gateway misconfigured to serve a live account on the paper port would
+    otherwise be traded against silently -- the one mistake here that cannot be
+    undone.
+    """
+    from qbs.live.broker import BrokerError, IBBroker
+
+    class LiveIB(StubIB):
+        def managedAccounts(self):
+            return ["U7654321"]
+
+    import ib_async
+    monkey = LiveIB
+    ib_async.IB = monkey
+    b = IBBroker(LiveConfig(ib_port=4002))
+    with pytest.raises(BrokerError, match="do not look like"):
+        b.connect()
+    assert not b.ib.isConnected(), "must disconnect, not stay attached to a live account"
+
+
+def test_broker_accepts_a_live_account_when_explicitly_allowed(stub_ib):
+    from qbs.live.broker import IBBroker
+
+    class LiveIB(StubIB):
+        def managedAccounts(self):
+            return ["U7654321"]
+
+    import ib_async
+    ib_async.IB = LiveIB
+    b = IBBroker(LiveConfig(ib_port=4002, allow_live_account=True))
+    b.connect()
+    assert b.ib.isConnected()
+
+
+def test_broker_connects_on_a_nonstandard_paper_port(stub_ib):
+    """Port 4004, as the gnzsnz container image serves it."""
+    from qbs.live.broker import IBBroker
+    b = IBBroker(LiveConfig(ib_port=4004))
+    b.connect()
+    assert b.ib.connected
 
 
 def test_broker_rejects_an_account_the_gateway_does_not_serve(stub_ib):

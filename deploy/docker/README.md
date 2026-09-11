@@ -182,7 +182,24 @@ Close the tunnel when you are done.
 
 ## Step 6 — Prove the connection
 
-First, cheaply: did the Gateway publish the port at all? No Python involved.
+First: **which port is the Gateway actually serving?** This image uses **4004**
+inside the container, not the 4002 a host-installed Gateway uses. The image is
+minimal — no `ss`, no `netstat` — so ask the kernel:
+
+```bash
+docker exec ib-gateway cat /proc/net/tcp | grep -i ' 0A '   # 0A = LISTEN
+```
+
+Column 2 is `IP:PORT` in hex. `0FA2` is 4002, `0FA4` is 4004; `00000000` means
+it is listening on all interfaces (reachable from other containers), `0100007F`
+means loopback only (not reachable). Ignore the `0B00007F` row — that is
+Docker's internal DNS.
+
+If yours is not 4004, set `IBG_PAPER_PORT` in `deploy/docker/.env` to whatever
+it is. The compose file uses that for both the published port and the trader's
+`QBS_IB_PORT`.
+
+Then, host-side:
 
 ```bash
 sudo ss -tlnp | grep 4002        # expect a LISTEN line on 127.0.0.1:4002
@@ -346,6 +363,9 @@ The Gateway container is untouched by this.
 | `ConnectionRefused` from the container | wrong host | it is `ib-gateway`, not `127.0.0.1` |
 | `ConnectionRefused` from the host | Gateway not up or still logging in | `$C logs ib-gateway`; first start takes minutes |
 | Connects, then drops | two clients sharing an id | phases use 17, the test uses 99 — keep them apart |
+| `ConnectionRefused` to `172.x.x.x:4002` from the container | the Gateway serves a different port inside — this image uses 4004 | `docker exec ib-gateway cat /proc/net/tcp \| grep -i ' 0A '`, then set `IBG_PAPER_PORT` |
+| `not a known paper port` | your Gateway serves paper on a port not in the default list | add it: `QBS_PAPER_PORTS=4002,4004,…` |
+| `do not look like paper accounts` | the Gateway is serving a live account | **stop** — check `TRADING_MODE=paper` and the credentials before anything else |
 | Account is not `DU…` | `TRADING_MODE` not `paper` | fix `.env`, recreate the Gateway container |
 | `var/` files owned by root | `QBS_UID`/`QBS_GID` unset | set them, then `sudo chown -R $(id -u):$(id -g) var/` |
 | Timers fire at the wrong hour | no `tzdata` on the host | `sudo apt-get install tzdata`, `daemon-reload` |

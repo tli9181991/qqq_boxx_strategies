@@ -79,8 +79,10 @@ class IBBroker:
 
         if not self.cfg.is_paper_port and not self.cfg.allow_live_account:
             raise BrokerError(
-                f"port {self.cfg.ib_port} is a LIVE trading port. Refusing to connect. "
-                "Set allow_live_account=true (or QBS_ALLOW_LIVE=1) if that is deliberate.")
+                f"port {self.cfg.ib_port} is not a known paper port "
+                f"{self.cfg.paper_ports}. Refusing to connect. If your Gateway "
+                "serves paper there, add it with QBS_PAPER_PORTS; if you really "
+                "mean to trade live, set allow_live_account=true (QBS_ALLOW_LIVE=1).")
 
         self.ib = IB()
         log.info("connecting to IB at %s:%s (clientId=%s)",
@@ -101,6 +103,22 @@ class IBBroker:
             raise BrokerError(
                 f"configured account {self.cfg.ib_account} is not served by this Gateway "
                 f"(it has {accounts})")
+
+        # The real guard. A port number is convention; the account number is
+        # what IB actually says this session trades. Checked after connecting
+        # because it cannot be known before, and enforced by disconnecting --
+        # reaching a live account by accident is the one mistake here with
+        # irreversible consequences.
+        if accounts and not self.cfg.allow_live_account:
+            live = [a for a in accounts if not self.cfg.looks_like_paper_account(a)]
+            if live:
+                self.disconnect()
+                raise BrokerError(
+                    f"Gateway is serving account(s) {live}, which do not look like "
+                    f"paper accounts (expected a "
+                    f"{'/'.join(self.cfg.paper_account_prefixes)} prefix). "
+                    "Disconnected without trading. Set allow_live_account=true "
+                    "(QBS_ALLOW_LIVE=1) only if you genuinely mean to trade live.")
 
     def disconnect(self) -> None:
         if self.ib is not None and self.ib.isConnected():
