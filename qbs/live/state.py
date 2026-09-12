@@ -94,3 +94,64 @@ def record_run(
 
 def kill_switch_engaged(path: str) -> bool:
     return bool(path) and os.path.exists(path)
+
+
+# --------------------------------------------------------------------------
+# External holdings baseline
+#
+# The one piece of state that *does* affect orders, and deliberately so: when
+# the strategy shares an IB account with positions you manage yourself, there
+# is no way to tell them apart at the broker. This records which shares are
+# yours so the strategy can subtract them.
+#
+# It is a fixed snapshot, not a running tally. The strategy never writes to it
+# when it trades -- its own position is always derived as (account - baseline),
+# with the broker's number authoritative. That is what keeps a missed fill or a
+# deleted run log from corrupting it, and it is why this does not reintroduce
+# the feedback loop the module docstring warns about.
+# --------------------------------------------------------------------------
+
+def load_external_positions(path: str) -> Dict[str, int]:
+    """Shares held outside the strategy. Missing file means an empty account."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"could not read the external-holdings baseline at {path}: {exc}. "
+            "Refusing to guess -- an unreadable baseline means the strategy "
+            "cannot tell its own shares from yours.") from exc
+
+    raw = data.get("positions", data)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: expected an object of symbol -> shares")
+    out: Dict[str, int] = {}
+    for sym, qty in raw.items():
+        try:
+            n = int(qty)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path}: {sym!r} has non-integer shares {qty!r}") from exc
+        if n < 0:
+            raise ValueError(f"{path}: {sym!r} has negative shares {n}")
+        if n:
+            out[str(sym).upper()] = n
+    return out
+
+
+def save_external_positions(path: str, positions: Dict[str, int],
+                            note: str = "") -> None:
+    payload = {
+        "captured_at": utc_now_iso(),
+        "note": note or ("shares held outside the strategy; it will never sell "
+                         "these, and derives its own position as account minus "
+                         "this baseline"),
+        # Upper-cased on the way in as well as out, so a hand-edited "tsm"
+        # cannot become a second, silently ignored entry alongside "TSM".
+        "positions": {k.upper(): int(v)
+                      for k, v in sorted(positions.items()) if int(v)},
+    }
+    _atomic_write(path, json.dumps(payload, indent=2))
+    log.info("wrote external-holdings baseline to %s: %s", path,
+             payload["positions"] or "(empty)")

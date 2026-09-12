@@ -70,6 +70,107 @@ def target_shares(
     return out
 
 
+def strategy_positions(
+    account: Dict[str, int],
+    external: Dict[str, int],
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    """Split an account's holdings into the strategy's and the owner's.
+
+    IB reports one position per symbol per account, so when the strategy shares
+    an account with holdings you manage yourself, the two are indistinguishable
+    at the broker. Netting them out is the only way the strategy can trade a
+    name you also hold: it must see the 5 shares it bought, not the 27 in the
+    account, or an exit sells your 22 as well.
+
+    `external` is a fixed baseline you capture once -- it is not maintained by
+    the strategy and never changes when the strategy trades, which is what
+    makes it recoverable. The strategy's position is always derived from the
+    broker's authoritative number minus that baseline, so a missed fill or a
+    lost run log cannot make it drift.
+
+    Returns (strategy positions, shortfalls). A shortfall means the account
+    holds fewer shares than the baseline claims are yours -- so the baseline is
+    stale, and the caller must not trade the affected names.
+    """
+    net: Dict[str, int] = {}
+    shortfall: Dict[str, int] = {}
+    for sym, qty in account.items():
+        ext = int(external.get(sym, 0))
+        if ext <= 0:
+            if qty:
+                net[sym] = int(qty)
+            continue
+        have = int(qty) - ext
+        if have < 0:
+            shortfall[sym] = have          # negative: how far the baseline overshoots
+            have = 0
+        if have:
+            net[sym] = have
+    return net, shortfall
+
+
+def attribute_marks(marks: List[Dict], external: Dict[str, int]) -> List[Dict]:
+    """Reduce IB's per-position marks to the strategy's share of each.
+
+    Market value is exactly attributable -- it is shares times a per-share
+    price -- so the strategy's share of a position it partly owns is simply its
+    own share count at the same mark. Unrealised P&L and average cost are not:
+    IB blends the cost basis of your shares and the strategy's into one number,
+    and no split of it is meaningful. Those are dropped rather than guessed.
+
+    Without this, every NAV row in the run log measures your whole account
+    against the strategy's notional -- so a $100k book alongside $400k of your
+    own holdings reports a risk weight of several hundred percent, and the
+    vol-target diagnostics become unreadable.
+    """
+    if not external:
+        return marks
+    out: List[Dict] = []
+    for m in marks:
+        ext = int(external.get(m["symbol"], 0))
+        if ext <= 0:
+            out.append(m)
+            continue
+        shares = float(m["shares"]) - ext
+        if shares <= 0:
+            continue
+        px = float(m["close_price"])
+        row = dict(m)
+        row["shares"] = shares
+        row["market_value"] = shares * px
+        row["avg_cost"] = float("nan")
+        row["unrealized_pnl"] = float("nan")
+        row["source"] = "ib+baseline"
+        out.append(row)
+    return out
+
+
+def check_external_baseline(shortfall: Dict[str, int],
+                            universe: Optional[Iterable[str]] = None) -> None:
+    """Refuse to trade a name whose baseline no longer matches the account.
+
+    Only names the strategy can trade matter: you may sell your own VOO freely,
+    but if the baseline says 22 TSM are yours and the account holds 5, the
+    strategy reads its own position as zero and buys *more* -- every session,
+    compounding, because each purchase still nets to zero. Better to stop.
+    """
+    if not shortfall:
+        return
+    scope = set(universe) if universe is not None else set(shortfall)
+    affected = {k: v for k, v in shortfall.items() if k in scope}
+    if not affected:
+        log.warning("baseline exceeds the account for names the strategy does not "
+                    "trade, ignoring: %s", sorted(shortfall))
+        return
+    detail = ", ".join(f"{k} short by {-v}" for k, v in sorted(affected.items()))
+    raise GuardTripped(
+        f"the external-holdings baseline is stale: {detail}. The account holds "
+        "fewer shares than the baseline says are yours, so the strategy cannot "
+        "tell which shares are its own and would keep buying. Re-capture it "
+        "with `runner baseline --capture --force` once the account is as you "
+        "want it.")
+
+
 def diff_positions(
     target: Dict[str, int],
     actual: Dict[str, int],

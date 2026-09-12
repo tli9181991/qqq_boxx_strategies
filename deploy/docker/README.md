@@ -304,6 +304,44 @@ When the order lists stop surprising you, set `QBS_DRY_RUN=0` in
 `deploy/docker/.env`. No restart is needed — each phase reads the file when it
 runs.
 
+## Sharing an account with your own holdings
+
+Skip this if the strategy has an account to itself — which is the arrangement to
+prefer, and the only one where the broker enforces the separation rather than a
+file on disk.
+
+IB reports one position per symbol per account. If you hold 22 TSM yourself and
+the strategy wants 5, the strategy sees 27, computes `5 - 27`, and **sells 17 of
+your shares**. Overlap is not hypothetical: the current book holds MRVL.
+
+Capture a baseline once, before the strategy has traded the account:
+
+```bash
+C="docker compose -f deploy/docker/docker-compose.yml"
+$C run --rm --no-deps qbs baseline              # show what would be recorded
+$C run --rm --no-deps qbs baseline --capture    # record it
+```
+
+Everything the account holds at that moment becomes yours, and the strategy
+trades only shares above those counts. Its own position is always derived as
+`account - baseline`, with the broker's number authoritative, so a missed fill
+or a lost run log cannot make it drift.
+
+The baseline is a snapshot, not a running tally, and the strategy never writes
+to it. Two consequences:
+
+- **Trade a name yourself after capturing, and the baseline is wrong.** Buy
+  more and the strategy will treat the extra shares as its own and may sell
+  them. Sell some and the account falls below the baseline: the strategy reads
+  its own position as zero and would buy more every session, compounding. It
+  refuses instead, with a guard naming the symbol.
+- **Re-capturing later sweeps the strategy's positions into the baseline** and
+  orphans them — it could then never sell them. A second capture needs
+  `--force`, after reading the table it prints.
+
+Fix a stale baseline by settling the account the way you want it, then
+`baseline --capture --force`.
+
 ## Step 10 — The instance schedule
 
 EventBridge Scheduler rules against the EC2 API. The simplest shape is one

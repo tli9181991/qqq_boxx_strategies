@@ -40,7 +40,9 @@ if __package__ in (None, ""):  # pragma: no cover
 
 from qbs.config import Config
 from qbs.live.config import LiveConfig
-from qbs.live.orders import GuardTripped, build_orders, format_order_table
+from qbs.live.orders import (GuardTripped, attribute_marks, build_orders,
+                             check_external_baseline, format_order_table,
+                             strategy_positions)
 from qbs.live.signals import compute_targets, load_live_prices
 from qbs.live import state as st
 from qbs.live import store
@@ -155,6 +157,28 @@ def _bar_is_today(book, tz: str) -> bool:
     return book.asof.date() == market_today(tz).date()
 
 
+def _strategy_book(broker, live: LiveConfig, universe=None) -> Dict[str, int]:
+    """What the strategy holds, as distinct from what the account holds.
+
+    When the strategy runs in an account that also holds positions you manage
+    yourself, the broker cannot tell them apart -- so an exit computed against
+    the account's 27 TSM would sell the 22 that are yours. Subtracting a fixed
+    baseline is what keeps the two books separate inside one account.
+    """
+    account = broker.positions()
+    external = st.load_external_positions(live.external_positions_path)
+    if not external:
+        log.info("current positions: %s", account or "(flat)")
+        return account
+
+    mine, shortfall = strategy_positions(account, external)
+    check_external_baseline(shortfall, universe=universe)
+    log.info("account positions : %s", account or "(flat)")
+    log.info("yours (baseline)  : %s", external)
+    log.info("strategy positions: %s", mine or "(flat)")
+    return mine
+
+
 # --------------------------------------------------------------------------
 # Phases
 # --------------------------------------------------------------------------
@@ -186,10 +210,9 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
     from qbs.live.broker import BrokerError, IBBroker
     try:
         with IBBroker(live) as broker:
-            positions = broker.positions()
             nlv = broker.net_liquidation()
             log.info("account %s: NetLiquidation $%s", broker.account, f"{nlv:,.0f}")
-            log.info("current positions: %s", positions or "(flat)")
+            positions = _strategy_book(broker, live, universe=book.universe)
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
@@ -275,8 +298,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
     from qbs.live.broker import BrokerError, IBBroker
     try:
         with IBBroker(live) as broker:
-            positions = broker.positions()
-            log.info("current positions: %s", positions or "(flat)")
+            positions = _strategy_book(broker, live, universe=book.universe)
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
@@ -373,8 +395,12 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
             if not fills:
                 log.info("no fills reported this session")
 
-            marks = broker.portfolio_marks()
-            positions = broker.positions()
+            external = st.load_external_positions(live.external_positions_path)
+            # Both the marks and the position list are the strategy's share of
+            # the account, so the NAV row describes the book being run rather
+            # than everything that happens to sit in the same account.
+            marks = attribute_marks(broker.portfolio_marks(), external)
+            positions, _ = strategy_positions(broker.positions(), external)
             nlv = broker.net_liquidation()
             cash = broker.cash_balance()
 
@@ -506,6 +532,63 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     return EXIT_OK
 
 
+def phase_baseline(live: LiveConfig, capture: bool = False,
+                   force: bool = False) -> int:
+    """Show, or capture, which shares in this account are yours not the strategy's.
+
+    Run `baseline --capture` once, before the strategy has ever traded this
+    account. Everything the account holds at that moment is recorded as yours,
+    and the strategy will only ever trade shares above that line.
+
+    Capturing later would sweep the strategy's own positions into the baseline
+    and orphan them -- it could then never sell them -- so a second capture
+    needs --force and a deliberate look at what it is about to record.
+    """
+    from qbs.live.broker import BrokerError, IBBroker
+
+    path = live.external_positions_path
+    existing = st.load_external_positions(path)
+
+    try:
+        with IBBroker(live) as broker:
+            account = broker.positions()
+    except BrokerError as exc:
+        log.error("broker problem: %s", exc)
+        return EXIT_CONFIG
+
+    mine, shortfall = strategy_positions(account, existing)
+    print(f"\n{'symbol':<8}{'account':>10}{'yours':>10}{'strategy':>10}")
+    for sym in sorted(set(account) | set(existing)):
+        print(f"{sym:<8}{account.get(sym, 0):>10}{existing.get(sym, 0):>10}"
+              f"{mine.get(sym, 0):>10}")
+    if not (account or existing):
+        print("(the account is flat and no baseline is recorded)")
+    if shortfall:
+        print("\nSTALE: the account holds fewer shares than the baseline claims "
+              f"are yours: {sorted(shortfall)}")
+    print(f"\nbaseline file: {path}")
+
+    if not capture:
+        if not existing:
+            print("\nNo baseline recorded, so the strategy treats the whole "
+                  "account as its own.\nIf you hold anything here yourself, run: "
+                  "runner baseline --capture")
+        return EXIT_OK
+
+    if existing and not force:
+        log.error(
+            "a baseline already exists at %s. Re-capturing would record the "
+            "strategy's own positions as yours, and it could then never sell "
+            "them. Pass --force only if the numbers above are what you want "
+            "recorded as yours.", path)
+        return EXIT_CONFIG
+
+    st.save_external_positions(path, account)
+    print(f"\nRecorded {len(account)} holding(s) as yours. The strategy will "
+          "trade only shares above these counts.")
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -514,7 +597,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("phase",
-                   choices=["preflight", "trade", "reconcile", "signal", "report"],
+                   choices=["preflight", "trade", "reconcile", "signal", "report",
+                            "baseline"],
                    help="which phase to run. 'signal' prints the target book and "
                         "exits, touching no broker; 'report' prints the run log "
                         "and touches neither broker nor network")
@@ -527,7 +611,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offline", action="store_true",
                    help="signal phase only: use the CSV cache, no network")
     p.add_argument("--force", action="store_true",
-                   help="trade even if the feed has no bar for today (debugging only)")
+                   help="trade: trade even if the feed has no bar for today "
+                        "(debugging only). baseline: overwrite an existing "
+                        "baseline, recording the strategy's own positions as yours")
+    p.add_argument("--capture", action="store_true",
+                   help="baseline: record the account's current holdings as "
+                        "yours, so the strategy never sells them")
     p.add_argument("--days", type=int, default=10,
                    help="report: how many sessions of closes to show")
     p.add_argument("--logfile", default=None, help="also write the run log here")
@@ -570,6 +659,8 @@ def main(argv=None) -> int:
         return EXIT_OK
     if args.phase == "report":
         return phase_report(live, days=args.days)
+    if args.phase == "baseline":
+        return phase_baseline(live, capture=args.capture, force=args.force)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":

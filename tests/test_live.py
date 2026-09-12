@@ -983,3 +983,98 @@ def test_the_target_book_carries_its_universe():
         "the universe should be wider than today's targets"
     # Every universe name is priced, so an exit can be logged with a notional.
     assert set(book.universe) <= set(book.prices)
+
+
+# --------------------------------------------------------------------------
+# Sharing an account with holdings the strategy must not touch
+# --------------------------------------------------------------------------
+
+def test_the_strategy_sees_only_its_own_share_of_a_shared_position():
+    from qbs.live.orders import strategy_positions
+
+    mine, short = strategy_positions({"TSM": 27, "MRVL": 125, "VOO": 30},
+                                     {"TSM": 22, "MRVL": 100, "VOO": 30})
+    assert mine == {"TSM": 5, "MRVL": 25}, "your shares leaked into the book"
+    assert not short
+
+
+def test_an_exit_sells_only_the_strategy_shares():
+    """The failure this exists to prevent: selling 17 of someone else's shares."""
+    from qbs.live.orders import build_orders, strategy_positions
+
+    account, external = {"TSM": 27}, {"TSM": 22}
+    mine, _ = strategy_positions(account, external)
+
+    orders, _ = build_orders(
+        weights={"BOXX": 1.0}, prices={"BOXX": 118.0, "TSM": 200.0},
+        actual=mine, notional=100_000, max_order_notional=200_000,
+        max_gross_turnover=1.6, max_positions=12, universe=["TSM", "BOXX"])
+
+    sells = [o for o in orders if o.symbol == "TSM"]
+    assert len(sells) == 1
+    assert sells[0].action == "SELL"
+    assert sells[0].quantity == 5, "the strategy tried to sell shares it does not own"
+
+
+def test_a_stale_baseline_stops_the_run_rather_than_buying_forever():
+    from qbs.live.orders import GuardTripped, check_external_baseline, strategy_positions
+
+    mine, short = strategy_positions({"TSM": 5}, {"TSM": 22})
+    assert mine == {}
+    with pytest.raises(GuardTripped, match="stale"):
+        check_external_baseline(short, universe=["TSM"])
+
+
+def test_a_stale_baseline_outside_the_universe_is_only_a_warning():
+    from qbs.live.orders import check_external_baseline, strategy_positions
+
+    _, short = strategy_positions({"VOO": 5}, {"VOO": 30})
+    check_external_baseline(short, universe=["TSM", "BOXX"])   # must not raise
+
+
+def test_marks_are_reduced_to_the_strategy_share():
+    from qbs.live.orders import attribute_marks
+
+    marks = [
+        dict(symbol="TSM", shares=27.0, close_price=200.0, market_value=5400.0,
+             avg_cost=150.0, unrealized_pnl=1350.0, source="ib"),
+        dict(symbol="AMD", shares=11.0, close_price=516.0, market_value=5676.0,
+             avg_cost=500.0, unrealized_pnl=176.0, source="ib"),
+    ]
+    out = {m["symbol"]: m for m in attribute_marks(marks, {"TSM": 22})}
+
+    assert out["TSM"]["shares"] == 5
+    assert out["TSM"]["market_value"] == pytest.approx(1000.0)
+    # Cost basis is blended across both owners, so no split of it is truthful.
+    assert np.isnan(out["TSM"]["unrealized_pnl"])
+    assert np.isnan(out["TSM"]["avg_cost"])
+    assert out["AMD"] == marks[1], "a position you do not share must pass through"
+
+
+def test_a_position_wholly_yours_drops_out_of_the_marks():
+    from qbs.live.orders import attribute_marks
+
+    marks = [dict(symbol="VOO", shares=30.0, close_price=500.0, market_value=15000.0,
+                  avg_cost=400.0, unrealized_pnl=3000.0, source="ib")]
+    assert attribute_marks(marks, {"VOO": 30}) == []
+
+
+def test_baseline_round_trips_and_normalises_case(tmp_path):
+    path = str(tmp_path / "external_positions.json")
+    st.save_external_positions(path, {"tsm": 22, "MRVL": 100, "nothing": 0})
+    assert st.load_external_positions(path) == {"TSM": 22, "MRVL": 100}
+
+
+def test_a_corrupt_baseline_refuses_to_load_rather_than_reading_as_empty(tmp_path):
+    """Empty means 'the whole account is mine', which is the dangerous reading."""
+    path = tmp_path / "external_positions.json"
+    path.write_text("{not json")
+    with pytest.raises(ValueError, match="could not read"):
+        st.load_external_positions(str(path))
+
+
+def test_a_negative_baseline_is_rejected(tmp_path):
+    path = tmp_path / "external_positions.json"
+    path.write_text('{"positions": {"TSM": -5}}')
+    with pytest.raises(ValueError, match="negative"):
+        st.load_external_positions(str(path))

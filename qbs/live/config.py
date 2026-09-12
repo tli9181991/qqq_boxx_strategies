@@ -137,6 +137,16 @@ class LiveConfig:
         return os.path.join(self.state_dir, "state.json")
 
     @property
+    def external_positions_path(self) -> str:
+        """Shares in this account that belong to you, not the strategy.
+
+        Only meaningful when the strategy shares an account with holdings you
+        manage yourself. Capture it once with `runner baseline --capture`; an
+        absent file means the whole account is the strategy's.
+        """
+        return os.path.join(self.state_dir, "external_positions.json")
+
+    @property
     def db_path(self) -> str:
         """The run log: trades, selections, closes and NAV, as SQL tables."""
         return os.path.join(self.state_dir, "qbs.db")
