@@ -921,3 +921,65 @@ def test_report_marks_real_orders_as_sent(db, capsys, monkeypatch):
 
     assert "no (dry run)" not in out
     assert "DRY RUN and never" not in out
+
+
+# --------------------------------------------------------------------------
+# Exits must actually leave the book
+# --------------------------------------------------------------------------
+
+def _exit_scenario(**kw):
+    from qbs.live.orders import build_orders
+    return build_orders(
+        weights={"NVDA": 0.36, "BOXX": 0.64},
+        prices={"NVDA": 100.0, "BOXX": 118.0, "MU": 974.0},
+        actual={"MU": 6, "BOXX": 539, "TSLA": 40},
+        notional=100_000, max_order_notional=40_000,
+        max_gross_turnover=1.6, max_positions=12, **kw)
+
+
+def test_a_name_that_left_the_target_is_sold():
+    """The regression that matters: zero weights are not carried.
+
+    `compute_targets` drops weights of zero, so a name the strategy has exited
+    is absent from `weights` entirely -- indistinguishable, without the
+    universe, from a holding that was never the strategy's. Read as the latter
+    it is never sold, and the book buys replacements while keeping every name
+    it ever held.
+    """
+    orders, _ = _exit_scenario(universe=["NVDA", "MU", "AMD", "BOXX"])
+    sells = {o.symbol: o for o in orders if o.action == "SELL"}
+
+    assert "MU" in sells, "an exited holding was left in the book"
+    assert sells["MU"].quantity == 6
+    assert sells["MU"].reason == "exit"
+    assert sells["MU"].notional > 0, "the exit should be priced, not logged as $0"
+
+
+def test_holdings_outside_the_universe_are_still_left_alone():
+    orders, _ = _exit_scenario(universe=["NVDA", "MU", "AMD", "BOXX"])
+    assert not any(o.symbol == "TSLA" for o in orders)
+
+
+def test_exits_are_ordered_before_the_entries_they_fund():
+    orders, _ = _exit_scenario(universe=["NVDA", "MU", "AMD", "BOXX"])
+    actions = [o.action for o in orders]
+    assert actions.index("SELL") < actions.index("BUY")
+
+
+def test_the_target_book_carries_its_universe():
+    """Without this the runner has nothing to pass, and the bug returns."""
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+
+    book = compute_targets(cfg, frame, requested=list(uni.columns))
+
+    assert cfg.momentum.safe_asset in book.universe
+    assert set(book.weights) <= set(book.universe)
+    assert len(book.universe) > len(book.weights), \
+        "the universe should be wider than today's targets"
+    # Every universe name is priced, so an exit can be logged with a notional.
+    assert set(book.universe) <= set(book.prices)

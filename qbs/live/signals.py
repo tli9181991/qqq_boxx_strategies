@@ -47,6 +47,12 @@ class TargetBook:
     scalar: float                      # the vol-target scalar actually applied
     book_vol: float                    # the book's own realised vol estimate
     raw_holdings: List[str] = field(default_factory=list)   # the 6 names before scaling
+    # Every name the strategy is entitled to trade: the rankable universe plus
+    # the safe asset. `weights` carries only today's non-zero targets, so it
+    # cannot tell a name the strategy just exited from a holding that was never
+    # the strategy's business. The order builder needs that distinction to sell
+    # the first and leave the second alone.
+    universe: List[str] = field(default_factory=list)
     n_rankable: int = 0
     universe_size: int = 0
     diagnostics: Dict[str, float] = field(default_factory=dict)
@@ -269,8 +275,13 @@ def compute_targets(
     held = list((mom.holdings_log or {}).get(asof, []))
     selection = _selection_rows(mom, asof, held)
 
+    universe = sorted(set(uni.columns) | {safe})
+
     last_px = prices.loc[asof]
-    px_map = {t: float(last_px[t]) for t in weights if t in last_px.index
+    # Priced across the whole universe, not just today's targets: an exit needs
+    # a price to be logged with a real notional, and the name being exited is
+    # by definition not in `weights`.
+    px_map = {t: float(last_px[t]) for t in universe if t in last_px.index
               and not pd.isna(last_px[t])}
     missing_px = sorted(set(weights) - set(px_map))
     if missing_px:
@@ -283,6 +294,7 @@ def compute_targets(
         scalar=float(vdiag["scalar"]),
         book_vol=float(vdiag["book_vol"]) if not pd.isna(vdiag["book_vol"]) else float("nan"),
         raw_holdings=held,
+        universe=universe,
         n_rankable=int(mom.diagnostics.loc[asof, "n_rankable"]),
         universe_size=uni.shape[1],
         diagnostics={k: v for k, v in diag.items()},

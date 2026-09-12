@@ -201,6 +201,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
                 min_notional=live.min_order_notional,
                 hold_safe_asset=live.hold_safe_asset,
                 safe_asset=live.safe_asset,
+                universe=book.universe,
             )
             log.info("orders the trade phase would send:\n%s",
                      format_order_table(orders, target, positions))
@@ -287,6 +288,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
                 min_notional=live.min_order_notional,
                 hold_safe_asset=live.hold_safe_asset,
                 safe_asset=live.safe_asset,
+                universe=book.universe,
             )
             log.info("order list:\n%s", format_order_table(orders, target, positions))
 

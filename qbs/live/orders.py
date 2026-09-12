@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -205,11 +205,19 @@ def build_orders(
     min_notional: float = 0.0,
     hold_safe_asset: bool = True,
     safe_asset: str = "BOXX",
+    universe: Optional[Iterable[str]] = None,
 ) -> tuple[List[Order], Dict[str, int]]:
     """The whole path: weights -> orders, guards applied. Returns (orders, targets).
 
     With `hold_safe_asset=False` the cash leg is simply left as cash: the safe
     asset is dropped from the target and any existing position in it is closed.
+
+    `universe` is every name the strategy may trade. It is what separates a
+    position the strategy has just exited from one that was never its business,
+    and both look identical from `weights` alone -- an exited name has weight
+    zero, and zero weights are not carried. Without it, a held name missing
+    from today's targets is read as somebody else's holding and left alone, so
+    the book buys its replacements while never selling its exits. Pass it.
     """
     weights = dict(weights)
     if not hold_safe_asset:
@@ -219,7 +227,7 @@ def build_orders(
     if not hold_safe_asset and safe_asset in actual:
         target[safe_asset] = 0
 
-    strategy_syms = set(target) | set(weights)
+    strategy_syms = set(target) | set(weights) | set(universe or ())
     unknown = {k: v for k, v in actual.items() if k not in strategy_syms and v != 0}
 
     orders = diff_positions(target, {k: v for k, v in actual.items()
