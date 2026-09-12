@@ -99,6 +99,22 @@ class LiveConfig:
     allow_live_account: bool = False       # refuses to run against a non-paper port unless set
 
     # ---- operational -----------------------------------------------------
+    # ---- keeping out of your own way -------------------------------------
+    # Names the ranker must not consider. A skipped name is not a lost slot:
+    # the next name down takes it, so the book is still six wide. Use this when
+    # you hold something yourself and would rather the strategy diversify away
+    # from it than compete with you for it.
+    #
+    # This changes the strategy from the one the backtest validated. Excluding
+    # one name costs roughly a point of CAGR; excluding six costs most of the
+    # edge, because a discretionary book concentrates where the momentum is and
+    # every exclusion removes one of the ranker's better candidates.
+    exclude_tickers: List[str] = field(default_factory=list)
+    # Also exclude everything in the external-holdings baseline, so the one
+    # capture serves both purposes: those shares are yours, and the strategy
+    # will not rank the names either.
+    exclude_own_holdings: bool = False
+
     state_dir: str = DEFAULT_STATE_DIR
     kill_switch: str = ""        # if this path exists, every phase refuses to trade
     dry_run: bool = False        # log the orders, send nothing
@@ -147,6 +163,11 @@ class LiveConfig:
         return os.path.join(self.state_dir, "external_positions.json")
 
     @property
+    def book_csv_path(self) -> str:
+        """A readable snapshot of the strategy's book. A report, not a record."""
+        return os.path.join(self.state_dir, "strategy_book.csv")
+
+    @property
     def db_path(self) -> str:
         """The run log: trades, selections, closes and NAV, as SQL tables."""
         return os.path.join(self.state_dir, "qbs.db")
@@ -184,6 +205,12 @@ class LiveConfig:
         cfg.dry_run = _env_bool("QBS_DRY_RUN", cfg.dry_run)
         cfg.allow_live_account = _env_bool("QBS_ALLOW_LIVE", cfg.allow_live_account)
         cfg.hold_safe_asset = _env_bool("QBS_HOLD_SAFE_ASSET", cfg.hold_safe_asset)
+        if os.environ.get("QBS_EXCLUDE_TICKERS"):
+            cfg.exclude_tickers = [t.strip().upper() for t in
+                                   os.environ["QBS_EXCLUDE_TICKERS"]
+                                   .replace(",", " ").split() if t.strip()]
+        cfg.exclude_own_holdings = _env_bool("QBS_EXCLUDE_OWN",
+                                             cfg.exclude_own_holdings)
         cfg.__post_init__()
         return cfg
 

@@ -342,6 +342,48 @@ to it. Two consequences:
 Fix a stale baseline by settling the account the way you want it, then
 `baseline --capture --force`.
 
+### Having the ranker skip names you hold
+
+Netting shares lets the strategy trade a name you also hold. If you would
+rather it stayed out of that name entirely and diversified away from you, add
+it to `exclude_tickers` in the live JSON config, or set `QBS_EXCLUDE_TICKERS`:
+
+```bash
+QBS_EXCLUDE_TICKERS=MRVL
+QBS_EXCLUDE_OWN=1       # also skip everything in the baseline
+```
+
+A skipped name is not a lost slot — the next name down takes it, so the book
+stays six wide. Excluding one name costs roughly a point of CAGR (measured on
+the current history: 26.4% -> 25.4%, Calmar 1.40 -> 1.36), which is a fair
+trade when you hold that name yourself and have the exposure anyway.
+
+It does not scale. Excluding all six of the current holdings drops the book to
+6.9% CAGR and 0.23 Sharpe, because a discretionary book concentrates in exactly
+the names the ranker likes, so every exclusion removes one of its better
+candidates. Keep the list to one or two.
+
+An excluded name the strategy already holds is **sold** on the next run: it has
+no target, and excluded names deliberately stay tradeable so the position can
+be closed rather than stranded.
+
+### `var/strategy_book.csv`
+
+Every preflight and trade writes a snapshot of the strategy's own book beside
+the account's:
+
+```
+asof,symbol,strategy_shares,account_shares,yours,price,market_value,target_shares,target_weight
+2026-09-11,MRVL,25,125,100,236.5600,5914.00,25,0.0591
+```
+
+It is a report, not a record. Every figure is recomputed from the broker and
+the baseline on the next run, so editing the file changes nothing and losing it
+costs nothing — which is precisely what makes it safe to keep. A CSV the
+strategy read back as its position of record would drift the first time a fill
+was missed, and no amount of price history could repair it. That is why the
+strategy's position is derived rather than tallied.
+
 ## Step 10 — The instance schedule
 
 EventBridge Scheduler rules against the EC2 API. The simplest shape is one

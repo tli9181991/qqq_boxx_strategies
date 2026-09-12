@@ -1078,3 +1078,96 @@ def test_a_negative_baseline_is_rejected(tmp_path):
     path.write_text('{"positions": {"TSM": -5}}')
     with pytest.raises(ValueError, match="negative"):
         st.load_external_positions(str(path))
+
+
+# --------------------------------------------------------------------------
+# Skipping a name you already hold, and taking the next one down
+# --------------------------------------------------------------------------
+
+def _excluded_book(exclude):
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    return compute_targets(cfg, frame, requested=list(uni.columns),
+                           exclude=exclude)
+
+
+def test_an_excluded_name_is_replaced_not_left_empty():
+    """A skipped slot goes to the next name down; the book stays six wide."""
+    cfg = Config()
+    base = _excluded_book(None)
+    held = [t for t in base.raw_holdings]
+    assert held, "the fixture produced no holdings"
+
+    after = _excluded_book([held[0]])
+
+    assert held[0] not in after.raw_holdings
+    assert len(after.raw_holdings) == len(held), "the slot was dropped, not refilled"
+    assert set(after.raw_holdings) - set(held), "no new name took the slot"
+
+
+def test_an_excluded_name_stays_sellable():
+    """The trap: dropping it from the tradeable set would strand the position.
+
+    An excluded name the strategy already holds must still be closable, or the
+    order builder reads it as somebody else's holding and never sells it.
+    """
+    base = _excluded_book(None)
+    held = base.raw_holdings[0]
+    after = _excluded_book([held])
+
+    assert held not in after.weights, "an excluded name should have no target"
+    assert held in after.universe, "an excluded name must stay tradeable to be sold"
+
+    from qbs.live.orders import build_orders
+    orders, _ = build_orders(
+        after.weights, after.prices, {held: 10},
+        notional=100_000, max_order_notional=200_000, max_gross_turnover=99,
+        max_positions=12, universe=after.universe)
+    sells = [o for o in orders if o.symbol == held]
+    assert sells and sells[0].action == "SELL" and sells[0].quantity == 10
+
+
+def test_excluding_everything_fails_loudly_rather_than_trading_a_thin_book():
+    """Better to stop than to run a book narrower than the strategy specifies."""
+    from qbs.universe import synthetic_universe
+
+    everything = list(synthetic_universe(n=30, start="2023-06-01").columns)
+    with pytest.raises(SignalError, match="after exclusions"):
+        _excluded_book(everything)
+
+
+def test_exclusions_come_from_config_and_optionally_the_baseline(tmp_path):
+    from qbs.live.runner import _excluded_names
+
+    live = LiveConfig(state_dir=str(tmp_path), exclude_tickers=["nvda"])
+    st.save_external_positions(live.external_positions_path, {"MRVL": 100})
+
+    assert _excluded_names(live) == ["NVDA"], "the baseline leaked in unasked"
+
+    live.exclude_own_holdings = True
+    assert _excluded_names(live) == ["MRVL", "NVDA"]
+
+
+def test_the_book_csv_shows_both_owners_side_by_side(tmp_path):
+    path = str(tmp_path / "strategy_book.csv")
+    st.write_book_csv(path,
+                      account={"MRVL": 125, "VOO": 30},
+                      external={"MRVL": 100, "VOO": 30},
+                      strategy={"MRVL": 25},
+                      prices={"MRVL": 236.56},
+                      target={"MRVL": 25},
+                      notional=100_000, asof="2026-09-11")
+
+    import csv as _csv
+    rows = {r["symbol"]: r for r in _csv.DictReader(open(path))}
+
+    assert rows["MRVL"]["strategy_shares"] == "25"
+    assert rows["MRVL"]["account_shares"] == "125"
+    assert rows["MRVL"]["yours"] == "100"
+    assert float(rows["MRVL"]["market_value"]) == pytest.approx(25 * 236.56)
+    # A holding wholly yours still appears, so the file explains the account.
+    assert rows["VOO"]["strategy_shares"] == "0"

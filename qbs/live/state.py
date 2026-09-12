@@ -16,6 +16,7 @@ doing rather than whether last night's run succeeded.
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -155,3 +156,65 @@ def save_external_positions(path: str, positions: Dict[str, int],
     _atomic_write(path, json.dumps(payload, indent=2))
     log.info("wrote external-holdings baseline to %s: %s", path,
              payload["positions"] or "(empty)")
+
+
+# --------------------------------------------------------------------------
+# A human-readable snapshot of the strategy's own book
+# --------------------------------------------------------------------------
+
+BOOK_CSV_COLUMNS = ["asof", "symbol", "strategy_shares", "account_shares",
+                    "yours", "price", "market_value", "target_shares",
+                    "target_weight"]
+
+
+def write_book_csv(path: str,
+                   account: Dict[str, int],
+                   external: Dict[str, int],
+                   strategy: Dict[str, int],
+                   prices: Optional[Dict[str, float]] = None,
+                   target: Optional[Dict[str, int]] = None,
+                   notional: float = 0.0,
+                   asof: str = "") -> None:
+    """Write what the strategy holds, next to what the account holds.
+
+    A *report*, deliberately not a source of truth. Every number here is
+    recomputed from the broker and the baseline on the next run, so editing
+    this file changes nothing and losing it costs nothing -- which is exactly
+    why it is safe to keep. A CSV that the strategy read back as its position
+    of record would drift the first time a fill was missed, and nothing in the
+    price history could ever repair it.
+    """
+    prices = prices or {}
+    target = target or {}
+    asof = asof or utc_now_iso()[:10]
+
+    rows = []
+    for sym in sorted(set(account) | set(strategy) | set(target)):
+        shares = int(strategy.get(sym, 0))
+        px = float(prices.get(sym, 0.0) or 0.0)
+        rows.append({
+            "asof": asof,
+            "symbol": sym,
+            "strategy_shares": shares,
+            "account_shares": int(account.get(sym, 0)),
+            "yours": int(external.get(sym, 0)),
+            "price": f"{px:.4f}" if px else "",
+            "market_value": f"{shares * px:.2f}" if px else "",
+            "target_shares": int(target[sym]) if sym in target else "",
+            "target_weight": (f"{target[sym] * px / notional:.4f}"
+                              if sym in target and px and notional else ""),
+        })
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=BOOK_CSV_COLUMNS)
+            w.writeheader()
+            w.writerows(rows)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    log.info("wrote the strategy book to %s (%d rows)", path, len(rows))

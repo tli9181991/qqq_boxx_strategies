@@ -240,6 +240,7 @@ def compute_targets(
     max_staleness_days: int = 5,
     min_coverage: float = 0.85,
     now: Optional[pd.Timestamp] = None,
+    exclude: Optional[List[str]] = None,
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -256,10 +257,27 @@ def compute_targets(
     # Same pruning the pipeline does: a name without enough history is not
     # rankable, and leaving it in as a NaN column shrinks the candidate pool.
     uni = uni.loc[:, uni.notna().sum() >= cfg.momentum.min_history]
+
+    # `tradeable` is fixed before exclusions and is what the order builder gets.
+    # An excluded name the strategy still holds has to remain sellable: drop it
+    # from the *tradeable* set as well and the order builder reads the position
+    # as somebody else's and never closes it, which is the exact bug the
+    # universe field exists to prevent.
+    tradeable = sorted(set(uni.columns) | {safe})
+
+    dropped = sorted(set(exclude or []) & set(uni.columns))
+    if dropped:
+        # Skipped names are not replaced by nothing -- the ranker simply fills
+        # the slot with the next name down, which is the point.
+        log.info("excluded from ranking (held outside the strategy): %s",
+                 ", ".join(dropped))
+        uni = uni.drop(columns=dropped)
+
     if uni.shape[1] < cfg.momentum.n_hold:
         raise SignalError(
             f"only {uni.shape[1]} names have the {cfg.momentum.min_history} days of "
-            f"history the ranker needs; cannot fill {cfg.momentum.n_hold} slots")
+            f"history the ranker needs{' after exclusions' if dropped else ''}; "
+            f"cannot fill {cfg.momentum.n_hold} slots")
 
     mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum)
 
@@ -275,7 +293,7 @@ def compute_targets(
     held = list((mom.holdings_log or {}).get(asof, []))
     selection = _selection_rows(mom, asof, held)
 
-    universe = sorted(set(uni.columns) | {safe})
+    universe = tradeable
 
     last_px = prices.loc[asof]
     # Priced across the whole universe, not just today's targets: an exit needs

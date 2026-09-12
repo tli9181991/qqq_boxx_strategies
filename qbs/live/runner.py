@@ -126,6 +126,21 @@ def past_moc_cutoff(tz: str, cutoff_hhmm: str) -> bool:
 # Shared work
 # --------------------------------------------------------------------------
 
+def _excluded_names(live: LiveConfig) -> List[str]:
+    """Names the ranker must skip: configured, plus optionally your own book.
+
+    Deriving the second half from the external-holdings baseline keeps one
+    capture serving both jobs -- those shares are yours, and the strategy does
+    not compete for the name. It must never be derived from *live* positions:
+    the strategy's own holdings would then exclude themselves the moment it
+    bought them, and it would churn the whole book every session.
+    """
+    names = {t.upper() for t in live.exclude_tickers}
+    if live.exclude_own_holdings:
+        names |= set(st.load_external_positions(live.external_positions_path))
+    return sorted(names)
+
+
 def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
                       offline: bool = False):
     """Download prices and compute the target book. Shared by preflight and trade.
@@ -149,6 +164,7 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         cfg, px, requested=tickers,
         max_staleness_days=live.max_price_staleness_days,
         min_coverage=live.min_universe_coverage,
+        exclude=_excluded_names(live),
     )
     return px, book
 
@@ -157,7 +173,8 @@ def _bar_is_today(book, tz: str) -> bool:
     return book.asof.date() == market_today(tz).date()
 
 
-def _strategy_book(broker, live: LiveConfig, universe=None) -> Dict[str, int]:
+def _strategy_book(broker, live: LiveConfig, universe=None
+                   ) -> tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
     """What the strategy holds, as distinct from what the account holds.
 
     When the strategy runs in an account that also holds positions you manage
@@ -169,14 +186,14 @@ def _strategy_book(broker, live: LiveConfig, universe=None) -> Dict[str, int]:
     external = st.load_external_positions(live.external_positions_path)
     if not external:
         log.info("current positions: %s", account or "(flat)")
-        return account
+        return account, account, {}
 
     mine, shortfall = strategy_positions(account, external)
     check_external_baseline(shortfall, universe=universe)
     log.info("account positions : %s", account or "(flat)")
     log.info("yours (baseline)  : %s", external)
     log.info("strategy positions: %s", mine or "(flat)")
-    return mine
+    return mine, account, external
 
 
 # --------------------------------------------------------------------------
@@ -212,7 +229,8 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
         with IBBroker(live) as broker:
             nlv = broker.net_liquidation()
             log.info("account %s: NetLiquidation $%s", broker.account, f"{nlv:,.0f}")
-            positions = _strategy_book(broker, live, universe=book.universe)
+            positions, account, external = _strategy_book(
+                broker, live, universe=book.universe)
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
@@ -228,6 +246,9 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
             )
             log.info("orders the trade phase would send:\n%s",
                      format_order_table(orders, target, positions))
+            st.write_book_csv(live.book_csv_path, account, external, positions,
+                              prices=book.prices, target=target,
+                              notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
             broker.qualify(sorted({o.symbol for o in orders} | set(target)))
             log.info("all symbols qualified with IB")
     except GuardTripped as exc:
@@ -298,7 +319,8 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
     from qbs.live.broker import BrokerError, IBBroker
     try:
         with IBBroker(live) as broker:
-            positions = _strategy_book(broker, live, universe=book.universe)
+            positions, account, external = _strategy_book(
+                broker, live, universe=book.universe)
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
@@ -313,6 +335,9 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
                 universe=book.universe,
             )
             log.info("order list:\n%s", format_order_table(orders, target, positions))
+            st.write_book_csv(live.book_csv_path, account, external, positions,
+                              prices=book.prices, target=target,
+                              notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
 
             # Checked here, immediately before sending, not at the top of the
             # phase: the download and ranking take real time, and it is the
