@@ -115,6 +115,15 @@ class LiveConfig:
     # will not rank the names either.
     exclude_own_holdings: bool = False
 
+    # ---- how the strategy knows what it holds ----------------------------
+    # "ledger"   its own fills, tallied in var/strategy_trades.csv. Unaffected
+    #            by anything you trade yourself, so it is the right choice for
+    #            a shared account -- provided you never sell what it bought.
+    # "baseline" account minus a snapshot of what was yours. Survives a missed
+    #            fill, but goes wrong silently if you trade those names.
+    # "account"  the whole account is the strategy's. Only for a dedicated one.
+    position_source: str = "account"
+
     state_dir: str = DEFAULT_STATE_DIR
     kill_switch: str = ""        # if this path exists, every phase refuses to trade
     dry_run: bool = False        # log the orders, send nothing
@@ -130,6 +139,10 @@ class LiveConfig:
             raise ValueError("max_gross_turnover must be positive")
         if not 0.0 < self.min_universe_coverage <= 1.0:
             raise ValueError("min_universe_coverage must be in (0, 1]")
+        if self.position_source not in ("ledger", "baseline", "account"):
+            raise ValueError(
+                f"position_source must be ledger, baseline or account, "
+                f"not {self.position_source!r}")
 
     # ---- derived ---------------------------------------------------------
     @property
@@ -161,6 +174,11 @@ class LiveConfig:
         absent file means the whole account is the strategy's.
         """
         return os.path.join(self.state_dir, "external_positions.json")
+
+    @property
+    def ledger_path(self) -> str:
+        """The strategy's own executions, appended from IB's fill records."""
+        return os.path.join(self.state_dir, "strategy_trades.csv")
 
     @property
     def book_csv_path(self) -> str:
@@ -211,6 +229,8 @@ class LiveConfig:
                                    .replace(",", " ").split() if t.strip()]
         cfg.exclude_own_holdings = _env_bool("QBS_EXCLUDE_OWN",
                                              cfg.exclude_own_holdings)
+        cfg.position_source = os.environ.get("QBS_POSITION_SOURCE",
+                                             cfg.position_source)
         cfg.__post_init__()
         return cfg
 

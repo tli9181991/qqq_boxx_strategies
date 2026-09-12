@@ -44,6 +44,7 @@ from qbs.live.orders import (GuardTripped, attribute_marks, build_orders,
                              check_external_baseline, format_order_table,
                              strategy_positions)
 from qbs.live.signals import compute_targets, load_live_prices
+from qbs.live import ledger as ldg
 from qbs.live import state as st
 from qbs.live import store
 
@@ -183,17 +184,35 @@ def _strategy_book(broker, live: LiveConfig, universe=None
     baseline is what keeps the two books separate inside one account.
     """
     account = broker.positions()
-    external = st.load_external_positions(live.external_positions_path)
-    if not external:
-        log.info("current positions: %s", account or "(flat)")
-        return account, account, {}
 
-    mine, shortfall = strategy_positions(account, external)
-    check_external_baseline(shortfall, universe=universe)
-    log.info("account positions : %s", account or "(flat)")
-    log.info("yours (baseline)  : %s", external)
-    log.info("strategy positions: %s", mine or "(flat)")
-    return mine, account, external
+    if live.position_source == "ledger":
+        mine = ldg.positions(live.ledger_path)
+        residual, over = ldg.reconcile_against_account(mine, account)
+        if over:
+            detail = ", ".join(f"{k} claims {v} more than the account holds"
+                               for k, v in sorted(over.items()))
+            raise GuardTripped(
+                f"the trade ledger disagrees with the account: {detail}. Either "
+                "a fill was never recorded, or shares the strategy bought were "
+                "sold outside it. The strategy would try to sell stock that is "
+                f"not there. Reconcile {live.ledger_path} against the account "
+                "before trading again.")
+        log.info("account positions : %s", account or "(flat)")
+        log.info("strategy (ledger) : %s", mine or "(flat)")
+        log.info("yours (residual)  : %s", residual or "(none)")
+        return mine, account, residual
+
+    if live.position_source == "baseline":
+        external = st.load_external_positions(live.external_positions_path)
+        mine, shortfall = strategy_positions(account, external)
+        check_external_baseline(shortfall, universe=universe)
+        log.info("account positions : %s", account or "(flat)")
+        log.info("yours (baseline)  : %s", external)
+        log.info("strategy positions: %s", mine or "(flat)")
+        return mine, account, external
+
+    log.info("current positions: %s", account or "(flat)")
+    return account, account, {}
 
 
 # --------------------------------------------------------------------------
@@ -420,10 +439,18 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
             if not fills:
                 log.info("no fills reported this session")
 
-            external = st.load_external_positions(live.external_positions_path)
+            if live.position_source == "ledger":
+                ldg.append_fills(live.ledger_path, session, fills)
+                external, _ = ldg.reconcile_against_account(
+                    ldg.positions(live.ledger_path), broker.positions())
+            else:
+                external = st.load_external_positions(live.external_positions_path)
             # Both the marks and the position list are the strategy's share of
             # the account, so the NAV row describes the book being run rather
             # than everything that happens to sit in the same account.
+            # `external` is what is not the strategy's, however that was
+            # determined -- a captured baseline, or the residual the ledger
+            # does not claim. Netting it out is the same operation either way.
             marks = attribute_marks(broker.portfolio_marks(), external)
             positions, _ = strategy_positions(broker.positions(), external)
             nlv = broker.net_liquidation()

@@ -1171,3 +1171,106 @@ def test_the_book_csv_shows_both_owners_side_by_side(tmp_path):
     assert float(rows["MRVL"]["market_value"]) == pytest.approx(25 * 236.56)
     # A holding wholly yours still appears, so the file explains the account.
     assert rows["VOO"]["strategy_shares"] == "0"
+
+
+# --------------------------------------------------------------------------
+# The trade ledger: the strategy's own fills as the position of record
+# --------------------------------------------------------------------------
+
+def _fill(symbol, action, qty, px, order_id=1, exec_id=""):
+    from qbs.live.broker import Fill
+    return Fill(symbol, action, qty, px, "Filled", order_id, exec_id)
+
+
+def test_the_ledger_nets_buys_and_sells(tmp_path):
+    from qbs.live import ledger
+
+    path = str(tmp_path / "strategy_trades.csv")
+    ledger.append_fills(path, "2026-09-15", [_fill("MU", "BUY", 6, 974.0, 1, "a")])
+    ledger.append_fills(path, "2026-09-16", [_fill("MU", "SELL", 2, 980.0, 2, "b")])
+
+    assert ledger.positions(path) == {"MU": 4}
+
+
+def test_a_fully_closed_name_leaves_the_ledger_positions(tmp_path):
+    from qbs.live import ledger
+
+    path = str(tmp_path / "strategy_trades.csv")
+    ledger.append_fills(path, "2026-09-15", [_fill("MU", "BUY", 6, 974.0, 1, "a")])
+    ledger.append_fills(path, "2026-09-16", [_fill("MU", "SELL", 6, 980.0, 2, "b")])
+
+    assert ledger.positions(path) == {}
+
+
+def test_rerunning_reconcile_does_not_double_count(tmp_path):
+    """Reconcile is re-runnable by design, so appending must be idempotent."""
+    from qbs.live import ledger
+
+    path = str(tmp_path / "strategy_trades.csv")
+    fills = [_fill("MU", "BUY", 6, 974.0, 1, "exec-a"),
+             _fill("MRVL", "BUY", 25, 236.0, 2, "exec-b")]
+
+    assert ledger.append_fills(path, "2026-09-15", fills) == 2
+    assert ledger.append_fills(path, "2026-09-15", fills) == 0
+    assert ledger.positions(path) == {"MU": 6, "MRVL": 25}
+
+
+def test_partial_fills_of_one_order_are_both_recorded(tmp_path):
+    """Two executions share an order id; only the execution id separates them."""
+    from qbs.live import ledger
+
+    path = str(tmp_path / "strategy_trades.csv")
+    ledger.append_fills(path, "2026-09-15", [
+        _fill("MU", "BUY", 4, 974.0, order_id=7, exec_id="x1"),
+        _fill("MU", "BUY", 2, 974.5, order_id=7, exec_id="x2"),
+    ])
+    assert ledger.positions(path) == {"MU": 6}
+
+
+def test_dry_run_results_never_enter_the_ledger(tmp_path):
+    from qbs.live import ledger
+    from qbs.live.broker import Fill
+
+    path = str(tmp_path / "strategy_trades.csv")
+    n = ledger.append_fills(path, "2026-09-15",
+                            [Fill("MU", "BUY", 6, 974.0, "DryRun", 0, "")])
+    assert n == 0
+    assert ledger.positions(path) == {}
+
+
+def test_the_residual_is_what_you_hold_yourself(tmp_path):
+    from qbs.live import ledger
+
+    residual, over = ledger.reconcile_against_account(
+        {"MU": 6, "MRVL": 25}, {"MU": 6, "MRVL": 125, "VOO": 30})
+
+    assert residual == {"MRVL": 100, "VOO": 30}
+    assert not over
+
+
+def test_your_own_buying_does_not_move_the_strategy_book(tmp_path):
+    """The whole reason to tally rather than derive."""
+    from qbs.live import ledger
+
+    path = str(tmp_path / "strategy_trades.csv")
+    ledger.append_fills(path, "2026-09-15", [_fill("MRVL", "BUY", 25, 236.0, 1, "a")])
+
+    before = ledger.positions(path)
+    # You buy 50 more MRVL yourself; the account changes, the ledger does not.
+    residual, over = ledger.reconcile_against_account(before, {"MRVL": 175})
+
+    assert before == {"MRVL": 25}
+    assert residual == {"MRVL": 150}
+    assert not over
+
+
+def test_a_ledger_claiming_more_than_the_account_holds_is_flagged():
+    from qbs.live import ledger
+
+    _, over = ledger.reconcile_against_account({"MU": 6}, {"MU": 2})
+    assert over == {"MU": 4}
+
+
+def test_position_source_must_be_one_of_the_three():
+    with pytest.raises(ValueError, match="position_source"):
+        LiveConfig(position_source="guess")

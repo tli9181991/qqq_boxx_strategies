@@ -314,6 +314,36 @@ IB reports one position per symbol per account. If you hold 22 TSM yourself and
 the strategy wants 5, the strategy sees 27, computes `5 - 27`, and **sells 17 of
 your shares**. Overlap is not hypothetical: the current book holds MRVL.
 
+`position_source` decides how the strategy recovers its own book:
+
+| | how | breaks when |
+|---|---|---|
+| `ledger` | tally its own fills | a fill is never recorded |
+| `baseline` | account minus a snapshot of what was yours | *you* trade those names |
+| `account` | the whole account is the strategy's | anything else is in there |
+
+**Use `ledger` for a shared account**, provided you never sell what the strategy
+bought. Your own trading is unbounded and silent; a missed fill is bounded, makes
+the reconcile unit fail, and is cross-checked on every run.
+
+```bash
+QBS_POSITION_SOURCE=ledger
+```
+
+`var/strategy_trades.csv` is appended from IB's own execution records at
+reconcile — never from orders sent, so an order that did not fill leaves no row.
+Rows are keyed on IB's execution id, so re-running reconcile after a failure
+cannot double-count, and an order filled in two parts records both.
+
+Every run checks the tally against the broker: the account must hold at least
+what the ledger claims. If it claims more, either a fill went unrecorded or
+someone sold the strategy's shares — the strategy would try to sell stock that
+is not there, so the run stops instead. Whatever the account holds beyond the
+tally is reported as the residual: that is your book, and the strategy leaves
+it alone.
+
+### The `baseline` alternative
+
 Capture a baseline once, before the strategy has traded the account:
 
 ```bash

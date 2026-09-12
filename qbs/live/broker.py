@@ -44,6 +44,11 @@ class Fill:
     avg_price: float
     status: str
     order_id: int = 0
+    # IB's own unique id for an execution. Carried so the trade ledger can be
+    # appended to twice without double-counting: reconcile is re-runnable by
+    # design, and an order that filled in two parts arrives as two executions
+    # sharing one order id.
+    exec_id: str = ""
 
 
 class IBBroker:
@@ -303,5 +308,6 @@ class IBBroker:
                 avg_price=float(ex.price),
                 status="Filled",
                 order_id=int(ex.orderId),
+                exec_id=str(getattr(ex, "execId", "") or ""),
             ))
         return out
