@@ -139,6 +139,16 @@ class LiveConfig:
             raise ValueError("max_gross_turnover must be positive")
         if not 0.0 < self.min_universe_coverage <= 1.0:
             raise ValueError("min_universe_coverage must be in (0, 1]")
+        # Normalised here rather than at each entry point, so a name typed
+        # into the JSON config behaves exactly like one passed in the
+        # environment. Lower-cased tickers match nothing in the universe, and
+        # an exclusion that matches nothing fails silently -- the book simply
+        # comes back holding the name you meant to skip.
+        seen = set()
+        self.exclude_tickers = [
+            t for t in (str(x).strip().upper() for x in self.exclude_tickers)
+            if t and not (t in seen or seen.add(t))]
+
         if self.position_source not in ("ledger", "baseline", "account"):
             raise ValueError(
                 f"position_source must be ledger, baseline or account, "

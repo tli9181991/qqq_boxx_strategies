@@ -1274,3 +1274,36 @@ def test_a_ledger_claiming_more_than_the_account_holds_is_flagged():
 def test_position_source_must_be_one_of_the_three():
     with pytest.raises(ValueError, match="position_source"):
         LiveConfig(position_source="guess")
+
+
+def test_exclusions_are_a_list_and_normalised_however_they_arrive(tmp_path):
+    """A lower-cased ticker matches no column, so it would exclude nothing.
+
+    That failure is silent -- the book simply comes back holding the name you
+    meant to skip -- so normalising has to happen for every entry path, not
+    just the environment one.
+    """
+    import json
+
+    cfg = LiveConfig(exclude_tickers=["mrvl", " nvda ", "MRVL", ""])
+    assert cfg.exclude_tickers == ["MRVL", "NVDA"], "not normalised or not deduped"
+
+    path = tmp_path / "live.json"
+    path.write_text(json.dumps({"exclude_tickers": ["mrvl", "klac"]}))
+    assert LiveConfig.from_env(str(path)).exclude_tickers == ["MRVL", "KLAC"]
+
+    os.environ["QBS_EXCLUDE_TICKERS"] = "mrvl, nvda amd"
+    try:
+        assert LiveConfig.from_env().exclude_tickers == ["MRVL", "NVDA", "AMD"]
+    finally:
+        del os.environ["QBS_EXCLUDE_TICKERS"]
+
+
+def test_several_names_can_be_excluded_at_once():
+    base = _excluded_book(None)
+    two = base.raw_holdings[:2]
+    after = _excluded_book(two)
+
+    assert not set(two) & set(after.raw_holdings)
+    assert len(after.raw_holdings) == len(base.raw_holdings), "slots were lost"
+    assert all(t in after.universe for t in two), "excluded names must stay sellable"

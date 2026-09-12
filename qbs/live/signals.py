@@ -265,7 +265,15 @@ def compute_targets(
     # universe field exists to prevent.
     tradeable = sorted(set(uni.columns) | {safe})
 
-    dropped = sorted(set(exclude or []) & set(uni.columns))
+    wanted_out = {str(t).strip().upper() for t in (exclude or [])} - {""}
+    dropped = sorted(wanted_out & set(uni.columns))
+    unmatched = sorted(wanted_out - set(uni.columns))
+    if unmatched:
+        # Usually harmless -- a name you hold that was never in the index, so
+        # there was nothing to exclude. Occasionally a typo, which would
+        # otherwise show up only as the book still holding the name.
+        log.info("exclusions that match nothing in the ranking universe: %s",
+                 ", ".join(unmatched))
     if dropped:
         # Skipped names are not replaced by nothing -- the ranker simply fills
         # the slot with the next name down, which is the point.

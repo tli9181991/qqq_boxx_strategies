@@ -15,6 +15,9 @@
   "max_price_staleness_days": 5,
   "min_universe_coverage": 0.85,
 
+  "position_source": "account",
+  "exclude_tickers": [],
+
   "state_dir": "/opt/qbs/var",
   "market_tz": "America/New_York",
   "dry_run": false,

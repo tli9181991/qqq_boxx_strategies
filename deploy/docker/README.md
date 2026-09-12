@@ -378,9 +378,15 @@ Netting shares lets the strategy trade a name you also hold. If you would
 rather it stayed out of that name entirely and diversified away from you, add
 it to `exclude_tickers` in the live JSON config, or set `QBS_EXCLUDE_TICKERS`:
 
+It takes a list — comma or space separated, any case — not a single name:
+
 ```bash
-QBS_EXCLUDE_TICKERS=MRVL
-QBS_EXCLUDE_OWN=1       # also skip everything in the baseline
+QBS_EXCLUDE_TICKERS=MRVL,NVDA,AMD
+QBS_EXCLUDE_OWN=1                    # also skip everything in the baseline
+```
+
+```json
+{ "exclude_tickers": ["MRVL", "NVDA", "AMD"] }
 ```
 
 A skipped name is not a lost slot — the next name down takes it, so the book
