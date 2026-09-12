@@ -475,14 +475,29 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     if trades:
         print("TRADING EVENTS (most recent first)")
         print(f"  {'date':<12}{'phase':<11}{'event':<14}{'symbol':<8}{'side':<6}"
-              f"{'qty':>8}{'price':>11}{'notional':>12}")
+              f"{'qty':>8}{'price':>11}{'notional':>12}  {'sent':<12}")
+        orders = dry = 0
         for r in trades:
+            is_order = bool(r["symbol"]) and (r["quantity"] or 0)
+            # `event` is "submitted" whether or not the order left the process,
+            # because that is the phase's own vocabulary. Without this column
+            # the log of a dry run is indistinguishable from the log of a
+            # session that actually traded -- the one ambiguity an audit trail
+            # must never have.
+            if is_order:
+                orders += 1
+                dry += bool(r["dry_run"])
+            sent = ("no (dry run)" if r["dry_run"] else "yes") if is_order else ""
             print(f"  {r['session_date']:<12}{r['phase']:<11}{r['event']:<14}"
                   f"{(r['symbol'] or ''):<8}{(r['action'] or ''):<6}"
                   f"{(r['quantity'] or 0):>8.0f}"
                   f"{(r['price'] or 0):>11,.2f}{(r['notional'] or 0):>12,.0f}"
+                  f"  {sent:<12}"
                   + (f"  {r['reason']}" if r["event"] in
                      ("guard_tripped", "error", "unfilled", "no_change") else ""))
+        if dry:
+            print(f"\n  NOTE: {dry} of {orders} order rows were DRY RUN and never "
+                  f"reached the broker.\n        Set QBS_DRY_RUN=0 to trade them.")
         print()
     if not any((nav, sel, trades)):
         print("(the run log is empty -- no phase has written to it yet)")

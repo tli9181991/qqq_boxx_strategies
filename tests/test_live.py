@@ -882,3 +882,42 @@ def test_main_refuses_to_run_a_phase_on_an_unwritable_state_dir(monkeypatch):
 
     assert rc == runner.EXIT_CONFIG
     assert not called, "the phase ran despite an unusable state directory"
+
+
+# --------------------------------------------------------------------------
+# The run log must never read the same for a dry run as for a real one
+# --------------------------------------------------------------------------
+
+def test_report_marks_dry_run_orders_as_not_sent(db, capsys, monkeypatch):
+    from qbs.live import runner
+    from qbs.live.orders import Order
+
+    orders = [Order(symbol="MU", action="BUY", quantity=6, price_hint=974.27)]
+    store.log_orders(db, "2026-09-11", "trade", orders, {"MU": "DryRun"},
+                     dry_run=True)
+
+    live = LiveConfig(state_dir=os.path.dirname(db))
+    monkeypatch.setattr(type(live), "db_path", property(lambda self: db))
+    runner.phase_report(live, days=5)
+    out = capsys.readouterr().out
+
+    assert "MU" in out
+    assert "no (dry run)" in out, "a dry run reads as a real submission"
+    assert "DRY RUN and never" in out
+
+
+def test_report_marks_real_orders_as_sent(db, capsys, monkeypatch):
+    from qbs.live import runner
+    from qbs.live.orders import Order
+
+    orders = [Order(symbol="MU", action="BUY", quantity=6, price_hint=974.27)]
+    store.log_orders(db, "2026-09-11", "trade", orders, {"MU": "Submitted"},
+                     dry_run=False)
+
+    live = LiveConfig(state_dir=os.path.dirname(db))
+    monkeypatch.setattr(type(live), "db_path", property(lambda self: db))
+    runner.phase_report(live, days=5)
+    out = capsys.readouterr().out
+
+    assert "no (dry run)" not in out
+    assert "DRY RUN and never" not in out
