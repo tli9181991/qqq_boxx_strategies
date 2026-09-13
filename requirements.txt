@@ -12,3 +12,6 @@ ipykernel>=6.25
 
 # Optional: nicer test runner. The suite also runs with plain `python tests/test_qbs.py`
 pytest>=7.4
+
+# Break-out level extraction (scipy.signal.find_peaks)
+scipy>=1.10

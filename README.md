@@ -12,6 +12,11 @@ that shows you where every signal fired.
 - **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
   can be held against the momentum book on identical assumptions
 
+Plus one strategy that does not fit the daily model and runs on its own:
+
+- **Weekly breakout, 6 slots** — a weekend Finviz watchlist traded by the M6
+  resistance-breakout rules on **hourly** bars, with per-trade stops
+
 Backtest window: **2025-01-20 (inauguration) to today**, one-day execution lag,
 commission and slippage charged separately on turnover.
 
@@ -323,6 +328,122 @@ window, worse — and that the 52-week-high proximity filter is why.
 
 ---
 
+### 8. Weekly breakout, 6 slots
+
+The scenario: **screen with Finviz at the weekend, trade the list next week with the
+M6 breakout rules, hold at most 6 names, and when one stops out let the slot sit in
+cash until the following weekend.**
+
+This is the only strategy here that does not go through `engine.run_backtest`, for two
+reasons that are structural rather than stylistic:
+
+- **It is hourly.** The entry is an hourly close crossing a resistance level, confirmed
+  *exactly two hourly bars later*. Collapse that to daily closes and the confirmation
+  window — the thing that separates a breakout from a spike — disappears entirely.
+- **It is event-driven.** Each position has its own entry price and its own stop at
+  `entry − R`. A weight times a close-to-close return cannot express "filled at 102.40
+  on the 11:30 bar, stopped at 98.10 four sessions later".
+
+So `breakout.py` does its own accounting from actual fills and hands back a
+`BacktestResult` that `metrics.summarise` reads like any other line. The costs, the
+slot weighting and the safe asset are the lab's; the fill model is the one thing that
+differs, and it differs because it has to.
+
+| | Rule |
+|---|---|
+| Universe | the weekend Finviz screen's top `watchlist_size` (20) by RS rank |
+| Entry | regime up (EMA10 > EMA20 daily), hourly close crosses a resistance level, still above it and still in regime `confirm_hours` (2) later. Filled at that bar's close |
+| Risk unit *R* | `min(\|entry × Var95\|, avg_level_gap/2 + ADR/2)` |
+| Stop | close ≤ `entry − R` |
+| Take profit | once above `entry + R`, exit when close < EMA10 − ADR |
+| Time / trend | between ±R, exit after 3 weeks or on close < EMA10 − ADR |
+| Slots | 6 concurrent, `1/6` each, idle slots in BOXX |
+| Refill | **none mid-week** — a freed slot waits for the next weekend |
+
+#### ⚠️ The notebook's breakout backtest has look-ahead in it
+
+Four defects, found while porting. Three of them let the future leak into a trade, and
+the first is severe enough that the notebook's breakout results should not be treated
+as achievable.
+
+1. **Resistance levels are drawn from the whole history.** `estimate_sr_levels` runs
+   `find_peaks` over the entire daily frame *once*, and `generate_trades` then replays
+   that same history against those levels. A resistance level is by construction a
+   price the stock turned at — so trades are placed at levels defined by turns that
+   had not happened yet. Measured on a 2.5-year sample:
+
+   | A trade placed... | levels drawn from pivots still in the future |
+   |---|---|
+   | a quarter of the way in | **76%** |
+   | halfway in | 49% |
+   | three quarters in | 20% |
+
+   The notebook then says *"we can manually adjust the levels for increasing the
+   performance"*, which is curve-fitting on top of the leak.
+
+2. **Var95 is taken over the whole return history**, then used to size `R` on every
+   trade — including trades that predate the returns it was computed from.
+
+3. **Daily indicators are forward-filled without a lag.** The hourly frame is resampled
+   to daily and reindexed with `ffill`. Daily rows are stamped at midnight, so *every*
+   hourly bar of day D receives the EMA, ATR and ADR computed from day D's **close** —
+   the 10:00 bar included. Both the regime gate and the EMA exit see the day's outcome
+   all day.
+
+4. **A position could exit before it entered.** The cross is detected at bar `i`, the
+   confirmation is read from bar `i+2`, and the trade is written into `active_by_level`
+   while the loop is still at `i`. The exit block then runs at bars `i+1` and `i+2` and
+   can close the position on a bar preceding its own `entry_time`.
+
+All four are fixed. The three look-ahead fixes are **switches**, not silent
+corrections, so you can price each one rather than take my word for it:
+
+```python
+BreakoutParams(causal_levels=False, causal_risk=False, lag_daily_indicators=False)
+```
+
+reproduces the notebook; the defaults are causal. With `causal_levels=True` the levels
+are redrawn at each weekend from data up to that weekend only — which is also just
+what a trader does, so the fix costs nothing in realism.
+
+Two parameters in the notebook are inert and are not reproduced: `rr_takeprofit` (a 2R
+target that `generate_trades` computes and never reads) and `require_retest`. Where its
+prose and its code disagree — the prose says "10-day **sma**", the code uses the fast
+**EMA** minus one ADR — the code is implemented, because the code is what produced its
+numbers.
+
+#### You need hourly data, and it expires
+
+`yfinance` serves **at most ~730 days of hourly history**, and it is not back-fillable:
+whatever you have not cached before it ages out is gone. `load_hourly()` caches
+additively, one CSV per name, for that reason. This is also why there are no headline
+numbers in this section — the repo's cached data is daily closes only, so the strategy
+has been **validated on synthetic hourly bars, not on real ones**:
+
+```python
+from qbs.breakout import load_hourly, finviz_watchlists, weekly_breakout_book
+from qbs.metrics import summarise
+
+wl = finviz_watchlists(universe_prices, prices["BOXX"], n_watch=20)
+hourly = load_hourly(sorted({t for names in wl.values() for t in names}),
+                     start="2024-09-15")
+book = weekly_breakout_book(hourly, wl, prices["BOXX"])
+print(summarise(book.result), book.hit_rate)
+print(book.trades.head())            # every fill, with its level, R and exit reason
+```
+
+`book.trades` is the thing to read first. A 6-slot book takes few enough trades that
+you can audit them one by one, and a breakout strategy's behaviour lives in the exit
+mix — a book that is mostly `stop_R` is telling you the levels are not holding.
+
+**What the no-refill rule costs.** A slot freed on Tuesday sits in cash until Friday
+however many watchlist names break out on Wednesday, so average exposure runs well
+below 100% and the book is structurally part-invested. That is the scenario as
+specified, and `WeeklyBookParams(refill_within_week=True)` measures what the constraint
+is worth.
+
+---
+
 ---
 
 > ⚠️ **Read the default 17/16 as a warning, not a recommendation.** VIX's long-run
@@ -357,6 +478,8 @@ qbs/
   strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
   screens.py      filter-based screens: the trend template and the Finviz screen,
                   both rolled forward from a notebook so they can be backtested
+  breakout.py     hourly resistance-breakout trading + the weekly six-slot book;
+                  its own fill-level accounting, because weights cannot express a stop
   engine.py       one backtest function: lag, commission, slippage, equity curve
   metrics.py      CAGR, Sharpe/Sortino vs BOXX, drawdown, turnover, trade log
   plotting.py     the chart system
@@ -364,7 +487,7 @@ qbs/
                   sweep_vix(), sweep_target_vol()
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
-tests/test_qbs.py 78 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 89 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -484,6 +607,10 @@ makes a missed session self-healing; never replay one by hand.
   rises, but it manages sustained volatility rather than gaps, and it does not
   diversify. As of the last cached run all six holdings were semiconductors, and
   nothing in the ranker prevents that.
+- **The breakout book has never been run on real bars.** Its logic is tested — slot
+  cap, no look-ahead, stop placement, the no-refill rule — but on *synthetic* hourly
+  data, because this repo caches daily closes only. Treat its machinery as reviewed and
+  its numbers as not yet existing.
 - **The Finviz comparison is a rule comparison, not a strategy verdict.** Both books
   rank the same 99 Nasdaq-100 names, which is what makes the difference attributable to
   the selection rule. The notebook's real screen runs on the whole US market, and any

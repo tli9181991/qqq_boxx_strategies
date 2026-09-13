@@ -995,3 +995,193 @@ if __name__ == "__main__":
                 print(f"  FAIL  {name}: {type(exc).__name__}: {exc}")
     print(f"\n{'FAILURES: ' + str(failures) if failures else 'all tests passed'}")
     sys.exit(1 if failures else 0)
+
+
+# --------------------------------------------------------------------------
+# The hourly breakout book (qbs/breakout.py)
+# --------------------------------------------------------------------------
+
+def _breakout_inputs(n=12, seed=5):
+    from qbs.breakout import synthetic_hourly, hourly_to_daily
+
+    tickers = [f"SY{i:03d}" for i in range(n)]
+    hourly = synthetic_hourly(tickers, seed=seed)
+    closes = pd.DataFrame({t: hourly_to_daily(hourly[t])["Close"] for t in tickers})
+    closes.index = pd.to_datetime(closes.index).normalize()
+    fris = closes.index.to_series().resample("W-FRI").last().dropna()
+    mom = closes / closes.shift(21) - 1.0
+    watchlists = {
+        pd.Timestamp(d): list(mom.loc[d].dropna().sort_values(ascending=False).index[:8])
+        for d in fris if d in mom.index and mom.loc[d].notna().any()
+    }
+    safe = synthetic_prices(start="2024-06-01")["BOXX"]
+    return hourly, watchlists, safe
+
+
+def test_breakout_never_exceeds_its_slot_count():
+    """The whole point of the scenario is a hard cap on concurrent names."""
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(),
+                              WeeklyBookParams(n_slots=4))
+    assert bk.diagnostics["slots_in_use"].max() <= 4
+    risk = bk.result.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risk <= 1.0 + 1e-9).all(), "a slot book must never lever"
+    assert np.allclose(bk.result.weights.sum(axis=1), 1.0)
+
+
+def test_breakout_only_trades_names_on_that_weeks_watchlist():
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(), WeeklyBookParams())
+    sel = sorted(wl)
+    for _, row in bk.trades.iterrows():
+        prior = [d for d in sel if d <= row["entry_time"]]
+        assert prior, "a trade fired before any watchlist existed"
+        assert row["ticker"] in wl[prior[-1]], \
+            f"{row['ticker']} was not on the watchlist for {prior[-1]:%Y-%m-%d}"
+
+
+def test_breakout_freed_slot_waits_for_the_weekend():
+    """`refill_within_week=False` is the rule the user specified: a stop-out
+    parks in cash rather than handing the slot to the next name down."""
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    wait = weekly_breakout_book(hourly, wl, safe, BreakoutParams(),
+                                WeeklyBookParams(refill_within_week=False))
+    refill = weekly_breakout_book(hourly, wl, safe, BreakoutParams(),
+                                  WeeklyBookParams(refill_within_week=True))
+    assert len(wait.trades) < len(refill.trades), \
+        "waiting for the weekend must take strictly fewer trades"
+    assert wait.diagnostics["exposure"].mean() <= refill.diagnostics["exposure"].mean()
+
+
+def test_breakout_stop_exits_are_at_or_below_the_stop():
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(), WeeklyBookParams())
+    stopped = bk.trades[bk.trades["reason"] == "stop_R"]
+    assert not stopped.empty, "the fixture never stopped out -- test proves nothing"
+    assert (stopped["exit_price"] <= stopped["entry_price"] - stopped["R"] + 1e-9).all()
+
+
+def test_breakout_entries_are_above_their_level():
+    """An entry is a confirmed break: the fill must be above the level broken."""
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(), WeeklyBookParams())
+    assert not bk.trades.empty
+    assert (bk.trades["entry_price"] > bk.trades["level"]).all()
+    assert (bk.trades["R"] > 0).all()
+
+
+def test_breakout_has_no_look_ahead():
+    """Rewriting the future must not change a single trade decided before it.
+
+    This is the test the notebook could not pass: its levels come from
+    `find_peaks` over the whole history, so tampering with later bars moves
+    trades that already happened.
+    """
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    cut = sorted(wl)[len(wl) // 2]
+
+    rng = np.random.default_rng(7)
+    tampered = {}
+    for t, bars in hourly.items():
+        b = bars.copy()
+        after = b.index > cut
+        b.loc[after, ["Open", "High", "Low", "Close"]] *= rng.uniform(
+            0.5, 1.5, (int(after.sum()), 4))
+        tampered[t] = b
+
+    p, bp = BreakoutParams(), WeeklyBookParams()
+    a = weekly_breakout_book(hourly, wl, safe, p, bp).trades
+    b = weekly_breakout_book(tampered, wl, safe, p, bp).trades
+    a = a[a["entry_time"] <= cut].reset_index(drop=True)
+    b = b[b["entry_time"] <= cut].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a[["ticker", "entry_time", "entry_price", "level"]],
+                                  b[["ticker", "entry_time", "entry_price", "level"]])
+
+
+def test_breakout_notebook_mode_does_have_look_ahead():
+    """The switches are only worth having if they actually change something --
+    with them off, the future must leak in, which is the bug being fixed."""
+    from qbs.breakout import sr_levels, hourly_to_daily, synthetic_hourly
+    from qbs.config import BreakoutParams
+
+    bars = synthetic_hourly(["SY000"], seed=5)["SY000"]
+    daily = hourly_to_daily(bars)
+    cut = daily.index[len(daily) // 2]
+    p = BreakoutParams()
+
+    full = sr_levels(daily, p)
+    causal = sr_levels(daily.loc[:cut], p)
+    assert full != causal, \
+        "levels from the whole history must differ from levels known at the time"
+
+
+def test_breakout_causal_levels_use_only_past_bars():
+    from qbs.breakout import sr_levels, hourly_to_daily, synthetic_hourly
+    from qbs.config import BreakoutParams
+
+    bars = synthetic_hourly(["SY000"], seed=5)["SY000"]
+    daily = hourly_to_daily(bars)
+    cut = daily.index[len(daily) // 2]
+    p = BreakoutParams()
+
+    a = sr_levels(daily.loc[:cut], p)
+    tampered = daily.copy()
+    cols = ["Open", "High", "Low", "Close"]
+    tampered.loc[tampered.index > cut, cols] *= 1.7
+    b = sr_levels(tampered.loc[:cut], p)
+    assert a == b, "a level known at `cut` cannot move when later bars change"
+
+
+def test_breakout_daily_indicators_are_lagged():
+    """Un-lagged, the 10:00 bar of day D already knows day D's close."""
+    from qbs.breakout import daily_indicators, hourly_to_daily, synthetic_hourly
+    from qbs.config import BreakoutParams
+
+    daily = hourly_to_daily(synthetic_hourly(["SY000"], seed=5)["SY000"])
+    lagged = daily_indicators(daily, BreakoutParams(lag_daily_indicators=True))
+    raw = daily_indicators(daily, BreakoutParams(lag_daily_indicators=False))
+    pd.testing.assert_series_equal(lagged["EMA_F"].iloc[1:], raw["EMA_F"].shift(1).iloc[1:])
+
+
+def test_breakout_position_cannot_exit_before_it_enters():
+    """The notebook's ordering bug: a trade registered at the cross bar could
+    be closed by the exit block on a bar preceding its own entry."""
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(), WeeklyBookParams())
+    closed = bk.trades[bk.trades["exit_time"].notna()]
+    assert not closed.empty
+    assert (closed["exit_time"] >= closed["entry_time"]).all()
+
+
+def test_breakout_result_summarises_like_any_other_strategy():
+    from qbs.breakout import weekly_breakout_book
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    bk = weekly_breakout_book(hourly, wl, safe, BreakoutParams(), WeeklyBookParams())
+    s = summarise(bk.result)
+    assert np.isfinite(s["CAGR"]) and -1.0 <= s["Max drawdown"] <= 0.0
+    assert s["Ann. turnover"] > 0, "a book that trades must report turnover"
+    assert bk.result.equity.index[0] >= min(wl), \
+        "the book must not be priced before its first watchlist"

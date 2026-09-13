@@ -31,3 +31,6 @@ var/
 
 # Docker deployment secrets (IB login, VNC password)
 deploy/docker/.env
+
+# Hourly OHLCV cache (one CSV per name, large)
+data/hourly/

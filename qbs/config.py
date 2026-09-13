@@ -259,6 +259,91 @@ class BookVolTargetParams:
 
 
 @dataclass
+class BreakoutParams:
+    """Hourly resistance-breakout trading, from M6_finalnotebook.ipynb.
+
+    The notebook's rules, as written there:
+
+        Entry   an hourly close crosses above the nearest resistance level,
+                and price is STILL above that level `confirm_hours` later
+        Exit    below entry - R                              -> stop
+                between entry +/- R, held 3 weeks or closing
+                  below the fast EMA minus one ADR           -> time/trend exit
+                above entry + R, closing below EMA - ADR     -> take profit
+
+    Three departures from the notebook's code, all removing look-ahead. Each
+    is switchable so you can measure what it was worth:
+
+    * `causal_levels` -- the notebook runs `find_peaks` over the WHOLE daily
+      history once, then replays trades across that same history, so a trade
+      is placed at a level defined by pivots that had not happened yet. On a
+      2.5-year sample a trade a quarter of the way in draws three quarters of
+      its levels from its own future. Set False to reproduce the notebook.
+    * `causal_risk` -- likewise for Var95, which the notebook takes over the
+      full return history and then uses to size R on every trade.
+    * `lag_daily_indicators` -- the notebook resamples hourly to daily and
+      forward-fills onto the hourly index, so the 09:30 bar of day D already
+      carries the EMA, ATR and ADR computed from day D's CLOSE. Shifting one
+      day makes the regime gate and the EMA exit use only completed days.
+
+    Two things in the notebook are inert and are not reproduced: `rr_takeprofit`
+    (a 2R target that `generate_trades` computes and never reads) and
+    `require_retest`. The markdown also says "10-day sma" where the code uses
+    the fast EMA minus one ADR; the code is what is implemented here.
+    """
+    # ---- level extraction (on daily bars) -------------------------------
+    swing_lookback: int = 1           # find_peaks `distance`
+    prominence_frac: float = 0.015    # prominence as a fraction of last close
+    atr_window: int = 14
+    atr_merge_mult: float = 1.0       # first merge pass, within 1 ATR
+    second_merge_mult: float = 1.3    # the notebook's repeated merge, 1.3 ATR
+    max_levels: int = 20
+
+    # ---- entry ----------------------------------------------------------
+    confirm_hours: int = 2            # bars after the cross that must hold
+    ema_fast_days: int = 10
+    ema_slow_days: int = 20
+    adr_window: int = 14
+
+    # ---- risk unit R ----------------------------------------------------
+    var_confidence: float = 0.95      # Var95 of daily returns caps R
+    hold_weeks: float = 3.0           # the time stop on a trade going nowhere
+
+    # ---- honesty switches -----------------------------------------------
+    causal_levels: bool = True
+    causal_risk: bool = True
+    lag_daily_indicators: bool = True
+
+
+@dataclass
+class WeeklyBookParams:
+    """The portfolio wrapper: a weekend watchlist traded by breakout, 6 slots.
+
+    Selection happens once a week on the last session of the week. The names
+    that pass go onto a ranked watchlist; during the following week a slot is
+    taken when one of them triggers a confirmed breakout.
+
+    `refill_within_week = False` is the rule as described: a slot freed by a
+    stop-out or a failed breakout holds cash until the next weekend rather
+    than being handed to the next name down. That is a real constraint, not a
+    detail -- it caps how often the book can be wrong in a week, and it is why
+    average exposure sits well below 100%.
+    """
+    n_slots: int = 6
+    watchlist_size: int = 20          # ranked names carried into the week
+    refill_within_week: bool = False  # a freed slot waits for the weekend
+    selection_day: str = "W-FRI"      # when the watchlist is rebuilt
+    safe_asset: str = SAFE_ASSET      # where an unused slot sits
+    equal_weight_slots: bool = True   # 1/n_slots per slot, matching the others
+
+    def __post_init__(self):
+        if self.n_slots < 1:
+            raise ValueError("n_slots must be >= 1")
+        if self.watchlist_size < self.n_slots:
+            raise ValueError("watchlist_size must be >= n_slots")
+
+
+@dataclass
 class Config:
     tickers: List[str] = field(default_factory=lambda: list(TICKERS))
     backtest_start: str = BACKTEST_START
@@ -272,6 +357,8 @@ class Config:
     vol: VolTargetParams = field(default_factory=VolTargetParams)
     momentum: MomentumParams = field(default_factory=MomentumParams)
     finviz: FinvizScreenParams = field(default_factory=FinvizScreenParams)
+    breakout: BreakoutParams = field(default_factory=BreakoutParams)
+    weekly_book: WeeklyBookParams = field(default_factory=WeeklyBookParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
 
@@ -296,6 +383,7 @@ PALETTE = {
     # Slot 7 sits OUTSIDE the validated six-hue set above: the categorical
     # hues are used up, so this one separates by lightness instead.
     "finviz":    "#3d4f5c",   # slot 7 -- dark slate
+    "breakout":  "#a8572c",   # slot 8 -- burnt umber, also outside the set
     "bh_qqq":    "#898781",   # benchmark -- muted
     "bh_boxx":   "#c3c2b7",   # benchmark -- fainter still
     "buy":       "#0ca30c",   # status: good
@@ -318,6 +406,7 @@ STRATEGY_LABELS = {
     "momentum_vix": "Top-6 + VIX breaker",
     "momentum_vt": "Top-6 vol-targeted",
     "finviz": "Top-6 Finviz screen",
+    "breakout": "Weekly breakout, 6 slots",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",
 }
