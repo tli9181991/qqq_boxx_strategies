@@ -123,6 +123,72 @@ class MomentumParams:
 
 
 @dataclass
+class FinvizScreenParams:
+    """The Finviz screener strategy, rolled forward so it can be backtested.
+
+    This reproduces `finviz_filter_with_daily_summary.ipynb`: a Finviz filter
+    pass, then a relative-strength ranking of whatever survived, then take the
+    strongest N. Every Finviz criterion in that notebook is derived from price
+    and volume, which is why it can be recomputed on every historical date
+    instead of only on the day you ran the screener.
+
+    Where a default here differs from the notebook, the docstring says so.
+    The two that matter:
+
+    * `rs_lookback` is a FIXED 252 bars. The notebook downloads `period="1y"`
+      and takes `(last - first) / first`, so a name with 210 bars of history
+      contributes a 210-day return to a column compared against other names'
+      252-day returns. Ranking two different horizons against each other is
+      not a like-for-like comparison, so the lookback is pinned.
+    * `min_quarter_return` is None -- off. The notebook applies its 20%
+      quarterly gate only to the sector-breakdown table, NOT to the watchlist
+      it finally ranks. Set it to 0.20 to fold that gate into selection.
+
+    Two Finviz criteria cannot be reproduced from prices alone:
+
+    * Market cap over $300m needs fundamentals. On a Nasdaq-100 ranking
+      universe it is non-binding -- the smallest constituent is orders of
+      magnitude above the threshold.
+    * Average volume over 200k needs share volume. Pass `volumes=` to
+      `finviz_momentum_screen` to enable it; without it the criterion is
+      skipped and `volume_filter_applied` on the result is False. Skipping it
+      is strictly MORE permissive, so it flatters this strategy rather than
+      the other way round.
+    """
+    # ---- Finviz stage-1 filters -----------------------------------------
+    min_price: float = 10.0             # "Price: Over $10"
+    quarter_lookback: int = 63          # ~one quarter, for "Performance: Quarter Up"
+    require_quarter_up: bool = True     # "Performance: Quarter Up"
+    above_sma: int = 200                # "200-Day SMA: Price above SMA200"
+    within_52w_high_pct: float = 0.10   # "52-Week High/Low: 0-10% below High"
+    high_window: int = 252
+    min_avg_volume: float = 200_000.0   # "Average Volume: Over 200K" -- needs volumes=
+    avg_volume_window: int = 50         # the notebook's Avg_Vol_50D
+
+    # ---- the notebook's stage-2 gate, off by default --------------------
+    min_quarter_return: float | None = None   # 0.20 reproduces its 動力股 rule
+    min_turnover: float | None = None         # 5e6, same rule -- needs volumes=
+
+    # ---- stage-3 ranking ------------------------------------------------
+    rs_lookback: int = 252              # the notebook's Perf_1Y
+    rs_buckets: int = 100               # its qcut(..., q=min(100, n)) RS Rank
+    min_history: int = 252              # bars before a name is rankable
+
+    # ---- turning a watchlist into a book --------------------------------
+    n_hold: int = 6                     # 0 -> hold every name that passes
+    exit_rank: int = 0                  # 0 = no band, which is the notebook's rule
+    rebalance: str = "daily"            # "daily" | "ME" | "W-FRI"
+    safe_asset: str = SAFE_ASSET
+    equal_weight_slots: bool = True     # size per slot, matching the momentum book
+
+    def __post_init__(self):
+        if self.n_hold < 0:
+            raise ValueError("n_hold must be >= 0 (0 means hold every passing name)")
+        if self.exit_rank and self.n_hold and self.exit_rank < self.n_hold:
+            raise ValueError("exit_rank must be 0 (no band) or >= n_hold")
+
+
+@dataclass
 class VixBreakerParams:
     """A VIX circuit breaker laid over any base strategy.
 
@@ -205,6 +271,7 @@ class Config:
     gem: GEMParams = field(default_factory=GEMParams)
     vol: VolTargetParams = field(default_factory=VolTargetParams)
     momentum: MomentumParams = field(default_factory=MomentumParams)
+    finviz: FinvizScreenParams = field(default_factory=FinvizScreenParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
 
@@ -226,6 +293,9 @@ PALETTE = {
     "momentum":  "#eda100",   # slot 4 -- yellow (low contrast: always direct-labelled)
     "momentum_vix": "#e87ba4",  # slot 5 -- magenta
     "momentum_vt": "#8a63d2",   # slot 6 -- violet
+    # Slot 7 sits OUTSIDE the validated six-hue set above: the categorical
+    # hues are used up, so this one separates by lightness instead.
+    "finviz":    "#3d4f5c",   # slot 7 -- dark slate
     "bh_qqq":    "#898781",   # benchmark -- muted
     "bh_boxx":   "#c3c2b7",   # benchmark -- fainter still
     "buy":       "#0ca30c",   # status: good
@@ -247,6 +317,7 @@ STRATEGY_LABELS = {
     "momentum": "Top-6 NDX momentum",
     "momentum_vix": "Top-6 + VIX breaker",
     "momentum_vt": "Top-6 vol-targeted",
+    "finviz": "Top-6 Finviz screen",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",
 }

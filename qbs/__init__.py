@@ -11,15 +11,15 @@ Quick start::
 """
 
 from .config import (
-    BookVolTargetParams, Config, GEMParams, MomentumParams, RSI2Params,
-    VixBreakerParams, VolTargetParams,
+    BookVolTargetParams, Config, FinvizScreenParams, GEMParams, MomentumParams,
+    RSI2Params, VixBreakerParams, VolTargetParams,
     RISK_ASSET, INTL_ASSET, SAFE_ASSET, TICKERS,
     BACKTEST_START, BACKTEST_END, PALETTE, STRATEGY_LABELS,
 )
 
 __all__ = [
-    "BookVolTargetParams", "Config", "GEMParams", "MomentumParams",
-    "RSI2Params", "VixBreakerParams", "VolTargetParams",
+    "BookVolTargetParams", "Config", "FinvizScreenParams", "GEMParams",
+    "MomentumParams", "RSI2Params", "VixBreakerParams", "VolTargetParams",
     "RISK_ASSET", "INTL_ASSET", "SAFE_ASSET", "TICKERS",
     "BACKTEST_START", "BACKTEST_END", "PALETTE", "STRATEGY_LABELS",
 ]

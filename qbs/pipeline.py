@@ -14,6 +14,7 @@ from .config import (
 from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
 from .engine import BacktestResult, run_backtest
 from .metrics import format_summary, summary_table
+from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
     cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
@@ -65,6 +66,7 @@ def run(
     with_momentum: bool = True,
     with_vix: bool = True,
     with_book_vt: bool = True,
+    with_finviz: bool = True,
     vix: Optional[pd.Series] = None,
     fetch_universe: bool = True,
     pit_membership: Optional[pd.DataFrame] = None,
@@ -74,6 +76,8 @@ def run(
     `with_momentum=False` skips the Nasdaq-100 download, which is much the
     slowest part -- useful while iterating on the other three strategies.
     `with_book_vt=False` drops the vol-targeted variant of the momentum book.
+    `with_finviz=False` drops the Finviz screen, which shares the same universe
+    download and so is free once the momentum book has been built.
     `pit_membership` takes a point-in-time membership frame (see
     `universe.load_pit_universe`) to remove survivorship bias from the ranking.
     """
@@ -145,10 +149,22 @@ def run(
                 mom_sig, combined, cfg.book_vol, lag=cfg.execution_lag,
                 name="momentum_vt")
 
+        # ---- the Finviz screen, ranking the SAME universe ----------------
+        # Same names, same slots, same engine, same costs, so the only thing
+        # the comparison against `momentum` can be measuring is the selection
+        # rule. Running it against the notebook's own ~530-name Finviz output
+        # instead would change the universe and the rule at once, and the
+        # universe would be today's screener result applied to history --
+        # i.e. names chosen for having gone up. See the README.
+        if with_finviz:
+            signals["finviz"] = finviz_momentum_screen(
+                uni, prices[SAFE_ASSET], cfg.finviz)
+
     # ---- backtest everything on identical assumptions -------------------
     results: Dict[str, BacktestResult] = {}
     for key, sig in signals.items():
-        book = (combined if key in ("momentum", "momentum_vix", "momentum_vt")
+        book = (combined
+                if key in ("momentum", "momentum_vix", "momentum_vt", "finviz")
                 else prices)
         results[key] = run_backtest(
             book, sig, start=cfg.backtest_start, end=cfg.backtest_end,

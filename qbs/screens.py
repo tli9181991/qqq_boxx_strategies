@@ -10,6 +10,11 @@ edges that it is worth keeping them apart.
 from M6_finalnotebook.ipynb, rolled forward so it can be backtested rather than
 evaluated once on the last bar.
 
+`finviz_momentum_screen` does the same for finviz_filter_with_daily_summary.ipynb
+-- a Finviz filter pass, then a relative-strength ranking of the survivors. Both
+notebooks answer "what would I buy today"; rolling them forward is what turns
+that answer into something you can hold against the Top-6 momentum book.
+
 What was in the notebook and what is here
 -----------------------------------------
 The notebook screens the S&P 500 against ^GSPC on a single date. This version
@@ -47,7 +52,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .config import SAFE_ASSET, TRADING_DAYS
+from .config import FinvizScreenParams, SAFE_ASSET, TRADING_DAYS
 from .strategies import StrategySignals, _empty_events
 
 
@@ -252,3 +257,242 @@ def trend_template_screen(
     sig.momentum = annret
     sig.params["sector_filter_applied"] = sector_filter_applied
     return sig
+
+
+# ==========================================================================
+# The Finviz screener, rolled forward
+# ==========================================================================
+# finviz_filter_with_daily_summary.ipynb runs three stages:
+#
+#   1. a Finviz filter pass  -- market cap, "Quarter Up", price > $10, above
+#      SMA200, within 10% of the 52-week high, average volume > 200k
+#   2. a sector-concentration table over the names that also clear $5 close,
+#      $5m turnover and +20% on the quarter
+#   3. an RS ranking of the STAGE-1 survivors (note: not the stage-2 subset --
+#      the notebook ranks `candidate_tickers`), sorted by RS Rank descending
+#      and then by distance below the 52-week high ascending
+#
+# Stage 3 is the selection rule, so that is what is reproduced here. Stage 2
+# is available through `min_quarter_return` / `min_turnover` but is off by
+# default, because in the notebook it feeds the breakdown table and nothing
+# else. Stage 1 is a set of absolute tests, which is what makes this a screen
+# rather than a ranking: on a bad day nothing passes and the book is in cash.
+
+
+def finviz_momentum_screen(
+    universe_prices: pd.DataFrame,
+    safe_prices: pd.Series,
+    params: Optional[FinvizScreenParams] = None,
+    volumes: Optional[pd.DataFrame] = None,
+    name: str = "finviz",
+) -> StrategySignals:
+    """Roll the Finviz screen forward and hold its top `n_hold` names.
+
+    Parameters
+    ----------
+    universe_prices : date x ticker adjusted closes for the ranking universe.
+    safe_prices     : the cash leg. Unfilled slots, and every date on which
+                      too few names pass, sit here.
+    volumes         : optional date x ticker share volume. Supplying it enables
+                      the "Average Volume over 200K" criterion (and
+                      `min_turnover`, if set); without it both are skipped and
+                      `volume_filter_applied` on the result is False.
+
+    The ranking
+    -----------
+    The notebook's `rank_momentum_stocks`: bucket the survivors' 1-year returns
+    into `rs_buckets` percentile buckets to get an RS Rank of 1-99, sort by that
+    descending, and break ties on the smallest distance below the 52-week high.
+
+    Bucketing a rank is a monotone transform, so on a universe no larger than
+    `rs_buckets` every name lands in its own bucket and the rule collapses to
+    "sort by 1-year return". That is exactly what happens on a Nasdaq-100
+    universe -- the tie-break never fires there. It is reproduced faithfully
+    anyway, because on the notebook's own ~530-name screen it does fire.
+
+    The 52-week high
+    ----------------
+    The notebook takes `df['High'].max()` -- an intraday high. This uses a
+    rolling max of closes, because a wide universe cached as closes is what the
+    rest of the package carries. A close-based high is never higher than the
+    intraday one, so "within 10% of the high" admits slightly MORE names here.
+    """
+    p = params or FinvizScreenParams()
+    px = universe_prices.sort_index()
+    safe = safe_prices.reindex(px.index).ffill()
+
+    # ---- stage 1: the Finviz filters --------------------------------------
+    sma = px.rolling(p.above_sma, min_periods=p.above_sma).mean()
+    above_sma = px > sma
+
+    high_52w = px.rolling(p.high_window, min_periods=p.high_window).max()
+    pct_off_high = 1.0 - px / high_52w
+    within_high = pct_off_high <= p.within_52w_high_pct
+
+    priced = px >= p.min_price
+
+    quarter_ret = px / px.shift(p.quarter_lookback) - 1.0
+    quarter_up = quarter_ret > 0 if p.require_quarter_up else px.notna()
+
+    # A name needs enough history before any of this means anything.
+    history = px.notna().cumsum()
+    has_history = history >= p.min_history
+
+    passes = above_sma & within_high & priced & quarter_up & has_history
+
+    # ---- the volume criteria, only if the caller supplied the data --------
+    volume_filter_applied = volumes is not None
+    if volume_filter_applied:
+        vol = volumes.reindex(index=px.index, columns=px.columns).ffill()
+        avg_vol = vol.rolling(p.avg_volume_window,
+                              min_periods=p.avg_volume_window).mean()
+        passes &= avg_vol > p.min_avg_volume
+        if p.min_turnover is not None:
+            passes &= (px * vol) >= p.min_turnover
+    elif p.min_turnover is not None:
+        raise ValueError("min_turnover needs `volumes`; pass it or leave the "
+                         "parameter at None")
+
+    # ---- the notebook's stage-2 gate, if it was switched on ---------------
+    if p.min_quarter_return is not None:
+        passes &= quarter_ret >= p.min_quarter_return
+
+    # ---- stage 3: the RS measure ------------------------------------------
+    # Perf_1Y, on a fixed lookback. See FinvizScreenParams on why it is fixed.
+    perf = px / px.shift(p.rs_lookback) - 1.0
+    passes &= perf.notna()
+
+    # ---- rebalance calendar -----------------------------------------------
+    if p.rebalance == "daily":
+        rebal_set = set(px.index)
+    else:
+        marks = px.index.to_series().resample(p.rebalance).last().dropna()
+        rebal_set = {d for d in marks if d in px.index}
+
+    assets = list(px.columns) + [p.safe_asset]
+    weights = pd.DataFrame(0.0, index=px.index, columns=assets)
+
+    held: List[str] = []
+    events: List[Dict] = []
+    holdings_log: Dict[pd.Timestamp, List[str]] = {}
+    held_ranks: Dict[pd.Timestamp, Dict[str, float]] = {}
+    n_passing: Dict[pd.Timestamp, float] = {}
+    last_n_passing = np.nan
+
+    for dt in px.index:
+        if dt in rebal_set:
+            ok = passes.loc[dt].fillna(False)
+            cand = perf.loc[dt][ok].dropna()
+            n_passing[dt] = last_n_passing = float(len(cand))
+
+            order, rs_rank = _rs_rank_order(cand, pct_off_high.loc[dt], p.rs_buckets)
+            rank = pd.Series(np.arange(1, len(order) + 1), index=order.index)
+
+            if p.exit_rank:
+                # A name that stops passing is simply absent from `rank`, so
+                # `inf` drops it -- the band only ever protects a name that is
+                # still passing but has slipped down the ordering.
+                keep = [t for t in held if rank.get(t, np.inf) <= p.exit_rank]
+                for t in order.index:
+                    if p.n_hold and len(keep) >= p.n_hold:
+                        break
+                    if t not in keep:
+                        keep.append(t)
+                target = keep
+            else:
+                # The notebook's rule: re-screen from scratch, no memory.
+                target = list(order.index) if p.n_hold == 0 else list(order.index[:p.n_hold])
+
+            for t in held:
+                if t not in target:
+                    r = rank.get(t, float("nan"))
+                    if not bool(ok.get(t, False)):
+                        why = "fails the screen"
+                    elif p.exit_rank:
+                        why = f"RS rank {r:.0f} > {p.exit_rank}"
+                    else:
+                        why = f"RS rank {r:.0f} outside top {p.n_hold}"
+                    events.append(dict(
+                        date=dt, action="sell", asset=t,
+                        price=float(px.at[dt, t]) if t in px.columns else np.nan,
+                        reason=why,
+                        rank=float(rank.get(t, np.nan)),
+                        score=float(perf.loc[dt].get(t, np.nan)),
+                    ))
+            for t in target:
+                if t not in held:
+                    events.append(dict(
+                        date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
+                        reason=(f"rank {rank[t]:.0f}, RS {rs_rank[t]:.0f}, "
+                                f"1y {cand[t]:+.1%}, {pct_off_high.at[dt, t]:.1%} off high"),
+                        rank=float(rank[t]), score=float(cand[t]),
+                    ))
+            held = target
+            held_ranks[dt] = {t: float(rank.get(t, np.nan)) for t in held}
+        else:
+            # Carried forward, not recomputed: on a non-rebalance day the screen
+            # was not evaluated, so the last count is the only honest answer.
+            # Recording `len(held)` here would put the book's size in a column
+            # named for the candidate pool's.
+            n_passing[dt] = last_n_passing
+
+        holdings_log[dt] = list(held)
+
+        if held:
+            # Per-slot weighting, matching the momentum book, so the comparison
+            # is about selection rather than about sizing.
+            slots = p.n_hold if (p.n_hold and p.equal_weight_slots) else len(held)
+            weights.loc[dt, held] = 1.0 / slots
+        risk_total = float(weights.loc[dt, px.columns].sum())
+        weights.at[dt, p.safe_asset] = max(0.0, 1.0 - risk_total)
+
+    diagnostics = pd.DataFrame({
+        "n_passing": pd.Series(n_passing),
+        "n_held": pd.Series({d: len(v) for d, v in holdings_log.items()}),
+        "cash_slots": pd.Series({d: max(0, p.n_hold - len(v))
+                                 for d, v in holdings_log.items()}),
+        "n_above_sma": above_sma.sum(axis=1),
+        "n_within_high": within_high.sum(axis=1),
+        "n_quarter_up": quarter_up.sum(axis=1),
+    })
+
+    ev = pd.DataFrame(events) if events else _empty_events()
+    sig = StrategySignals(name, weights, diagnostics, ev, params=p.__dict__.copy())
+    sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
+    sig.holdings_log = holdings_log
+    sig.held_ranks = held_ranks
+    sig.momentum = perf
+    sig.params["volume_filter_applied"] = volume_filter_applied
+    sig.params["market_cap_filter_applied"] = False
+    return sig
+
+
+def _rs_rank_order(candidates: pd.Series, pct_off_high: pd.Series, buckets: int):
+    """The notebook's RS Rank ordering: bucket, sort descending, tie-break on high.
+
+    Returns the candidates in selection order plus their 1-99 RS Rank. An empty
+    candidate set returns empty series rather than raising -- on a bad day
+    nothing passes, and that has to mean cash, not an error.
+    """
+    if candidates.empty:
+        return candidates, candidates
+
+    n = len(candidates)
+    q = min(buckets, n)
+    if q < 2:
+        rs = pd.Series(1.0, index=candidates.index)
+    else:
+        # rank(method="first") makes the input strictly increasing, so qcut
+        # splits it into q equal-sized buckets with no duplicate-edge collapse.
+        rs = pd.Series(
+            pd.qcut(candidates.rank(method="first"), q=q, labels=False,
+                    duplicates="drop"),
+            index=candidates.index,
+        ).astype(float) + 1.0
+
+    frame = pd.DataFrame({
+        "rs": rs,
+        "off_high": pct_off_high.reindex(candidates.index).fillna(np.inf),
+    })
+    frame = frame.sort_values(["rs", "off_high"], ascending=[False, True])
+    return candidates.reindex(frame.index), rs.reindex(frame.index)

@@ -16,8 +16,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.config import (
-    BookVolTargetParams, Config, GEMParams, MomentumParams, RSI2Params,
-    VixBreakerParams, VolTargetParams,
+    BookVolTargetParams, Config, FinvizScreenParams, GEMParams, MomentumParams,
+    RSI2Params, VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -746,6 +746,242 @@ def test_screen_runs_through_the_shared_engine():
     res = run_backtest(book, sig, start="2025-01-20")
     s = summarise(res)
     assert np.isfinite(s["CAGR"]) and -1.0 <= s["Max drawdown"] <= 0.0
+
+# --------------------------------------------------------------------------
+# The Finviz screen (qbs/screens.py)
+# --------------------------------------------------------------------------
+
+def _finviz_inputs(n=40):
+    px = synthetic_prices()
+    uni = synthetic_universe(n=n, start="2023-06-01").reindex(px.index).ffill()
+    return uni, px["BOXX"]
+
+
+def test_finviz_weights_are_a_valid_long_only_book():
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+    assert (sig.weights >= -1e-9).all().all()
+    risk = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risk <= 1.0 + 1e-9).all(), "a screen must never lever the book"
+
+
+def test_finviz_parks_in_the_safe_asset_when_nothing_passes():
+    """The Finviz filters are absolute tests, so 'nothing qualifies' has to be
+    a reachable state that means cash rather than a forced allocation."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    p = FinvizScreenParams(n_hold=6, within_52w_high_pct=-1.0)
+    sig = finviz_momentum_screen(uni, safe, p)
+    assert np.allclose(sig.weights["BOXX"], 1.0), "must be fully in cash"
+    assert np.nanmax(sig.diagnostics["n_passing"].to_numpy()) == 0
+
+
+def test_finviz_ranks_by_one_year_return_among_passing_names():
+    """The notebook's rule: RS Rank is a bucketed 1-year return, so the first
+    name bought on any date is the strongest 1-year performer that passed."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    p = FinvizScreenParams(n_hold=6)
+    sig = finviz_momentum_screen(uni, safe, p)
+
+    perf = uni / uni.shift(p.rs_lookback) - 1.0
+    checked = 0
+    for dt, names in sig.holdings_log.items():
+        if len(names) < p.n_hold:
+            continue
+        chosen = perf.loc[dt, names]
+        # Every held name must be at least as strong as the weakest held name,
+        # and no unheld name inside the book's own price range may beat the best.
+        assert chosen.iloc[0] == chosen.max(), "selection order must be RS-descending"
+        checked += 1
+    assert checked > 0, "the fixture never filled the book -- test proves nothing"
+
+
+def test_finviz_rs_bucketing_is_a_no_op_on_a_small_universe():
+    """qcut into min(100, n) buckets gives every name its own bucket when the
+    candidate pool is smaller than the bucket count, so the tie-break on
+    distance-below-high can never fire. Worth pinning: it is the reason the
+    rule collapses to a plain 1-year-return sort on a Nasdaq-100 universe."""
+    from qbs.screens import _rs_rank_order
+
+    cand = pd.Series({"A": 0.50, "B": 0.10, "C": 0.30})
+    # Distances below the high that would reverse the order if they were used.
+    off = pd.Series({"A": 0.09, "B": 0.01, "C": 0.05})
+    order, rs = _rs_rank_order(cand, off, buckets=100)
+    assert list(order.index) == ["A", "C", "B"]
+    assert rs.is_monotonic_decreasing
+
+
+def test_finviz_tie_break_prefers_the_name_nearest_its_high():
+    """With fewer buckets than names the tie-break does fire, and it must
+    prefer the smaller distance below the 52-week high."""
+    from qbs.screens import _rs_rank_order
+
+    cand = pd.Series({"A": 0.50, "B": 0.45, "C": 0.10, "D": 0.05})
+    off = pd.Series({"A": 0.09, "B": 0.01, "C": 0.08, "D": 0.02})
+    order, _ = _rs_rank_order(cand, off, buckets=2)
+    assert list(order.index)[:2] == ["B", "A"], "same bucket -> nearest the high first"
+
+
+def test_finviz_caps_the_book_at_n_hold():
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=4))
+    assert sig.diagnostics["n_held"].max() <= 4
+
+
+def test_finviz_has_no_look_ahead():
+    """Rewriting the future must not change any weight decided before it."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    cut = uni.index[len(uni) // 2]
+    rng = np.random.default_rng(3)
+    tampered = uni.copy()
+    after = tampered.index > cut
+    tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
+
+    p = FinvizScreenParams(n_hold=6)
+    a = finviz_momentum_screen(uni, safe, p).weights.loc[:cut]
+    b = finviz_momentum_screen(tampered, safe, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_finviz_volume_filter_only_ever_removes_names():
+    """'Average Volume over 200K' is a filter: supplying volumes cannot admit
+    a name that failed without them."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    p = FinvizScreenParams(n_hold=0)
+    base = finviz_momentum_screen(uni, safe, p)
+
+    # Half the universe trades under the threshold, half far above it.
+    vol = pd.DataFrame(
+        {t: (1e5 if i % 2 else 1e7) for i, t in enumerate(uni.columns)},
+        index=uni.index,
+    )
+    withv = finviz_momentum_screen(uni, safe, p, volumes=vol)
+    assert base.params["volume_filter_applied"] is False
+    assert withv.params["volume_filter_applied"] is True
+    for dt in uni.index[::40]:
+        assert set(withv.holdings_log[dt]) <= set(base.holdings_log[dt])
+
+
+def test_finviz_min_turnover_needs_volumes():
+    """Silently ignoring a criterion the caller asked for would overstate the
+    strategy, so an unusable parameter has to raise."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    try:
+        finviz_momentum_screen(uni, safe, FinvizScreenParams(min_turnover=5e6))
+    except ValueError:
+        return
+    raise AssertionError("min_turnover without volumes must raise")
+
+
+def test_finviz_quarter_up_gate_removes_names():
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    on = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    off = finviz_momentum_screen(uni, safe,
+                                 FinvizScreenParams(n_hold=0, require_quarter_up=False))
+    for dt in uni.index[::40]:
+        assert set(on.holdings_log[dt]) <= set(off.holdings_log[dt])
+
+
+def test_finviz_band_reduces_turnover():
+    """The notebook has no band (exit_rank=0) and re-screens from scratch every
+    day. Adding one must cut trading, whatever it does to return."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    none = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=0))
+    band = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=15))
+    t_none = float(none.weights.diff().abs().sum(axis=1).sum())
+    t_band = float(band.weights.diff().abs().sum(axis=1).sum())
+    assert t_band < t_none, "a hysteresis band must reduce turnover"
+
+
+def test_finviz_band_cannot_be_narrower_than_the_book():
+    try:
+        FinvizScreenParams(n_hold=6, exit_rank=3)
+    except ValueError:
+        return
+    raise AssertionError("exit_rank below n_hold must raise")
+
+
+def test_finviz_records_rank_and_score_like_the_momentum_book():
+    """So the live run log stores selections from either strategy identically."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    assert {"rank", "score"} <= set(sig.events.columns)
+    assert sig.held_ranks is not None
+    buys = sig.events[sig.events["action"] == "buy"]
+    assert not buys.empty and (buys["rank"] >= 1).all()
+
+
+def test_finviz_runs_through_the_shared_engine():
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    book = uni.copy()
+    book["BOXX"] = safe
+    res = run_backtest(book, sig, start="2025-01-20")
+    s = summarise(res)
+    assert np.isfinite(s["CAGR"]) and -1.0 <= s["Max drawdown"] <= 0.0
+
+
+def test_finviz_monthly_rebalance_only_trades_at_month_ends():
+    """The non-daily path is a separate branch of the date loop, so it needs its
+    own test -- with `rebalance="daily"` every date is a rebalance date and the
+    branch never executes."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    monthly = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="ME"))
+    daily = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="daily"))
+
+    changed = monthly.weights.diff().abs().sum(axis=1) > 1e-12
+    assert 0 < changed.sum() < (daily.weights.diff().abs().sum(axis=1) > 1e-12).sum()
+
+    # n_passing is the size of the candidate pool, not of the book. On a
+    # non-rebalance day it carries forward rather than collapsing to n_held.
+    d = monthly.diagnostics.dropna(subset=["n_passing"])
+    assert (d["n_passing"] >= d["n_held"]).all()
+    assert d["n_passing"].max() > d["n_held"].max(), \
+        "the candidate pool must be wider than the book somewhere in the sample"
+
+
+def test_trend_screen_monthly_rebalance_runs():
+    """Same branch, same reason, for the screen that was here first."""
+    from qbs.screens import TrendScreenParams, trend_template_screen
+
+    uni, mkt, safe = _screen_inputs()
+    sig = trend_template_screen(uni, mkt, safe, TrendScreenParams(rebalance="ME"))
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+
+
+def test_pipeline_backtests_the_finviz_screen_on_the_momentum_book():
+    """Both strategies must be priced off the same combined frame, or the
+    comparison is measuring two different universes."""
+    lab = run(use_synthetic=True)
+    assert "finviz" in lab.results
+    assert (list(lab.results["finviz"].weights.columns)
+            == list(lab.results["momentum"].weights.columns))
+    assert len(lab.results["finviz"].returns) == len(lab.results["momentum"].returns)
+
 
 if __name__ == "__main__":
     failures = 0

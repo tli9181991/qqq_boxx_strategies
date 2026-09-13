@@ -60,6 +60,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "(default 0.25; this is the drawdown control that works)")
     p.add_argument("--no-book-vt", dest="book_vt", action="store_false", default=True,
                    help="skip the vol-targeted variant of the momentum book")
+    p.add_argument("--finviz-off-high", type=float, default=None,
+                   help="Finviz screen: max distance below the 52-week high "
+                        "(0.10 = the notebook's '0-10%% below High')")
+    p.add_argument("--finviz-exit-rank", type=int, default=None,
+                   help="Finviz screen: hysteresis band (0 = none, the "
+                        "notebook's rule -- it re-screens from scratch daily)")
+    p.add_argument("--finviz-rebalance", default=None, choices=["daily", "ME", "W-FRI"],
+                   help="Finviz screen rebalance frequency")
+    p.add_argument("--no-finviz", dest="finviz", action="store_false", default=True,
+                   help="skip the Finviz screen strategy")
     p.add_argument("--sweep-target-vol", action="store_true",
                    help="also print the book vol-target sensitivity table")
     p.add_argument("--synthetic", action="store_true", help="use generated prices, no network")
@@ -113,6 +123,16 @@ def main(argv=None) -> int:
         cfg.vix.min_cash_days = args.vix_min_cash
     if args.target_vol_book is not None:
         cfg.book_vol.target_vol = args.target_vol_book
+    if args.finviz_off_high is not None:
+        cfg.finviz.within_52w_high_pct = args.finviz_off_high
+    if args.finviz_exit_rank is not None:
+        cfg.finviz.exit_rank = args.finviz_exit_rank
+    if args.finviz_rebalance is not None:
+        cfg.finviz.rebalance = args.finviz_rebalance
+    if cfg.finviz.exit_rank and cfg.finviz.exit_rank < cfg.finviz.n_hold:
+        print("finviz-exit-rank must be 0 (no band) or >= the number of names held",
+              file=sys.stderr)
+        return 2
     if cfg.momentum.exit_rank < cfg.momentum.n_hold:
         print("exit-rank must be >= n-hold (the band cannot be negative)", file=sys.stderr)
         return 2
@@ -126,6 +146,7 @@ def main(argv=None) -> int:
         lab = run(cfg, offline=args.offline, refresh=args.refresh,
                   use_synthetic=args.synthetic, with_momentum=args.momentum,
                   with_vix=args.vix, with_book_vt=args.book_vt,
+                  with_finviz=args.finviz,
                   fetch_universe=args.fetch_universe, pit_membership=pit)
     except ImportError:
         print("yfinance is not installed. Either `pip install yfinance` or run "

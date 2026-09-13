@@ -1,6 +1,6 @@
 # QQQ / BOXX strategy lab
 
-Six trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
+Seven trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
 that shows you where every signal fired.
 
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
@@ -9,6 +9,8 @@ that shows you where every signal fired.
 - **Top-6 Nasdaq-100 momentum** — cross-sectional 12-1 momentum with a hysteresis band
 - **Top-6 + VIX circuit breaker** — the same book, switched off entirely when VIX spikes
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
+- **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
+  can be held against the momentum book on identical assumptions
 
 Backtest window: **2025-01-20 (inauguration) to today**, one-day execution lag,
 commission and slippage charged separately on turnover.
@@ -227,6 +229,100 @@ gap in one name: it responds to sustained volatility, not to jumps.
 against VIX so you can see the episodes an index signal misses. The dial is expected
 to be *boring* — a kink would mean the overlay is doing more than rescaling.
 
+### 7. Top-6 Finviz screen
+
+`finviz_filter_with_daily_summary.ipynb` answers "what would I buy today". This rolls
+it forward to every historical date so it can be held against the momentum book.
+
+| | Rule |
+|---|---|
+| Filter | price > $10, close > SMA(200), quarter return > 0, **within 10% of the 52-week high** |
+| Score | 1-year total return, bucketed into a 1–99 RS Rank |
+| Tie-break | smallest distance below the 52-week high |
+| Hold | the top 6, equal weight per slot |
+| Exit | the day a name stops passing or drops out of the top 6 — **no band** |
+
+**What was reproduced and what could not be.** Every Finviz criterion in the notebook
+is derived from price or volume, which is what makes it rollable at all. Two are not
+applied: market cap over $300m needs fundamentals (non-binding on the Nasdaq-100), and
+average volume over 200k needs share volume — pass `volumes=` to enable it. Both
+omissions are *permissive*, so they flatter this strategy rather than the other way
+round. The notebook's 20%-quarterly-return gate is off by default because the notebook
+itself applies it only to the sector-breakdown table, not to the list it ranks
+(`min_quarter_return=0.20` switches it on).
+
+**It is ranked against the Nasdaq-100, not against Finviz's own output.** That is
+deliberate. The notebook screens the whole US market and gets ~530 names; running the
+comparison that way would change the universe and the selection rule at the same time,
+and there would be no way to attribute the difference to either. Worse, there is no
+point-in-time version of that 530-name list — it is *today's* screener result, i.e.
+names selected for having already gone up, and a backtest that may only buy from it
+has been handed the answer. Ranking both strategies over the same 99 names means the
+only thing the comparison can be measuring is the rule.
+
+#### How it compares
+
+Same universe, same six slots, same engine, same 1bp + 5bp costs, 2025-01-20 → 2026-09-08:
+
+| | CAGR | Vol | Sharpe | Max DD | Turnover | Cost drag |
+|---|---|---|---|---|---|---|
+| **Top-6 NDX momentum** (12-1, band 10) | **46.1%** | 49.0% | **0.94** | **−34.8%** | **5.7×** | 0.3% |
+| Top-6 Finviz screen (notebook rules) | 25.8% | 40.1% | 0.67 | −36.0% | 86.7× | 5.2% |
+| Top-6 Finviz screen, monthly rebalance | 43.3% | 45.9% | 0.93 | −39.9% | 12.7× | 0.8% |
+| Buy & hold QQQ | 22.2% | 22.6% | 0.82 | −22.8% | 0.6× | 0.0% |
+
+**Roughly a third of the gap is churn, the rest is selection.** Gross of costs the
+screen makes 32.5% against the momentum book's 46.6%, so about 6 of the 20-point net
+gap is trading friction and the remaining 14 is the rule itself. The friction is
+structural: a screen has no memory, so it re-sorts from scratch every day and a name
+oscillating around rank 6 is round-tripped repeatedly. The average holding period is
+**6 trading days against the momentum book's 98**, and it touches 62 distinct names
+over the window where the momentum book touches 24. Rebalancing monthly removes almost
+all of that and closes most of the gap.
+
+**The binding constraint is "within 10% of the 52-week high".** It is the criterion
+that decides what this strategy is, and on this universe it costs money:
+
+| Max distance below the high | 5% | **10%** | 15% | 20% | 30% | none |
+|---|---|---|---|---|---|---|
+| CAGR (daily rebalance) | 20.8% | **25.8%** | 49.6% | 54.4% | 54.7% | 65.4% |
+| Names passing (avg) | 21 | **32** | 39 | 42 | 44 | 45 |
+
+Monotone, which is the shape you would rather not see in a parameter you are relying
+on — there is no plateau to sit on, just a filter that helps less the tighter you set
+it. (The monthly-rebalance column is *not* monotone, which is a fair reminder of how
+much noise a 20-month sample carries.)
+
+The reason is visible in the current book. On the last cached bar the two strategies
+had **zero names in common**:
+
+```
+Top-6 NDX momentum:  LRCX, MU, AMAT, INTC, AMD, MRVL     (six semiconductors)
+Top-6 Finviz screen: WBD, CRWD, FTNT, ROST, CSX, BIIB
+```
+
+The semiconductor complex has the six strongest 1-year returns in the index — MU at
++663%, INTC +327%, MRVL +257% — and every one of them sits 13–35% below its 52-week
+high after the run. The proximity filter excludes the entire group by construction. Over
+the whole window the two books share a median of 3 names out of 6, and on 44% of days
+two or fewer.
+
+**Its cash leg never engages.** A screen is an absolute test, so it *can* answer
+"nothing qualifies" and sit in BOXX — that is the main structural argument for
+preferring one to a ranking. On the Nasdaq-100 it never gets the chance: the worst day
+in the sample still had 10 names passing, against a median of 34, so the book was 100%
+invested on every one of the 410 trading days, April 2025 included. Whatever this
+strategy is, it is not a de-risking mechanism on this universe. On the notebook's own
+small-cap-inclusive universe it may well be; that is not testable here.
+
+**What this does not settle.** The notebook's real screen runs on the whole US market,
+and its edge — if it has one — may live in the small and mid caps the Nasdaq-100 does
+not contain. Nothing above rules that out. What it does show is that the *selection
+rule*, applied to the same names as the momentum book, picks differently and, on this
+window, worse — and that the 52-week-high proximity filter is why.
+
+---
+
 ---
 
 > ⚠️ **Read the default 17/16 as a warning, not a recommendation.** VIX's long-run
@@ -258,7 +354,9 @@ qbs/
   data.py         yfinance download + CSV cache + synthetic market and VIX generators
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
-  strategies.py   the six strategies -> target weights + diagnostics + events
+  strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
+  screens.py      filter-based screens: the trend template and the Finviz screen,
+                  both rolled forward from a notebook so they can be backtested
   engine.py       one backtest function: lag, commission, slippage, equity curve
   metrics.py      CAGR, Sharpe/Sortino vs BOXX, drawdown, turnover, trade log
   plotting.py     the chart system
@@ -266,8 +364,9 @@ qbs/
                   sweep_vix(), sweep_target_vol()
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
-tests/test_qbs.py 52 tests: indicators, engine, momentum, circuit-breaker and
-                  vol-target invariants (including a shuffled-future look-ahead test)
+tests/test_qbs.py 78 tests: indicators, engine, momentum, circuit-breaker,
+                  vol-target and screen invariants (each strategy gets a
+                  shuffled-future look-ahead test)
 ```
 
 ### The one convention that matters
@@ -385,6 +484,12 @@ makes a missed session self-healing; never replay one by hand.
   rises, but it manages sustained volatility rather than gaps, and it does not
   diversify. As of the last cached run all six holdings were semiconductors, and
   nothing in the ranker prevents that.
+- **The Finviz comparison is a rule comparison, not a strategy verdict.** Both books
+  rank the same 99 Nasdaq-100 names, which is what makes the difference attributable to
+  the selection rule. The notebook's real screen runs on the whole US market, and any
+  edge it has in small and mid caps is invisible here — there is no point-in-time
+  version of that screener output to test against, only today's list, which is a list
+  of names that already went up.
 - **Short-term capital gains.** At the turnover the band sweep reports, a taxable
   account converts most of the return into income-taxed short-term gains. Compare the
   after-tax number with simply holding QQQ before concluding anything.
