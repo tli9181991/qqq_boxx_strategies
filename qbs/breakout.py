@@ -618,6 +618,194 @@ def _account(
 
 
 # ==========================================================================
+# Does the selection actually break out?
+# ==========================================================================
+# A different question from "what did the book earn". The book's return mixes
+# the SELECTION (did Finviz hand us names that break out?) with the SIZING and
+# the slot cap. This measures the first part alone, as a funnel:
+#
+#   selected  ->  had a resistance level overhead  ->  crossed it inside the
+#   waiting window  ->  the cross held the confirmation  ->  the trade reached
+#   +1R before it exited
+#
+# The last stage is the strategy's own definition of a breakout that worked:
+# +1R is exactly where `breakout_signals` stops using the time stop and starts
+# trailing. Reaching it is the difference between a breakout and a poke.
+#
+# Attrition matters more than the final number. A selection that rarely gets
+# overhead resistance at all is a different problem from one that crosses
+# constantly and fails the confirmation.
+
+
+def closes_to_bars(closes: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Turn a wide frame of daily closes into per-ticker OHLC bars.
+
+    For running the funnel on the lab's cached universe, which is closes only.
+    High and Low are the close-to-close envelope -- `max/min(close, prev
+    close)` -- so the frame is self-consistent and ATR and ADR both mean
+    something, rather than the degenerate High == Low == Close, which would
+    make ADR identically zero and silently tighten every stop.
+
+    **This understates the true range**, because a real session trades outside
+    its close-to-close band. Smaller ADR means a smaller R and a tighter stop,
+    so a funnel run on close-only bars is a CONSERVATIVE estimate of the
+    success rate. Use real intraday bars when you have them.
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    for t in closes.columns:
+        c = closes[t].dropna()
+        if c.empty:
+            continue
+        prev = c.shift(1).fillna(c)
+        out[t] = pd.DataFrame(
+            {"Open": prev, "High": np.maximum(c, prev),
+             "Low": np.minimum(c, prev), "Close": c},
+            index=c.index,
+        )
+    return out
+
+
+def breakout_funnel(
+    bars: Dict[str, pd.DataFrame],
+    watchlists: Dict[pd.Timestamp, List[str]],
+    p: Optional[BreakoutParams] = None,
+    wait_days: int = 7,
+    progress: bool = False,
+) -> pd.DataFrame:
+    """One row per (selection date, ticker): did this pick break out, and did it work?
+
+    `wait_days` is the waiting window -- how long after the selection a first
+    breakout still counts. The default of 7 calendar days is exactly the week
+    a weekend watchlist is meant to cover, so a name that has not gone by the
+    next selection has had its chance. Sweep it to see how much of the
+    strategy depends on waiting longer than one week.
+
+    Works on daily or hourly bars. The confirmation is `confirm_hours` BARS,
+    so on daily bars it is two sessions -- the daily analogue of the
+    notebook's two-hour hold, and the closest honest reading of the rule at
+    that resolution.
+
+    Columns
+    -------
+    has_level     was there a resistance level above the price at selection
+    dist_pct      how far overhead it sat, as a fraction of price
+    crossed       price closed through it inside the window
+    confirmed     the cross held `confirm_hours` bars later -- a real entry
+    reached_1R    the confirmed trade got a full R in front before exiting
+    max_R         best R multiple reached while open
+    r_multiple    what it actually closed at, in R
+    reason        which exit fired
+
+    Every stage is evaluated with the same functions the trading code uses,
+    so "confirmed" here means exactly what an entry means there.
+    """
+    p = p or BreakoutParams()
+    sel_dates = sorted(watchlists)
+    window = pd.Timedelta(days=wait_days)
+
+    rows: List[Dict] = []
+    for n, sd in enumerate(sel_dates):
+        if progress and n % 10 == 0:
+            print(f"  [{n}/{len(sel_dates)}] {sd:%Y-%m-%d}")
+        for rank, ticker in enumerate(watchlists[sd], start=1):
+            frame = bars.get(ticker)
+            if frame is None or frame.empty:
+                continue
+            frame = frame.sort_index()
+            hist = frame.loc[:sd]
+            if len(hist) < max(p.atr_window, p.ema_slow_days) + 2:
+                continue
+
+            price = float(hist["Close"].iloc[-1])
+            levels = sr_levels(hist, p)
+            overhead = [L for L in levels if L > price]
+            row = dict(selection_date=sd, ticker=ticker, rank=rank,
+                       price=price, has_level=bool(overhead),
+                       nearest_level=np.nan, dist_pct=np.nan,
+                       crossed=False, bars_to_cross=np.nan,
+                       confirmed=False, entry_price=np.nan, R=np.nan,
+                       reached_1R=False, max_R=np.nan,
+                       r_multiple=np.nan, reason=None)
+
+            if not overhead:
+                rows.append(row)
+                continue
+
+            level = min(overhead)
+            row["nearest_level"] = level
+            row["dist_pct"] = level / price - 1.0
+
+            seg = frame.loc[sd:]
+            if len(seg) < 3:
+                rows.append(row)
+                continue
+            entry_end = sd + window
+
+            # Did it close through the level inside the window at all?
+            in_win = seg.loc[:entry_end, "Close"]
+            if len(in_win) > 1:
+                prev, now = in_win.shift(1), in_win
+                hit = (prev <= level) & (now > level)
+                if bool(hit.any()):
+                    row["crossed"] = True
+                    row["bars_to_cross"] = int(np.argmax(hit.to_numpy()))
+
+            # Did a cross survive the confirmation? Same function the book uses,
+            # restricted to this one level, so the two can never disagree.
+            ind = align_indicators(seg.index, daily_indicators(
+                hourly_to_daily(frame) if _is_intraday(frame) else frame, p))
+            trades = breakout_signals(seg, [level], var_risk(hist, p), p,
+                                      ticker=ticker, ind_hourly=ind,
+                                      entry_end=entry_end)
+            if trades:
+                tr = trades[0]
+                row.update(confirmed=True, entry_price=tr.entry_price, R=tr.R,
+                           reason=tr.reason, r_multiple=tr.r_multiple)
+                held = seg.loc[tr.entry_time:tr.exit_time] if tr.exit_time else seg.loc[tr.entry_time:]
+                if len(held) and tr.R > 0:
+                    best = float(held["Close"].max())
+                    row["max_R"] = (best - tr.entry_price) / tr.R
+                    row["reached_1R"] = bool(row["max_R"] >= 1.0)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _is_intraday(frame: pd.DataFrame) -> bool:
+    """True when the index carries more than one bar per calendar day."""
+    if len(frame) < 3:
+        return False
+    return bool(frame.index.normalize().duplicated().any())
+
+
+def funnel_summary(funnel: pd.DataFrame) -> pd.DataFrame:
+    """The funnel as counts and conversion rates, one row per stage.
+
+    `of_selected` is the share of all picks reaching that stage; `of_previous`
+    is the conversion from the stage above, which is where the attrition
+    actually shows.
+    """
+    n = len(funnel)
+    if n == 0:
+        return pd.DataFrame(columns=["stage", "n", "of_selected", "of_previous"])
+    stages = [
+        ("selected", n),
+        ("had resistance overhead", int(funnel["has_level"].sum())),
+        ("crossed it in the window", int(funnel["crossed"].sum())),
+        ("cross confirmed (an entry)", int(funnel["confirmed"].sum())),
+        ("reached +1R", int(funnel["reached_1R"].sum())),
+        ("closed profitable", int((funnel["r_multiple"] > 0).sum())),
+    ]
+    rows = []
+    for i, (label, count) in enumerate(stages):
+        prev = stages[i - 1][1] if i else count
+        rows.append({"stage": label, "n": count,
+                     "of_selected": count / n,
+                     "of_previous": (count / prev) if prev else np.nan})
+    return pd.DataFrame(rows)
+
+
+# ==========================================================================
 # Sweeps
 # ==========================================================================
 # The lab's other sweeps (`pipeline.sweep_band`, `sweep_vix`,

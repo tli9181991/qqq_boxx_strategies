@@ -1296,3 +1296,99 @@ def test_r_multiple_is_profit_in_units_of_risk():
               exit_time=pd.Timestamp("2025-01-09"), exit_price=110.0, reason="tp")
     assert abs(t.r_multiple - 2.0) < 1e-12
     assert np.isnan(Trade("X", pd.Timestamp("2025-01-02"), 100.0, 99.0, 5.0, 1.0).r_multiple)
+
+
+# --------------------------------------------------------------------------
+# The selection -> breakout funnel
+# --------------------------------------------------------------------------
+
+def test_closes_to_bars_builds_a_usable_range():
+    """High == Low == Close would make ADR identically zero and silently
+    tighten every stop, so the envelope has to have width."""
+    from qbs.breakout import closes_to_bars
+
+    closes = pd.DataFrame({"A": [10.0, 11.0, 10.5, 12.0]},
+                          index=pd.bdate_range("2025-01-01", periods=4))
+    bars = closes_to_bars(closes)["A"]
+    assert (bars["High"] >= bars["Close"]).all()
+    assert (bars["Low"] <= bars["Close"]).all()
+    assert (bars["High"] - bars["Low"]).iloc[1:].gt(0).all(), "range must not be zero"
+
+
+def test_funnel_stages_are_nested():
+    """Each stage is a subset of the one above it -- a pick cannot confirm
+    without crossing, or cross without a level to cross."""
+    from qbs.breakout import breakout_funnel, closes_to_bars
+    from qbs.config import BreakoutParams
+
+    hourly, wl, _ = _breakout_inputs()
+    closes = pd.DataFrame({t: b["Close"].resample("1D").last() for t, b in hourly.items()}).dropna(how="all")
+    f = breakout_funnel(closes_to_bars(closes), wl, BreakoutParams(), wait_days=7)
+
+    assert not f.empty
+    assert (f.loc[f["crossed"], "has_level"]).all(), "crossed implies a level existed"
+    assert (f.loc[f["confirmed"], "crossed"]).all(), "confirmed implies crossed"
+    assert (f.loc[f["reached_1R"], "confirmed"]).all(), "reached_1R implies an entry"
+    assert f.loc[f["confirmed"], "entry_price"].notna().all()
+
+
+def test_funnel_entries_agree_with_the_trading_code():
+    """The funnel must count an entry exactly where `breakout_signals` would
+    take one, or it is measuring a different strategy from the backtest."""
+    from qbs.breakout import (align_indicators, breakout_funnel, breakout_signals,
+                              daily_indicators, hourly_to_daily, var_risk)
+    from qbs.config import BreakoutParams
+
+    hourly, wl, _ = _breakout_inputs()
+    p = BreakoutParams()
+    f = breakout_funnel(hourly, wl, p, wait_days=7)
+    conf = f[f["confirmed"]]
+    assert not conf.empty
+
+    row = conf.iloc[0]
+    bars = hourly[row["ticker"]].sort_index()
+    hist = bars.loc[:row["selection_date"]]
+    seg = bars.loc[row["selection_date"]:]
+    # Indicators are warmed from the FULL series, exactly as `candidate_trades`
+    # does: at selection time the EMAs are already running. Warming them from
+    # the one-week segment instead leaves EMA20 undefined and finds no trade.
+    ind = align_indicators(seg.index, daily_indicators(hourly_to_daily(bars), p))
+    trades = breakout_signals(seg, [row["nearest_level"]], var_risk(hist, p), p,
+                              ind_hourly=ind,
+                              entry_end=row["selection_date"] + pd.Timedelta(days=7))
+    assert trades and abs(trades[0].entry_price - row["entry_price"]) < 1e-9
+
+
+def test_funnel_window_is_monotone():
+    """A longer waiting window can only find more first breakouts, never fewer."""
+    from qbs.breakout import breakout_funnel
+    from qbs.config import BreakoutParams
+
+    hourly, wl, _ = _breakout_inputs()
+    p = BreakoutParams()
+    short = breakout_funnel(hourly, wl, p, wait_days=2)["crossed"].sum()
+    long_ = breakout_funnel(hourly, wl, p, wait_days=14)["crossed"].sum()
+    assert long_ >= short
+
+
+def test_funnel_summary_conversion_rates():
+    from qbs.breakout import funnel_summary
+
+    f = pd.DataFrame({
+        "has_level": [True, True, True, False],
+        "crossed": [True, True, False, False],
+        "confirmed": [True, False, False, False],
+        "reached_1R": [True, False, False, False],
+        "r_multiple": [2.0, np.nan, np.nan, np.nan],
+    })
+    s = funnel_summary(f).set_index("stage")
+    assert s.loc["selected", "n"] == 4
+    assert s.loc["had resistance overhead", "n"] == 3
+    assert abs(s.loc["crossed it in the window", "of_previous"] - 2 / 3) < 1e-12
+    assert abs(s.loc["cross confirmed (an entry)", "of_selected"] - 0.25) < 1e-12
+
+
+def test_funnel_summary_handles_an_empty_frame():
+    from qbs.breakout import funnel_summary
+
+    assert funnel_summary(pd.DataFrame()).empty

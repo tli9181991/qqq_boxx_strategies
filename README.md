@@ -499,6 +499,69 @@ once per group, and every `WeeklyBookParams` variation reuses them — so sweepi
 the synthetic fixture that is **~4× faster** than the naive loop. A test asserts a
 cached row is identical to running the book from scratch.
 
+#### Does the selection actually break out?
+
+`notebooks/breakout_success_rate.ipynb` answers a different question from the backtest.
+The book's return mixes the **selection**, the **sizing** and the **slot cap**; the
+funnel isolates the first:
+
+```
+selected -> had resistance overhead -> crossed it in the waiting window
+         -> the cross held the confirmation -> reached +1R
+```
+
+The **waiting window** (`wait_days`, default 7) is how long after the weekend a first
+breakout still counts — exactly the week the watchlist covers. It runs on the cached
+daily closes, so unlike the backtest above it produces **real numbers today**: 2,815
+Finviz selections across 142 weeks of Nasdaq-100 data.
+
+| stage | n | of picks | of previous |
+|---|---|---|---|
+| selected | 2,815 | 100% | — |
+| had resistance overhead | 1,347 | 47.9% | 47.9% |
+| crossed it in the window | 653 | 23.2% | 48.5% |
+| cross confirmed (an entry) | 370 | 13.1% | 56.7% |
+| reached +1R | 186 | 6.6% | 50.3% |
+| closed profitable | 142 | 5.0% | 76.3% |
+
+**The biggest loss is at the first stage, and it is structural.** The Finviz screen
+requires a name to be *within 10% of its 52-week high* — and a name that close to its
+high has usually already cleared every level its chart shows. **52% of picks had
+nothing overhead to break out through.** The selection rule filters *for* names that
+have already broken out; the entry rule needs names that have not. These two strategies
+are working against each other by construction.
+
+**Read the tail before the mean.** Of the 370 confirmed entries: 38% closed profitable,
+mean **+0.41R**, median **−0.66R**. A positive mean with a negative median means the
+edge is entirely in the right tail — and here it is extreme:
+
+> **the top 10 trades are 90% of all R earned** across 369 closed trades
+> (the top 3 alone are 39%)
+
+Every one of those is a 2025–26 semiconductor or mega-cap tech name. Strip them and
+there is no strategy left. That is not a reason to dismiss it — positive skew is what a
+breakout book is *supposed* to look like — but it means the mean is an estimate of a
+fat tail from a handful of trades in one regime.
+
+**The screen's own ranking predicts the tail, not the hit rate:**
+
+| RS rank | picks | has resistance | entries | win rate | mean R | median R |
+|---|---|---|---|---|---|---|
+| 1–5 | 710 | 37.3% | 84 | 39.3% | **+1.37** | −0.89 |
+| 6–10 | 710 | 45.9% | 94 | 38.3% | +0.21 | −0.62 |
+| 11–15 | 705 | 50.2% | 81 | 37.0% | +0.14 | −0.64 |
+| 16–20 | 690 | 58.3% | 111 | 38.7% | +0.03 | −0.66 |
+
+Two columns saying opposite things. `has resistance` **rises** with rank — the
+strongest names are the least likely to have anything overhead, so the best picks are
+the least tradeable by this entry. `mean R` **falls** with rank. But `win rate` is flat
+at ~38% across every bucket, so the ranking is not predicting *whether* a breakout
+works, only how far the winners run.
+
+⚠️ Close-only bars: High/Low are synthesised as the close-to-close envelope, which
+understates the true range, so R is smaller and stops are tighter than they would be
+live. The success rates above are **conservative**. Re-run on `load_hourly()` bars.
+
 **What the no-refill rule costs.** A slot freed on Tuesday sits in cash until Friday
 however many watchlist names break out on Wednesday, so average exposure runs well
 below 100% and the book is structurally part-invested. That is the scenario as
@@ -550,7 +613,8 @@ qbs/
                   sweep_vix(), sweep_target_vol()
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
-tests/test_qbs.py 98 tests: indicators, engine, momentum, circuit-breaker,
+notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
+tests/test_qbs.py 104 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
