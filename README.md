@@ -508,6 +508,13 @@ winners with a wider risk unit, and past ~2.0 the stop has stopped being a stop 
 **These are synthetic numbers and prove nothing about markets**; the table is here to
 show what the harness reports, not what to set.
 
+`min_off_high_pct` turns the Finviz screen's 52-week-high filter from a *ceiling* into
+a **band**. It is switched off by default (`0.0` reproduces the screener exactly) and
+exists to test one hypothesis: the screen selects names within 10% of their high, which
+are names that have *already* broken out, while the entry needs names approaching
+resistance. Selecting 5–20% below the high instead should give the breakout something
+to break. **Untested** — it is a knob for the experiment, not a recommendation.
+
 `r_mult` and `use_var_cap` are new parameters, added because the default exit mix came
 back 54% `stop_R`. R is `min(|entry × Var95|, gap/2 + ADR/2)`, and the Var95 cap
 usually binds — Var95 on a volatile name is a single bad session, which a breakout
@@ -663,7 +670,7 @@ qbs/
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 108 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 110 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```

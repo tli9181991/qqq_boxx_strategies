@@ -161,6 +161,11 @@ class FinvizScreenParams:
     require_quarter_up: bool = True     # "Performance: Quarter Up"
     above_sma: int = 200                # "200-Day SMA: Price above SMA200"
     within_52w_high_pct: float = 0.10   # "52-Week High/Low: 0-10% below High"
+    # The notebook's filter is a ceiling only: 0-10% below the high. Setting a
+    # FLOOR turns it into a band, which is what a breakout entry needs -- a
+    # name already at its high has nothing overhead left to break through.
+    # 0.0 keeps the notebook's behaviour.
+    min_off_high_pct: float = 0.0
     high_window: int = 252
     min_avg_volume: float = 200_000.0   # "Average Volume: Over 200K" -- needs volumes=
     avg_volume_window: int = 50         # the notebook's Avg_Vol_50D

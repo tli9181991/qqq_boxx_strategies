@@ -1462,3 +1462,44 @@ def test_pipeline_masks_the_ranker_with_pit_membership():
     assert early, "fixture has no pre-join dates -- test proves nothing"
     assert not any(late in held[d] for d in early), \
         "a name must never be held before it joined the index"
+
+
+def test_finviz_high_band_floor_excludes_names_at_their_high():
+    """`min_off_high_pct` turns the 52-week-high filter from a ceiling into a
+    band. The motivation is the breakout book: a name already at its high has
+    nothing overhead left to break through, so an entry that needs resistance
+    can never fire on it.
+    """
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    ceiling = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    band = finviz_momentum_screen(
+        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04,
+                                      within_52w_high_pct=0.20))
+
+    high = uni.rolling(252, min_periods=252).max()
+    off = 1.0 - uni / high
+    checked = 0
+    for dt in uni.index[::40]:
+        for t in band.holdings_log[dt]:
+            assert off.at[dt, t] >= 0.04 - 1e-9, f"{t} sits above the band floor"
+            checked += 1
+    assert checked > 0, "the fixture never held anything -- test proves nothing"
+
+    # A floor can only remove names that the bare ceiling admitted.
+    strict = finviz_momentum_screen(
+        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04))
+    for dt in uni.index[::40]:
+        assert set(strict.holdings_log[dt]) <= set(ceiling.holdings_log[dt])
+
+
+def test_finviz_high_band_floor_defaults_to_the_notebook_rule():
+    """Zero floor must reproduce the screener's own behaviour exactly."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    a = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    b = finviz_momentum_screen(uni, safe,
+                               FinvizScreenParams(n_hold=6, min_off_high_pct=0.0))
+    pd.testing.assert_frame_equal(a.weights, b.weights)

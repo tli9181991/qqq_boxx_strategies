@@ -328,6 +328,8 @@ def finviz_momentum_screen(
     high_52w = px.rolling(p.high_window, min_periods=p.high_window).max()
     pct_off_high = 1.0 - px / high_52w
     within_high = pct_off_high <= p.within_52w_high_pct
+    if p.min_off_high_pct:
+        within_high &= pct_off_high >= p.min_off_high_pct
 
     priced = px >= p.min_price
 
