@@ -65,9 +65,44 @@ lab = run(cfg, pit_membership=pit)
 ```
 
 `membership_mask()` turns that into a date × ticker eligibility grid the ranker
-respects, so a name added in March 2025 is simply not rankable before then. Everything
-else in the package is unchanged. If you are going to trade real money on this, buy the
-membership history.
+respects, so a name added in March 2025 is simply not rankable before then.
+
+**The file must be a complete snapshot per date, not a list of change events.** Rows
+are forward-filled wholesale, so a ticker omitted from a snapshot reads as "dropped".
+
+**And half the bias lives in the names that LEFT.** Masking today's constituents to
+their join dates stops a name being ranked before it joined — but the names that were
+*removed* are the ones whose absence flatters the result, and they are not in today's
+list at all. So with `pit_membership` the universe is rebuilt from
+`universe.pit_tickers()`, the union of every name that was ever a member, and those
+are what get downloaded. Former members with no usable price history (delisted,
+renamed, missing from the feed) are **reported by name** rather than dropped quietly:
+they stay unrankable, that is residual bias, and delisted names are exactly the ones
+that failed.
+
+Where to get the data — see **Sourcing point-in-time membership** below.
+
+---
+
+### Sourcing point-in-time membership
+
+Nothing here ships membership history; these are the routes, roughly cheapest first.
+**Verify current pricing yourself** — the figures below are indicative only.
+
+| Source | Cost | What you get |
+|---|---|---|
+| **Invesco QQQ daily holdings** | free | The ETF *is* the index. Daily holdings files give exact constituents **and** weights. The catch is the archive: start saving them now, because historical files are not reliably retrievable |
+| **Wikipedia revision history** | free | Pull dated revisions of the Nasdaq-100 page via the MediaWiki API and parse the components table at each. Good enough for recent years. Caveats: edits lag real index changes by days, early revisions are inconsistently formatted, and you are recording *what Wikipedia said*, not what the index was |
+| **Nasdaq press releases** | free | The authoritative record — annual December reconstitutions plus ad-hoc change notices. Most accurate free option, most assembly work |
+| **Norgate Data** | ~$70–90/mo | The standard retail answer: survivorship-bias-free US equities including delisted names, with index constituent history. Solves the price half and the membership half together |
+| **EODHD** | ~$20–100/mo | Offers historical index constituents; check NDX coverage specifically |
+| **CRSP / LSEG / FactSet / Bloomberg** | institutional | Definitive, priced accordingly. CRSP via WRDS if you have academic access |
+
+**Membership alone is not enough.** You also need prices for names that left the index,
+including ones that delisted. That is the half Norgate-style vendors exist to solve and
+the half a free membership list does not touch — a perfect membership file plus a price
+feed that has forgotten the delisted names still leaves you biased, which is why the
+loader now names the gaps instead of hiding them.
 
 ---
 
@@ -628,7 +663,7 @@ qbs/
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 104 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 108 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```

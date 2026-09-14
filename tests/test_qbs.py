@@ -1392,3 +1392,73 @@ def test_funnel_summary_handles_an_empty_frame():
     from qbs.breakout import funnel_summary
 
     assert funnel_summary(pd.DataFrame()).empty
+
+
+# --------------------------------------------------------------------------
+# Point-in-time membership
+# --------------------------------------------------------------------------
+
+def test_pit_tickers_is_the_union_of_every_member_ever():
+    """The download list under point-in-time membership is every name that was
+    ever in the index, not today's -- that is the whole point of buying it."""
+    from qbs.universe import pit_tickers
+
+    pit = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01", "2024-01-01", "2025-01-01", "2025-01-01"]),
+        "ticker": ["AAA", "BBB", "AAA", "CCC"],      # BBB was dropped, CCC added
+    })
+    assert pit_tickers(pit) == ["AAA", "BBB", "CCC"]
+
+
+def test_pit_mask_makes_a_name_unrankable_before_it_joined():
+    from qbs.universe import membership_mask
+
+    # Each date in the file is a COMPLETE snapshot of the index on that date,
+    # not a change event -- `membership_mask` forward-fills whole rows, so a
+    # name omitted from a snapshot reads as "no longer a member".
+    idx = pd.bdate_range("2024-01-01", periods=10)
+    day1, day8 = pd.Timestamp("2024-01-01"), pd.Timestamp("2024-01-08")
+    pit = pd.DataFrame({
+        "date": [day1, day1, day8, day8, day8],
+        "ticker": ["AAA", "BBB", "AAA", "BBB", "CCC"],
+    })
+    m = membership_mask(idx, ["AAA", "BBB", "CCC"], pit)
+    assert m["AAA"].all() and m["BBB"].all()
+    assert not m["CCC"].iloc[0], "CCC was not a member on day 1"
+    assert m["CCC"].iloc[-1], "CCC joined on the 8th and stays a member"
+
+
+def test_pit_dropped_member_is_still_rankable_while_it_was_in():
+    """The half of the bias the default path misses: a name removed from the
+    index must still be rankable for the dates it WAS a member."""
+    from qbs.universe import membership_mask
+
+    idx = pd.bdate_range("2024-01-01", periods=10)
+    kept = [pd.Timestamp(d) for d in idx]
+    pit = pd.DataFrame({
+        "date": kept + kept[:4],
+        "ticker": ["AAA"] * len(kept) + ["ZZZ"] * 4,   # ZZZ dropped after day 4
+    })
+    m = membership_mask(idx, ["AAA", "ZZZ"], pit)
+    assert m["ZZZ"].iloc[:4].all(), "ZZZ must be rankable while it was a member"
+    assert not m["ZZZ"].iloc[4:].any(), "and unrankable once it was dropped"
+
+
+def test_pipeline_masks_the_ranker_with_pit_membership():
+    from qbs.universe import synthetic_universe
+
+    uni = synthetic_universe(n=12, start="2023-06-01")
+    late = uni.columns[0]
+    join = uni.index[len(uni) // 2]
+    rows = [{"date": d, "ticker": t}
+            for d in uni.index for t in uni.columns
+            if not (t == late and d < join)]
+    pit = pd.DataFrame(rows)
+
+    lab = run(use_synthetic=True, universe_prices=uni, pit_membership=pit,
+              with_vix=False, with_book_vt=False, with_finviz=False)
+    held = lab.signals["momentum"].holdings_log
+    early = [d for d in held if d < join]
+    assert early, "fixture has no pre-join dates -- test proves nothing"
+    assert not any(late in held[d] for d in early), \
+        "a name must never be held before it joined the index"

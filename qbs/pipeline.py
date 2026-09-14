@@ -20,7 +20,8 @@ from .strategies import (
     cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
 )
 from .universe import (
-    load_universe, load_universe_prices, membership_mask, synthetic_universe,
+    load_universe, load_universe_prices, membership_mask, pit_tickers,
+    synthetic_universe,
 )
 
 
@@ -98,6 +99,19 @@ def run(
         if universe_prices is None:
             if use_synthetic:
                 universe_prices = synthetic_universe(start=cfg.download_start)
+            elif pit_membership is not None:
+                # With point-in-time membership the universe is every name
+                # that was EVER a member, not today's list. Ranking today's
+                # constituents with historical join dates removes only half
+                # the bias: the names that were DROPPED are the ones whose
+                # absence flatters the result, and they have to be priced.
+                tickers = pit_tickers(pit_membership)
+                print(f"[universe] point-in-time: {len(tickers)} names were members "
+                      f"at some point (today's list would be ~100)")
+                universe_prices = load_universe_prices(
+                    tickers, start=cfg.download_start, end=cfg.backtest_end,
+                    refresh=refresh,
+                )
             else:
                 tickers = load_universe(fetch=fetch_universe)
                 universe_prices = load_universe_prices(
@@ -111,8 +125,20 @@ def run(
         uni = universe_prices.reindex(prices.index).ffill()
         uni = uni.loc[:, uni.notna().sum() >= cfg.momentum.min_history]
 
-        eligible = (membership_mask(uni.index, list(uni.columns), pit_membership)
-                    if pit_membership is not None else None)
+        eligible = None
+        if pit_membership is not None:
+            # Residual bias is what is left when a former member has no price
+            # history to download -- delisted, renamed, or simply absent from
+            # the feed. It cannot be fixed here, but it must not be silent:
+            # those names are disproportionately the failures.
+            missing = sorted(set(pit_tickers(pit_membership)) - set(uni.columns))
+            if missing:
+                print(f"[universe] WARNING: {len(missing)} former members have no "
+                      f"usable price history and stay unrankable: {missing[:12]}"
+                      f"{' ...' if len(missing) > 12 else ''}\n"
+                      f"[universe] that is residual survivorship bias -- delisted "
+                      f"names are exactly the ones that failed.")
+            eligible = membership_mask(uni.index, list(uni.columns), pit_membership)
 
         mom_sig = cross_sectional_momentum(
             uni, prices[SAFE_ASSET], cfg.momentum, eligible=eligible,

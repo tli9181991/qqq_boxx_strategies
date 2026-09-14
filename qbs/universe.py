@@ -139,6 +139,19 @@ def load_pit_universe(path: str) -> pd.DataFrame:
     return out.drop_duplicates().sort_values(["date", "ticker"]).reset_index(drop=True)
 
 
+def pit_tickers(pit: pd.DataFrame) -> List[str]:
+    """Every ticker that was EVER a member, across the whole point-in-time file.
+
+    This is the list to download prices for, and it is not the same list as
+    today's index. A name that was a member in 2024 and dropped in 2025 has to
+    be priced and rankable for its 2024 dates, or the backtest still cannot
+    see it -- which is the survivorship bias the membership file was bought to
+    remove. Masking today's constituents to their join dates fixes only the
+    half of the problem where a name is ranked before it joined.
+    """
+    return sorted(set(pit["ticker"].astype(str).str.strip().str.upper()))
+
+
 def membership_mask(
     index: pd.DatetimeIndex,
     tickers: Sequence[str],
