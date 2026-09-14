@@ -558,6 +558,20 @@ the least tradeable by this entry. `mean R` **falls** with rank. But `win rate` 
 at ~38% across every bucket, so the ranking is not predicting *whether* a breakout
 works, only how far the winners run.
 
+**`+1.37R` is not something to expect** (notebook §8b exists to stop that reading). R is
+profit in units of risk on a trade that happens for only 11.8% of top-5 picks — median
+1R is 2.85% of price, so it is ~3.9% of a *position*, not of the book. Dropping the 5
+best of 84 trades takes it to +0.42R; the bootstrap CI is [+0.34R, +2.53R]; the median
+trade is −0.89R. By year it is +0.86R (2024), +0.26R (2025), **+6.05R on 11 trades
+(2026)**, and three tickers are 69% of the bucket's total R.
+
+The *direction* does survive — permutation p = 0.002, positive in both halves and all
+three years — and running the book on a 5-name watchlist beats the 20-name version
+(§8c). But survivorship bias bites hardest exactly here: today's Nasdaq-100 over-
+represents names that went on to become large, and ranking by RS inside it selects for
+precisely those. Treat concentration as a hypothesis for point-in-time data, not a
+finding.
+
 ⚠️ Close-only bars: High/Low are synthesised as the close-to-close envelope, which
 understates the true range, so R is smaller and stops are tighter than they would be
 live. The success rates above are **conservative**. Re-run on `load_hourly()` bars.
