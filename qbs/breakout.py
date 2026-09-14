@@ -231,6 +231,14 @@ class Trade:
             return 0.0
         return self.exit_price / self.entry_price - 1.0
 
+    @property
+    def r_multiple(self) -> float:
+        """Profit in units of the risk taken -- the only scale on which two
+        breakout configurations with different stop widths compare."""
+        if self.exit_price is None or self.R <= 0:
+            return float("nan")
+        return (self.exit_price - self.entry_price) / self.R
+
 
 def breakout_signals(
     hourly: pd.DataFrame,
@@ -318,7 +326,8 @@ def breakout_signals(
             if np.isnan(f) or np.isnan(s) or f <= s or c_now <= L:
                 continue            # regime broke, or price fell back below
             structural = gap / 2.0 + (adr_at_cross * 0.5 if not np.isnan(adr_at_cross) else 0.0)
-            r_val = min(abs(c_now * var95), structural) if np.isfinite(var95) else structural
+            cap = abs(c_now * var95) if (p.use_var_cap and np.isfinite(var95)) else np.inf
+            r_val = min(cap, structural) * p.r_mult
             if not np.isfinite(r_val) or r_val <= 0:
                 continue
             active[L] = Trade(ticker=ticker, entry_time=now, entry_price=float(c_now),
@@ -389,16 +398,35 @@ def weekly_breakout_book(
     """
     p = p or BreakoutParams()
     book = book or WeeklyBookParams()
+    candidates = candidate_trades(hourly, watchlists, p)
+    taken = allocate_slots(candidates, watchlists, book)
+    return _account(taken, watchlists, safe_prices, hourly, p, book,
+                    cost_bps, slippage_bps, name)
 
+
+def candidate_trades(
+    hourly: Dict[str, pd.DataFrame],
+    watchlists: Dict[pd.Timestamp, List[str]],
+    p: Optional[BreakoutParams] = None,
+) -> List[Trade]:
+    """Every breakout the rules would have taken, before the slot cap bites.
+
+    Split out from `weekly_breakout_book` because it is by far the expensive
+    half -- levels are re-derived per name per week -- and because it depends
+    only on `BreakoutParams`. `sweep_breakout` reuses one candidate set across
+    every `WeeklyBookParams` variation, which is what makes sweeping slot
+    count and watchlist size cheap.
+
+    Levels and risk are recomputed at each selection date a name appears on,
+    so a trade opened in week W is only ever placed at a level that week W's
+    chart could already show.
+    """
+    p = p or BreakoutParams()
     sel_dates = sorted(watchlists)
     if not sel_dates:
         raise ValueError("no watchlists -- nothing can ever be traded")
 
-    # ---- per-name trade candidates, generated once per name ---------------
-    # Levels and risk are recomputed at each selection date the name appears
-    # on, so a trade opened in week W is only ever placed at a level that
-    # week W's chart could show.
-    all_trades: List[Trade] = []
+    out: List[Trade] = []
     for ticker in sorted({t for names in watchlists.values() for t in names}):
         bars = hourly.get(ticker)
         if bars is None or bars.empty:
@@ -415,8 +443,7 @@ def weekly_breakout_book(
                 if ticker not in watchlists[sd]:
                     continue
                 end = sel_dates[k + 1] if k + 1 < len(sel_dates) else None
-                hist = daily.loc[:sd] if p.causal_levels or p.causal_risk else daily
-                windows.append((sd, end, hist))
+                windows.append((sd, end, daily.loc[:sd]))
 
         for sd, end, hist in windows:
             if hist.empty:
@@ -431,14 +458,32 @@ def weekly_breakout_book(
             # Entries only inside this week; exits managed over everything
             # after it, because a trade may run for `hold_weeks`. Indicators
             # come from the full series so the EMA is already warm.
-            all_trades += breakout_signals(seg, levels, v95, p, ticker=ticker,
-                                           ind_hourly=ind.reindex(seg.index),
-                                           entry_end=end)
+            out += breakout_signals(seg, levels, v95, p, ticker=ticker,
+                                    ind_hourly=ind.reindex(seg.index),
+                                    entry_end=end)
+    return out
 
-    # ---- allocate trades to slots, in time order --------------------------
-    all_trades.sort(key=lambda t: (t.entry_time, t.ticker))
-    rank_of = {sd: {t: i for i, t in enumerate(names)}
-               for sd, names in watchlists.items()}
+
+def allocate_slots(
+    candidates: List[Trade],
+    watchlists: Dict[pd.Timestamp, List[str]],
+    book: Optional[WeeklyBookParams] = None,
+) -> List[Trade]:
+    """Fill `n_slots` from the candidates, in time order, one name at a time.
+
+    Pure and non-mutating: it selects a subset of `candidates` and never
+    touches a `Trade`, which is what makes one candidate set safe to allocate
+    many times with different book parameters.
+
+    With `refill_within_week=False` a slot freed mid-week is counted as still
+    spent until the next selection date. That is the rule that stops the book
+    chasing: a stop-out on Tuesday is cash until Friday, however many
+    watchlist names break out on Wednesday.
+    """
+    book = book or WeeklyBookParams()
+    sel_dates = sorted(watchlists)
+    ordered = sorted(candidates, key=lambda t: (t.entry_time, t.ticker))
+    eligible = {sd: set(names) for sd, names in watchlists.items()}
 
     def week_of(ts: pd.Timestamp) -> Optional[pd.Timestamp]:
         prior = [d for d in sel_dates if d <= ts]
@@ -449,14 +494,14 @@ def weekly_breakout_book(
     freed_this_week = 0
     current_week: Optional[pd.Timestamp] = None
 
-    for tr in all_trades:
+    for tr in ordered:
         wk = week_of(tr.entry_time)
-        if wk is None or tr.ticker not in rank_of.get(wk, {}):
+        if wk is None or tr.ticker not in eligible.get(wk, ()):
             continue                                   # not on that week's list
         if wk != current_week:
             current_week, freed_this_week = wk, 0
-        # Retire anything that closed before this entry.
-        still_open = [x for x in open_slots if x.is_open or x.exit_time > tr.entry_time]
+        still_open = [x for x in open_slots
+                      if x.is_open or x.exit_time > tr.entry_time]
         freed_this_week += len(open_slots) - len(still_open)
         open_slots = still_open
         if any(x.ticker == tr.ticker for x in open_slots):
@@ -466,9 +511,7 @@ def weekly_breakout_book(
             continue
         open_slots.append(tr)
         taken.append(tr)
-
-    return _account(taken, watchlists, safe_prices, hourly, p, book,
-                    cost_bps, slippage_bps, name)
+    return taken
 
 
 def _account(
@@ -548,7 +591,8 @@ def _account(
                          entry_price=tr.entry_price, exit_time=tr.exit_time,
                          exit_price=tr.exit_price, reason=tr.reason,
                          level=tr.level, R=tr.R,
-                         gross_return=tr.gross_return))
+                         gross_return=tr.gross_return,
+                         R_multiple=tr.r_multiple))
 
     idle = (book.n_slots - in_use).clip(lower=0) * slot_w
     weights[book.safe_asset] = idle
@@ -569,8 +613,201 @@ def _account(
                          "exposure": in_use * slot_w})
     tdf = pd.DataFrame(rows) if rows else pd.DataFrame(
         columns=["ticker", "entry_time", "entry_price", "exit_time", "exit_price",
-                 "reason", "level", "R", "gross_return"])
+                 "reason", "level", "R", "gross_return", "R_multiple"])
     return BreakoutBook(result=res, trades=tdf, watchlists=watchlists, diagnostics=diag)
+
+
+# ==========================================================================
+# Sweeps
+# ==========================================================================
+# The lab's other sweeps (`pipeline.sweep_band`, `sweep_vix`,
+# `sweep_target_vol`) vary one dial and print a table you read for a PLATEAU
+# rather than a best cell. Same idea here, with one difference that matters:
+# a weight-based strategy trades every day, so its CAGR is an average over
+# hundreds of decisions, whereas a 6-slot breakout book may take 100 trades in
+# two years. At that count CAGR is mostly noise.
+#
+# So every row also carries the trade-level numbers, and those are what you
+# read first:
+#
+#   n_trades      below ~30 the rest of the row means nothing
+#   expectancy_R  mean profit per trade in units of risk. THE number: it is
+#                 the only scale on which two configs with different stop
+#                 widths are comparable
+#   hit_rate      low is fine for breakouts if expectancy_R is positive
+#   stop/tp/time  the exit mix. A config that is mostly `stop_R` is telling
+#                 you the levels are not holding or R is too tight -- and that
+#                 diagnosis survives a sample far too small to trust its CAGR
+
+
+def trade_stats(trades: pd.DataFrame) -> Dict[str, float]:
+    """Trade-level summary of a breakout book, in R units."""
+    if trades.empty:
+        return {"n_trades": 0, "n_closed": 0, "hit_rate": float("nan"),
+                "expectancy_R": float("nan"), "avg_win_R": float("nan"),
+                "avg_loss_R": float("nan"), "pct_stop": float("nan"),
+                "pct_take_profit": float("nan"), "pct_time_or_ema": float("nan")}
+
+    closed = trades[trades["exit_time"].notna()]
+    r = closed["R_multiple"].dropna()
+    wins, losses = r[r > 0], r[r <= 0]
+    n = len(closed)
+    counts = closed["reason"].value_counts()
+    return {
+        "n_trades": int(len(trades)),
+        "n_closed": int(n),
+        "hit_rate": float((r > 0).mean()) if len(r) else float("nan"),
+        "expectancy_R": float(r.mean()) if len(r) else float("nan"),
+        "avg_win_R": float(wins.mean()) if len(wins) else float("nan"),
+        "avg_loss_R": float(losses.mean()) if len(losses) else float("nan"),
+        "pct_stop": float(counts.get("stop_R", 0) / n) if n else float("nan"),
+        "pct_take_profit": float(counts.get("take_profit", 0) / n) if n else float("nan"),
+        "pct_time_or_ema": float(counts.get("time_or_ema", 0) / n) if n else float("nan"),
+    }
+
+
+_BREAKOUT_FIELDS = set(BreakoutParams().__dict__)
+_BOOK_FIELDS = set(WeeklyBookParams().__dict__)
+
+
+def sweep_breakout(
+    hourly: Dict[str, pd.DataFrame],
+    watchlists: Dict[pd.Timestamp, List[str]],
+    safe_prices: pd.Series,
+    grid: Dict[str, Sequence],
+    base: Optional[BreakoutParams] = None,
+    book: Optional[WeeklyBookParams] = None,
+    rf: Optional[pd.Series] = None,
+    cost_bps: float = 1.0,
+    slippage_bps: float = 5.0,
+    progress: bool = True,
+) -> pd.DataFrame:
+    """Re-run the book across a grid of parameters, one row per combination.
+
+    `grid` maps a parameter name to the values to try. Names are resolved
+    against `BreakoutParams` first, then `WeeklyBookParams`::
+
+        sweep_breakout(hourly, wl, safe, {"confirm_hours": [1, 2, 3, 4]})
+        sweep_breakout(hourly, wl, safe, {"r_mult": [0.5, 1.0, 1.5, 2.0],
+                                          "n_slots": [4, 6, 8]})
+
+    Several keys give the full cartesian product, so keep it small.
+
+    Why this is not just a loop over `weekly_breakout_book`
+    ------------------------------------------------------
+    Generating candidates is the expensive half -- levels are re-derived per
+    name per week -- and it depends only on `BreakoutParams`. Rows are
+    therefore grouped by their signal parameters, candidates are generated
+    once per distinct group, and every book variation in that group reuses
+    them. Sweeping `n_slots` or `watchlist_size` costs one generation for the
+    whole column rather than one per cell.
+
+    Read the result for a plateau, and read `n_trades` and `expectancy_R`
+    before CAGR -- see the note at the top of this section.
+    """
+    base = base or BreakoutParams()
+    book = book or WeeklyBookParams()
+
+    unknown = set(grid) - _BREAKOUT_FIELDS - _BOOK_FIELDS
+    if unknown:
+        raise ValueError(f"not parameters of either dataclass: {sorted(unknown)}")
+    if not grid:
+        raise ValueError("grid is empty -- nothing to sweep")
+
+    from itertools import product
+    from .metrics import summarise
+
+    keys = list(grid)
+    combos = [dict(zip(keys, vals)) for vals in product(*(list(grid[k]) for k in keys))]
+
+    # Group by the signal half, so candidates are generated once per group.
+    def signal_key(combo):
+        return tuple(sorted((k, v) for k, v in combo.items() if k in _BREAKOUT_FIELDS))
+
+    groups: Dict[tuple, List[Dict]] = {}
+    for c in combos:
+        groups.setdefault(signal_key(c), []).append(c)
+
+    rows = []
+    done = 0
+    for sig_key, members in groups.items():
+        p = BreakoutParams(**{**base.__dict__, **dict(sig_key)})
+        cands = candidate_trades(hourly, watchlists, p)
+        for combo in members:
+            bk = WeeklyBookParams(**{**book.__dict__,
+                                     **{k: v for k, v in combo.items()
+                                        if k in _BOOK_FIELDS}})
+            wl = watchlists
+            if "watchlist_size" in combo:
+                wl = {d: names[:bk.watchlist_size] for d, names in watchlists.items()}
+            taken = allocate_slots(cands, wl, bk)
+            out = _account(taken, wl, safe_prices, hourly, p, bk,
+                           cost_bps, slippage_bps, "sweep")
+            m = summarise(out.result, rf=rf)
+            rows.append({**combo, **trade_stats(out.trades),
+                         "CAGR": m.get("CAGR"), "Ann. vol": m.get("Ann. vol"),
+                         "Sharpe": m.get("Sharpe (vs BOXX)"),
+                         "Max drawdown": m.get("Max drawdown"),
+                         "Ann. turnover": m.get("Ann. turnover"),
+                         "Avg exposure": m.get("Avg risk exposure")})
+            done += 1
+            if progress:
+                print(f"  [{done}/{len(combos)}] {combo} -> "
+                      f"{rows[-1]['n_trades']} trades, "
+                      f"expectancy {rows[-1]['expectancy_R']:+.2f}R")
+
+    return pd.DataFrame(rows)[keys + [
+        "n_trades", "n_closed", "hit_rate", "expectancy_R", "avg_win_R", "avg_loss_R",
+        "pct_stop", "pct_take_profit", "pct_time_or_ema",
+        "CAGR", "Ann. vol", "Sharpe", "Max drawdown", "Ann. turnover", "Avg exposure"]]
+
+
+def lookahead_cost(
+    hourly: Dict[str, pd.DataFrame],
+    watchlists: Dict[pd.Timestamp, List[str]],
+    safe_prices: pd.Series,
+    base: Optional[BreakoutParams] = None,
+    book: Optional[WeeklyBookParams] = None,
+    rf: Optional[pd.Series] = None,
+    progress: bool = True,
+) -> pd.DataFrame:
+    """Price each of the notebook's three look-ahead paths, one at a time.
+
+    Five rows: the causal book, the notebook's own settings, and each leak
+    switched back on by itself. The gap between the first and second rows is
+    what the notebook's breakout results were worth that a live trader could
+    not have had.
+
+    Do not read a small gap as "the leak was harmless". On synthetic bars the
+    difference is small by construction -- generated prices have no real pivot
+    structure for `find_peaks` to exploit, so knowing future peaks buys little.
+    On real bars, where levels genuinely mark where a stock turned, expect
+    more. This table exists to measure that on YOUR data.
+    """
+    base = base or BreakoutParams()
+    variants = {
+        "causal (default)": {},
+        "notebook (all three)": dict(causal_levels=False, causal_risk=False,
+                                     lag_daily_indicators=False),
+        "+ levels from full history": dict(causal_levels=False),
+        "+ Var95 from full history": dict(causal_risk=False),
+        "+ unlagged daily indicators": dict(lag_daily_indicators=False),
+    }
+    rows = []
+    for label, over in variants.items():
+        p = BreakoutParams(**{**base.__dict__, **over})
+        bk = book or WeeklyBookParams()
+        out = weekly_breakout_book(hourly, watchlists, safe_prices, p, bk)
+        from .metrics import summarise
+        m = summarise(out.result, rf=rf)
+        rows.append({"variant": label, **trade_stats(out.trades),
+                     "CAGR": m.get("CAGR"), "Sharpe": m.get("Sharpe (vs BOXX)"),
+                     "Max drawdown": m.get("Max drawdown")})
+        if progress:
+            print(f"  {label}: {rows[-1]['n_trades']} trades, "
+                  f"expectancy {rows[-1]['expectancy_R']:+.2f}R, "
+                  f"CAGR {rows[-1]['CAGR']:+.1%}")
+    return pd.DataFrame(rows)
 
 
 # ==========================================================================

@@ -306,7 +306,14 @@ class BreakoutParams:
     adr_window: int = 14
 
     # ---- risk unit R ----------------------------------------------------
+    # R is `min(|entry x Var95|, avg_level_gap/2 + ADR/2)`, then scaled by
+    # `r_mult`. The Var95 cap is usually the binding one, and Var95 on a
+    # volatile name is a single bad session -- which a breakout routinely
+    # gives back before it works. That is the first thing to sweep when the
+    # exit mix comes back dominated by `stop_R`.
     var_confidence: float = 0.95      # Var95 of daily returns caps R
+    use_var_cap: bool = True          # False -> structural distance alone sets R
+    r_mult: float = 1.0               # widen (>1) or tighten (<1) the whole stop
     hold_weeks: float = 3.0           # the time stop on a trade going nowhere
 
     # ---- honesty switches -----------------------------------------------

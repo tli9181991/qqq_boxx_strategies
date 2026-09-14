@@ -436,6 +436,69 @@ print(book.trades.head())            # every fill, with its level, R and exit re
 you can audit them one by one, and a breakout strategy's behaviour lives in the exit
 mix — a book that is mostly `stop_R` is telling you the levels are not holding.
 
+#### Sweeping it
+
+`sweep_breakout()` re-runs the book across a grid and returns one row per cell, the
+same shape as `sweep_band()` / `sweep_vix()` / `sweep_target_vol()` — and read the same
+way, for a **plateau rather than a best cell**.
+
+```python
+from qbs.breakout import sweep_breakout, lookahead_cost
+
+sweep_breakout(hourly, wl, prices["BOXX"], {"r_mult": [0.5, 1.0, 1.5, 2.0, 3.0]})
+sweep_breakout(hourly, wl, prices["BOXX"], {"confirm_hours": [1, 2, 3, 4, 6],
+                                            "n_slots": [4, 6, 8]})
+```
+
+**Read `n_trades` and `expectancy_R` before CAGR.** This is the one place this harness
+departs from the lab's others, and it matters. A weight-based strategy trades every
+day, so its CAGR averages hundreds of decisions. A 6-slot breakout book may take 100
+trades in two years — at that count CAGR is mostly noise, while the exit mix is not.
+`expectancy_R` (mean profit per trade in units of risk) is the only scale on which two
+configurations with *different stop widths* are comparable at all.
+
+The R sweep on the bundled synthetic universe shows the shape to expect:
+
+| `r_mult` | trades | hit rate | expectancy | stopped | took profit | timed out |
+|---|---|---|---|---|---|---|
+| 0.5 | 159 | 21% | **+0.39R** | 75% | 15% | 10% |
+| 1.0 *(notebook)* | 120 | 31% | +0.35R | 54% | 22% | 24% |
+| 1.5 | 110 | 38% | +0.26R | 37% | 17% | 46% |
+| 2.0 | 106 | 44% | +0.25R | 21% | 14% | 65% |
+| 3.0 | 113 | 44% | +0.13R | 2% | 7% | 91% |
+
+Widening the stop walks the book from stop-dominated to time-dominated and lifts the
+hit rate, while expectancy per unit of risk falls — you are paying for those extra
+winners with a wider risk unit, and past ~2.0 the stop has stopped being a stop at all.
+**These are synthetic numbers and prove nothing about markets**; the table is here to
+show what the harness reports, not what to set.
+
+`r_mult` and `use_var_cap` are new parameters, added because the default exit mix came
+back 54% `stop_R`. R is `min(|entry × Var95|, gap/2 + ADR/2)`, and the Var95 cap
+usually binds — Var95 on a volatile name is a single bad session, which a breakout
+routinely gives back before it works.
+
+**Cost of each look-ahead path.** `lookahead_cost()` prices the notebook's three leaks
+one at a time, so you can see what its results were worth that a live trader could not
+have had:
+
+```python
+lookahead_cost(hourly, wl, prices["BOXX"])   # 5 rows: causal, notebook, and each leak alone
+```
+
+Don't read a small gap on synthetic bars as "the leak was harmless" — generated prices
+have no real pivot structure for `find_peaks` to exploit, so knowing future peaks buys
+little there. On real bars, where a level genuinely marks where a stock turned, expect
+more. That table exists to measure it on *your* data.
+
+**Sweeps are not cheap, and the harness knows it.** Generating candidates is the
+expensive half (levels are re-derived per name per week) and depends only on
+`BreakoutParams`. Rows are grouped by their signal parameters, candidates are generated
+once per group, and every `WeeklyBookParams` variation reuses them — so sweeping
+`n_slots` or `watchlist_size` costs one generation for the whole column. Measured on
+the synthetic fixture that is **~4× faster** than the naive loop. A test asserts a
+cached row is identical to running the book from scratch.
+
 **What the no-refill rule costs.** A slot freed on Tuesday sits in cash until Friday
 however many watchlist names break out on Wednesday, so average exposure runs well
 below 100% and the book is structurally part-invested. That is the scenario as
@@ -487,7 +550,7 @@ qbs/
                   sweep_vix(), sweep_target_vol()
 run_backtest.py   CLI
 notebooks/backtest_visualization.ipynb
-tests/test_qbs.py 89 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 98 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```

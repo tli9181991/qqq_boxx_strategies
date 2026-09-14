@@ -1185,3 +1185,114 @@ def test_breakout_result_summarises_like_any_other_strategy():
     assert s["Ann. turnover"] > 0, "a book that trades must report turnover"
     assert bk.result.equity.index[0] >= min(wl), \
         "the book must not be priced before its first watchlist"
+
+
+# --------------------------------------------------------------------------
+# The breakout sweep harness
+# --------------------------------------------------------------------------
+
+def test_sweep_matches_running_the_book_directly():
+    """The sweep reuses one candidate set across book variations. That is only
+    sound if a cached row is identical to running the book from scratch."""
+    from qbs.breakout import sweep_breakout, weekly_breakout_book, trade_stats
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    sw = sweep_breakout(hourly, wl, safe, {"n_slots": [4, 6]}, progress=False)
+
+    for n in (4, 6):
+        direct = weekly_breakout_book(hourly, wl, safe, BreakoutParams(),
+                                      WeeklyBookParams(n_slots=n))
+        row = sw[sw["n_slots"] == n].iloc[0]
+        assert row["n_trades"] == trade_stats(direct.trades)["n_trades"]
+        assert abs(row["CAGR"] - summarise(direct.result)["CAGR"]) < 1e-12
+
+
+def test_allocate_slots_does_not_mutate_its_candidates():
+    """Candidate reuse depends on allocation being non-destructive."""
+    from qbs.breakout import candidate_trades, allocate_slots
+    from qbs.config import BreakoutParams, WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    cands = candidate_trades(hourly, wl, BreakoutParams())
+    before = [(t.ticker, t.entry_time, t.exit_time, t.R) for t in cands]
+    allocate_slots(cands, wl, WeeklyBookParams(n_slots=3))
+    allocate_slots(cands, wl, WeeklyBookParams(n_slots=9))
+    after = [(t.ticker, t.entry_time, t.exit_time, t.R) for t in cands]
+    assert before == after
+
+
+def test_sweep_returns_one_row_per_combination():
+    from qbs.breakout import sweep_breakout
+
+    hourly, wl, safe = _breakout_inputs()
+    sw = sweep_breakout(hourly, wl, safe,
+                        {"r_mult": [1.0, 2.0], "n_slots": [4, 6]}, progress=False)
+    assert len(sw) == 4
+    assert set(sw.columns) >= {"r_mult", "n_slots", "n_trades", "expectancy_R",
+                               "pct_stop", "CAGR"}
+
+
+def test_sweep_rejects_a_parameter_that_does_not_exist():
+    """A typo'd key would otherwise sweep nothing and silently report the
+    base case four times, which looks like a flat parameter."""
+    from qbs.breakout import sweep_breakout
+
+    hourly, wl, safe = _breakout_inputs()
+    try:
+        sweep_breakout(hourly, wl, safe, {"confirm_hrs": [1, 2]}, progress=False)
+    except ValueError:
+        return
+    raise AssertionError("an unknown grid key must raise")
+
+
+def test_wider_stops_produce_fewer_stop_outs():
+    """`r_mult` is the dial for the stop-heavy exit mix -- it must actually
+    move the mix, or the knob is decorative."""
+    from qbs.breakout import sweep_breakout
+
+    hourly, wl, safe = _breakout_inputs()
+    sw = sweep_breakout(hourly, wl, safe, {"r_mult": [0.5, 1.0, 2.0]},
+                        progress=False).sort_values("r_mult")
+    assert sw["pct_stop"].is_monotonic_decreasing, \
+        "widening R must reduce the share of trades stopped out"
+
+
+def test_sweeping_watchlist_size_actually_truncates():
+    from qbs.breakout import sweep_breakout
+    from qbs.config import WeeklyBookParams
+
+    hourly, wl, safe = _breakout_inputs()
+    # n_slots below the shortest watchlist, or WeeklyBookParams rejects the pair.
+    sw = sweep_breakout(hourly, wl, safe, {"watchlist_size": [2, 8]},
+                        book=WeeklyBookParams(n_slots=2),
+                        progress=False).sort_values("watchlist_size")
+    assert sw["n_trades"].iloc[0] < sw["n_trades"].iloc[1], \
+        "a shorter watchlist must offer fewer names to trade"
+
+
+def test_trade_stats_handles_an_empty_book():
+    from qbs.breakout import trade_stats
+
+    s = trade_stats(pd.DataFrame(columns=["exit_time", "reason", "R_multiple"]))
+    assert s["n_trades"] == 0 and np.isnan(s["expectancy_R"])
+
+
+def test_lookahead_cost_prices_every_switch():
+    from qbs.breakout import lookahead_cost
+
+    hourly, wl, safe = _breakout_inputs()
+    tbl = lookahead_cost(hourly, wl, safe, progress=False)
+    assert len(tbl) == 5
+    assert tbl["variant"].iloc[0] == "causal (default)"
+    assert tbl["n_trades"].min() > 0
+
+
+def test_r_multiple_is_profit_in_units_of_risk():
+    from qbs.breakout import Trade
+
+    t = Trade(ticker="X", entry_time=pd.Timestamp("2025-01-02"), entry_price=100.0,
+              level=99.0, R=5.0, ADR=1.0,
+              exit_time=pd.Timestamp("2025-01-09"), exit_price=110.0, reason="tp")
+    assert abs(t.r_multiple - 2.0) < 1e-12
+    assert np.isnan(Trade("X", pd.Timestamp("2025-01-02"), 100.0, 99.0, 5.0, 1.0).r_multiple)
