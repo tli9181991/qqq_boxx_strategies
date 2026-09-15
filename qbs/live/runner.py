@@ -641,6 +641,57 @@ def phase_baseline(live: LiveConfig, capture: bool = False,
     return EXIT_OK
 
 
+def phase_ledger(live: LiveConfig, rebuild: bool = False,
+                 force: bool = False) -> int:
+    """Show the strategy's tallied book, or rebuild it from the run log.
+
+    Rebuilding matters because the ledger only starts recording once
+    `position_source` is "ledger". Switch to it after the strategy has already
+    traded and the ledger is empty while the account is not: the strategy reads
+    its own book as flat and buys the whole thing again. Every fill is already
+    in the run log, so the tally can be reconstructed exactly.
+    """
+    from qbs.live.broker import BrokerError, IBBroker
+
+    path = live.ledger_path
+    if rebuild:
+        if os.path.exists(path) and not force:
+            log.error(
+                "%s already exists. Rebuilding replaces it wholesale -- rows "
+                "reconstructed from the run log carry no execution id, so they "
+                "cannot be merged with rows that have one without double "
+                "counting. Pass --force once you have looked at the file.", path)
+            return EXIT_CONFIG
+        ldg.rebuild_from_db(live.db_path, path)
+
+    mine = ldg.positions(path)
+    account: Dict[str, int] = {}
+    try:
+        with IBBroker(live) as broker:
+            account = broker.positions()
+    except BrokerError as exc:
+        log.warning("could not read the account (%s); showing the ledger alone", exc)
+
+    residual, over = ldg.reconcile_against_account(mine, account) if account \
+        else ({}, {})
+
+    print(f"\n{'symbol':<8}{'ledger':>10}{'account':>10}{'residual':>10}")
+    for sym in sorted(set(mine) | set(account)):
+        print(f"{sym:<8}{mine.get(sym, 0):>10}{account.get(sym, 0):>10}"
+              f"{residual.get(sym, 0):>10}")
+    if not (mine or account):
+        print("(the ledger is empty and the account is flat)")
+    if over:
+        print("\nMISMATCH: the ledger claims more than the account holds: "
+              f"{dict(sorted(over.items()))}")
+    print(f"\nledger file: {path}")
+    if not mine and account:
+        print("\nThe ledger is empty while the account is not. With "
+              "position_source=ledger the strategy would read its book as flat "
+              "and buy it all again.\nRebuild first:  runner ledger --rebuild")
+    return EXIT_OK
+
+
 def phase_sheets(live: LiveConfig) -> int:
     """Mirror the run log into a Google Sheet. Touches no broker.
 
@@ -681,7 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("phase",
                    choices=["preflight", "trade", "reconcile", "signal", "report",
-                            "baseline", "sheets"],
+                            "baseline", "sheets", "ledger"],
                    help="which phase to run. 'signal' prints the target book and "
                         "exits, touching no broker; 'report' prints the run log "
                         "and touches neither broker nor network")
@@ -696,7 +747,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true",
                    help="trade: trade even if the feed has no bar for today "
                         "(debugging only). baseline: overwrite an existing "
-                        "baseline, recording the strategy's own positions as yours")
+                        "baseline, recording the strategy's own positions as "
+                        "yours. ledger: replace an existing ledger on --rebuild")
+    p.add_argument("--rebuild", action="store_true",
+                   help="ledger: reconstruct the tally from the fills already "
+                        "recorded in the run log")
     p.add_argument("--capture", action="store_true",
                    help="baseline: record the account's current holdings as "
                         "yours, so the strategy never sells them")
@@ -746,6 +801,8 @@ def main(argv=None) -> int:
         return phase_baseline(live, capture=args.capture, force=args.force)
     if args.phase == "sheets":
         return phase_sheets(live)
+    if args.phase == "ledger":
+        return phase_ledger(live, rebuild=args.rebuild, force=args.force)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":

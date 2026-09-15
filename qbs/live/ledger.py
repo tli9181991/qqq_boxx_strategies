@@ -112,6 +112,54 @@ def append_fills(path: str, session_date: str, fills: Iterable) -> int:
     return len(new)
 
 
+def rebuild_from_db(db_path: str, ledger_path: str) -> int:
+    """Reconstruct the ledger from the fills already in the run log.
+
+    Needed because the ledger only starts recording once `position_source` is
+    set to "ledger", and the natural moment to set it -- while the account is
+    flat -- is easy to miss. Switching afterwards with an empty ledger is worse
+    than not switching: the strategy reads its own book as flat, sees no
+    positions to rebalance, and buys the entire book a second time.
+
+    Every fill the reconcile phase has ever seen is already in `trade_events`,
+    so the ledger can be rebuilt exactly. Writes the file whole rather than
+    appending: rows rebuilt from the database carry no execution id, so
+    appending them next to rows that have one would double-count the same fill.
+    """
+    from .store import connect
+
+    with connect(db_path) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT session_date, symbol, action, quantity, price, order_id "
+            "FROM trade_events WHERE event='filled' AND COALESCE(dry_run,0)=0 "
+            "AND symbol IS NOT NULL ORDER BY id")]
+
+    os.makedirs(os.path.dirname(ledger_path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ledger_path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=COLUMNS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({
+                    "timestamp": utc_now_iso(),
+                    "session_date": r["session_date"],
+                    "symbol": str(r["symbol"]).upper(),
+                    "side": str(r["action"] or "").upper(),
+                    "quantity": f"{float(r['quantity'] or 0):g}",
+                    "price": f"{float(r['price'] or 0):.4f}",
+                    "order_id": r["order_id"] or "",
+                    "exec_id": "",      # not recorded in the run log
+                })
+        os.replace(tmp, ledger_path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    log.info("ledger: rebuilt %s from %d recorded fill(s)", ledger_path, len(rows))
+    return len(rows)
+
+
 def _key(exec_id, session_date, symbol, side, quantity, order_id) -> str:
     if exec_id:
         return f"id:{exec_id}"

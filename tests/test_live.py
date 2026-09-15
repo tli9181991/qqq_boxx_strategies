@@ -1387,3 +1387,61 @@ def test_the_key_defaults_into_the_gitignored_state_dir(tmp_path):
 
     live.sheets_key_file = "/etc/qbs/sa.json"
     assert live.sheets_key_path == "/etc/qbs/sa.json"
+
+
+def test_the_ledger_can_be_rebuilt_from_the_recorded_fills(db, tmp_path):
+    """Switching to position_source=ledger after trading needs a seed.
+
+    An empty ledger beside a non-empty account is the dangerous state: the
+    strategy reads its own book as flat and buys the whole thing again.
+    """
+    from qbs.live import ledger
+    from qbs.live.broker import Fill
+
+    store.log_fills(db, "2026-09-14", [
+        Fill("MU", "BUY", 6, 924.41, "Filled", 11),
+        Fill("MRVL", "BUY", 27, 218.90, "Filled", 12),
+        Fill("BOXX", "BUY", 539, 118.17, "Filled", 13)])
+
+    path = str(tmp_path / "strategy_trades.csv")
+    assert ledger.rebuild_from_db(db, path) == 3
+    assert ledger.positions(path) == {"MU": 6, "MRVL": 27, "BOXX": 539}
+
+
+def test_a_rebuild_ignores_dry_run_orders(db, tmp_path):
+    from qbs.live import ledger
+    from qbs.live.orders import Order
+
+    store.log_orders(db, "2026-09-11", "trade", [Order("MU", "BUY", 6, 974.27)],
+                     {"MU": "DryRun"}, dry_run=True)
+    path = str(tmp_path / "strategy_trades.csv")
+
+    assert ledger.rebuild_from_db(db, path) == 0
+    assert ledger.positions(path) == {}
+
+
+def test_a_rebuild_replaces_rather_than_appends(db, tmp_path):
+    """Rebuilt rows have no execution id, so merging them would double count."""
+    from qbs.live import ledger
+    from qbs.live.broker import Fill
+
+    store.log_fills(db, "2026-09-14", [Fill("MU", "BUY", 6, 924.41, "Filled", 11)])
+    path = str(tmp_path / "strategy_trades.csv")
+
+    ledger.rebuild_from_db(db, path)
+    ledger.rebuild_from_db(db, path)
+
+    assert ledger.positions(path) == {"MU": 6}
+
+
+def test_rebuild_refuses_to_clobber_an_existing_ledger_without_force(db, tmp_path):
+    from qbs.live import runner
+    from qbs.live.broker import Fill
+
+    live = LiveConfig(state_dir=str(tmp_path))
+    ldg_path = live.ledger_path
+    open(ldg_path, "w").write("timestamp,session_date,symbol,side,quantity,"
+                              "price,order_id,exec_id\n")
+
+    rc = runner.phase_ledger(live, rebuild=True, force=False)
+    assert rc == runner.EXIT_CONFIG

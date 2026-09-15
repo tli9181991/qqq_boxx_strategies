@@ -330,6 +330,17 @@ the reconcile unit fail, and is cross-checked on every run.
 QBS_POSITION_SOURCE=ledger
 ```
 
+Switch it on **while the account is flat**. That is the only moment a tally
+starts from a guaranteed-correct zero. Switching later leaves an empty ledger
+beside a non-empty account, and the strategy then reads its own book as flat
+and buys the whole thing a second time. If you have already traded, seed it
+from the fills the run log has been recording all along:
+
+```bash
+$C run --rm --no-deps qbs ledger --rebuild     # reconstruct from the run log
+$C run --rm --no-deps qbs ledger               # ledger vs account, side by side
+```
+
 `var/strategy_trades.csv` is appended from IB's own execution records at
 reconcile — never from orders sent, so an order that did not fill leaves no row.
 Rows are keyed on IB's execution id, so re-running reconcile after a failure
