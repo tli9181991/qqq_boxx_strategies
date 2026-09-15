@@ -1,0 +1,12 @@
+# Streamlit dashboard (dashboard/app.py)
+#
+#   pip install -r requirements.txt -r requirements-dashboard.txt
+#   streamlit run dashboard/app.py
+#
+# The app reads only the CSV cache in data/ and never touches the network, so
+# build the cache first with `python run_backtest.py`.
+
+streamlit>=1.40
+
+# Support/resistance levels for the breakout strategy's picks.
+scipy>=1.10

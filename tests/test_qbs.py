@@ -1503,3 +1503,174 @@ def test_finviz_high_band_floor_defaults_to_the_notebook_rule():
     b = finviz_momentum_screen(uni, safe,
                                FinvizScreenParams(n_hold=6, min_off_high_pct=0.0))
     pd.testing.assert_frame_equal(a.weights, b.weights)
+
+
+# --------------------------------------------------------------------------
+# Market breadth (qbs/breadth.py)
+# --------------------------------------------------------------------------
+
+def _breadth_frame():
+    idx = pd.bdate_range("2024-01-01", periods=120)
+    rng = np.random.default_rng(4)
+    data = {f"S{i}": 100 * np.exp(np.cumsum(rng.normal(0.0008, 0.02, len(idx))))
+            for i in range(25)}
+    return pd.DataFrame(data, index=idx)
+
+
+def test_breadth_counts_four_percent_movers_exactly():
+    from qbs.breadth import daily_breadth
+
+    idx = pd.bdate_range("2024-01-01", periods=60)
+    # A rises 5% a day, B falls 5% a day, C is flat.
+    px = pd.DataFrame({
+        "A": 100 * 1.05 ** np.arange(len(idx)),
+        "B": 100 * 0.95 ** np.arange(len(idx)),
+        "C": np.full(len(idx), 100.0),
+    }, index=idx)
+    r = daily_breadth(px)
+    assert (r.table["up4"] == 1).all(), "exactly one name gains 4%+ each day"
+    assert (r.table["dn4"] == 1).all()
+    assert (r.table["n_stocks"] == 3).all()
+
+
+def test_breadth_percent_above_ma_is_a_percentage():
+    from qbs.breadth import daily_breadth
+
+    r = daily_breadth(_breadth_frame())
+    for col in ("pct_above_fast", "pct_above_slow"):
+        assert r.table[col].between(0, 100).all()
+    # A monotonically rising frame must sit fully above both averages.
+    idx = pd.bdate_range("2024-01-01", periods=120)
+    rising = pd.DataFrame({"A": np.arange(1.0, len(idx) + 1.0),
+                           "B": np.arange(2.0, len(idx) + 2.0)}, index=idx)
+    up = daily_breadth(rising)
+    assert np.allclose(up.table["pct_above_fast"], 100.0)
+    assert np.allclose(up.table["pct_above_slow"], 100.0)
+
+
+def test_atr_distance_matches_a_hand_computation():
+    from qbs.breadth import atr_distance
+
+    idx = pd.bdate_range("2024-01-01", periods=80)
+    close = pd.Series(np.linspace(100, 140, len(idx)), index=idx)
+    high, low = close + 1.0, close - 1.0
+    d = atr_distance(close, high, low, ema_span=50, atr_window=14)
+
+    ema = close.ewm(span=50, adjust=False).mean()
+    prev = close.shift()
+    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()], axis=1).max(axis=1)
+    expected = (close - ema) / tr.rolling(14).mean()
+    pd.testing.assert_series_equal(d.dropna(), expected.dropna())
+
+
+def test_atr_distance_without_highs_overstates_the_stretch():
+    """No high/low collapses the true range to the close-to-close move, which
+    is smaller -- so the distance in ATR units comes out LARGER. The docstring
+    claims it is an upper bound; this pins that."""
+    from qbs.breadth import atr_distance
+
+    idx = pd.bdate_range("2024-01-01", periods=90)
+    close = pd.Series(np.linspace(100, 150, len(idx)), index=idx)
+    wide = atr_distance(close, close + 3.0, close - 3.0)
+    narrow = atr_distance(close)
+    assert (narrow.dropna().abs() >= wide.dropna().abs() - 1e-9).all()
+
+
+def test_leader_mask_turnover_leg_only_removes_names():
+    from qbs.breadth import leader_mask
+
+    px = _breadth_frame()
+    without = leader_mask(px)
+    vol = pd.DataFrame(1.0, index=px.index, columns=px.columns)   # tiny turnover
+    with_vol = leader_mask(px, volumes=vol)
+    assert (with_vol & ~without).sum().sum() == 0, "volume cannot admit a name"
+    assert with_vol.sum().sum() < without.sum().sum(), "a $1 turnover must exclude"
+
+
+def test_sector_breakdown_shares_and_excess_are_consistent():
+    from qbs.breadth import sector_breakdown
+
+    px = _breadth_frame()
+    sectors = {t: ("Tech" if i % 3 == 0 else "Health" if i % 3 == 1 else "Energy")
+               for i, t in enumerate(px.columns)}
+    tbl = sector_breakdown(px, sectors)
+    if tbl.empty:
+        return                      # no leaders on this fixture; nothing to check
+    assert abs(tbl["share_pct"].sum() - 100.0) < 1e-9
+    assert np.allclose(tbl["excess_pp"], tbl["share_pct"] - tbl["pool_pct"])
+    assert tbl["penetration"].between(0, 100).all()
+
+
+def test_sector_breakdown_without_a_map_returns_empty():
+    """Rather than invent a classification, which a dashboard would render as
+    fact."""
+    from qbs.breadth import sector_breakdown
+
+    assert sector_breakdown(_breadth_frame(), {}).empty
+
+
+def test_breadth_classifiers_hit_their_thresholds():
+    from qbs.breadth import BreadthParams, atr_class, ma_class, pulse_class
+
+    p = BreadthParams()
+    assert pulse_class(p.pulse_strong, "up") == "up_strong"
+    assert pulse_class(p.pulse_strong - 1, "up") == "up"
+    assert pulse_class(p.pulse_strong, "down") == "down_strong"
+
+    assert ma_class(5.0, "fast") == "extreme_low"
+    assert ma_class(95.0, "fast") == "extreme_high"
+    assert ma_class(50.0, "fast") == "mid"
+    assert ma_class(15.0, "slow") == "extreme_low"      # slow floor is 20
+    assert ma_class(float("nan"), "fast") == "none"
+
+    assert atr_class(6.0) == "stretched"
+    assert atr_class(-6.0) == "oversold"
+    assert atr_class(0.0) == "normal"
+
+
+def test_breadth_reports_what_it_could_not_measure():
+    """The UI relies on these flags to decide what to leave blank."""
+    from qbs.breadth import daily_breadth
+
+    px = _breadth_frame()
+    bare = daily_breadth(px)
+    assert bare.has_volume is False and bare.has_index is False
+    rich = daily_breadth(px, qqq=px["S0"],
+                         volumes=pd.DataFrame(1e9, index=px.index, columns=px.columns))
+    assert rich.has_volume is True and rich.has_index is True
+    assert rich.n_stocks == px.shape[1]
+
+
+def test_breadth_does_not_report_zero_during_warm_up():
+    """`px > NaN` is False, not NaN, so counting it reports "0% above the
+    50-day" for the first 49 sessions -- which reads on a chart as a total
+    collapse of breadth at the left edge of every series. Warm-up rows must be
+    absent, never zero."""
+    from qbs.breadth import BreadthParams, daily_breadth
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2024-01-01", periods=120)
+    rising = pd.DataFrame({"A": np.arange(1.0, 121.0),
+                           "B": np.arange(2.0, 122.0)}, index=idx)
+    r = daily_breadth(rising, p=p)
+
+    assert len(r.table) == len(idx) - p.ma_slow + 1, "warm-up rows must be dropped"
+    assert r.table.index[0] == idx[p.ma_slow - 1]
+    assert (r.table["pct_above_slow"] > 0).all(), "a rising market is never 0%"
+    assert np.allclose(r.table["pct_above_slow"], 100.0)
+
+
+def test_breadth_ma_denominator_excludes_names_without_an_average():
+    """A name too young to have the average must not sit in the denominator
+    dragging the percentage down."""
+    from qbs.breadth import BreadthParams, daily_breadth
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2024-01-01", periods=120)
+    px = pd.DataFrame({"OLD": np.arange(1.0, 121.0),
+                       "YOUNG": np.nan}, index=idx)
+    px.iloc[-5:, px.columns.get_loc("YOUNG")] = np.arange(1.0, 6.0)
+
+    r = daily_breadth(px, p=p)
+    # YOUNG never has a 50-day average, so every row is 100% on OLD alone.
+    assert np.allclose(r.table["pct_above_slow"], 100.0)

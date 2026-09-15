@@ -667,10 +667,13 @@ qbs/
   plotting.py     the chart system
   pipeline.py     load -> signals -> backtest in one call; sweep_band(),
                   sweep_vix(), sweep_target_vol()
+  breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
+                  ATR units, momentum leaders and their sector concentration
 run_backtest.py   CLI
+dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 110 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 121 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -769,6 +772,43 @@ makes a missed session self-healing; never replay one by hand.
   Benchmarks sit outside that set in grey so they never compete with a strategy.
 - **Identity is never colour alone** — legend *and* direct end-labels on every
   multi-series chart; buy/sell markers differ in shape as well as hue.
+
+---
+
+## Dashboard
+
+```bash
+pip install -r requirements.txt -r requirements-dashboard.txt
+streamlit run dashboard/app.py
+```
+
+Two tabs:
+
+- **Daily picks** — what each of the three selection strategies held on any chosen
+  day, the entries and exits that changed it, the momentum ∩ Finviz overlap, and a
+  downloadable history table.
+- **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
+  20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
+  momentum-leader group with its count trend.
+
+It reads **only the CSV cache in `data/`** and never touches the network, so run
+`python run_backtest.py` once first.
+
+> ⚠️ **The market tab samples ~99 Nasdaq-100 constituents, not the US market.** The
+> commercial dashboards this mirrors sample ~2,400 US common stocks and ADRs. The
+> arithmetic is identical; the readings are not comparable. A count of names up 4% out
+> of 99 mega-caps measures something different from the same count out of 2,432 — it is
+> not a smaller version of the same number. The app repeats its own sample size on
+> every screen for that reason.
+
+Three panels are deliberately **left blank rather than approximated**, because the data
+to fill them honestly is not in this repo:
+
+| Panel | Needs |
+|---|---|
+| Sector concentration | a `ticker → sector` map. `breadth.sector_breakdown()` is written and works the moment you pass one |
+| Turnover leg of the leader screen | share volume. Without it the leader count is an over-estimate, and the app says so |
+| SPY column, S&P 500 level | an index this package does not cache (it holds QQQ) |
 
 ---
 
