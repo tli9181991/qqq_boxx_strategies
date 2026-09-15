@@ -188,22 +188,22 @@ def load_us_market(download_start: str, online: bool, force: bool, _token: int):
     looks entirely plausible.
     """
     filters = UniverseFilters()
-    uni = fetch_us_universe(filters, refresh=force, offline=not online,
-                            verbose=False)
+    uni, uni_err = fetch_us_universe(filters, refresh=force, offline=not online,
+                                     verbose=False)
     if uni is None or uni.empty:
-        return None, None, {}, filters.label, (
-            "no Finviz universe available — it needs one online fetch to build "
-            "its cache (`finvizfinance` installed, network reachable)")
+        return None, None, {}, filters.label, uni_err or "unknown failure"
 
     tickers = uni["Ticker"].tolist()
-    closes, volumes = load_universe_bars(tickers, start=download_start,
-                                         refresh=force, offline=not online,
-                                         verbose=False)
+    closes, volumes, bars_err = load_universe_bars(
+        tickers, start=download_start, refresh=force, offline=not online,
+        verbose=False)
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
-            f"Finviz listed {len(tickers)} tickers but no price history could "
-            "be loaded for them")
-    return closes, volumes, sector_map(uni), filters.label, None
+            f"Finviz listed {len(tickers)} tickers but no prices loaded — {bars_err}")
+
+    # A partial fetch is usable; a silent one is not. Carry the warning up.
+    warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
+    return closes, volumes, sector_map(uni), filters.label, warn
 
 
 EMA_SPANS = (10, 20, 50, 200)
@@ -562,12 +562,20 @@ with tab_market:
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
         breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols)
+        if mkt_err:                      # loaded, but not cleanly
+            st.warning(f"**Partial US universe.** {mkt_err}", icon="⚠️")
     else:
         if use_us:
             st.error(
-                f"**Falling back to the Nasdaq-100.** {mkt_err} — so the numbers "
-                "below are an index, not the market. Switch **Source** to Online "
-                "and press **Refresh now** to build the US universe.", icon="🚫")
+                f"**Falling back to the Nasdaq-100** — the numbers below are an "
+                f"index, not the market.\n\n**Reason:** {mkt_err}", icon="🚫")
+            st.caption(
+                "Streamlit hides tracebacks, so if that reason is not enough, run "
+                "`python -m qbs.finviz` in the same environment as this app: it "
+                "checks the interpreter, the package, the filters, the screener "
+                "and yfinance in order and names the step that breaks. The most "
+                "common cause is `finvizfinance` being installed in a notebook or "
+                "on Colab rather than for the interpreter running Streamlit.")
         else:
             st.warning(
                 f"**Measuring {uni.shape[1]} Nasdaq-100 constituents, not the US "

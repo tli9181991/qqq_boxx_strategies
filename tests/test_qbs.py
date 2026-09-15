@@ -1882,8 +1882,8 @@ def test_fetch_us_universe_parses_and_normalises():
     try:
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "u.csv")
-            out = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
-            assert out is not None
+            out, err = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
+            assert err is None and out is not None
             assert list(out["Ticker"]) == ["BRK-B", "AAPL"], "upper, dots->dashes, deduped"
             assert os.path.exists(path), "result must be cached"
     finally:
@@ -1907,8 +1907,9 @@ def test_fetch_us_universe_falls_back_to_cache_on_failure():
                  sys.modules.get("finvizfinance.screener.overview")}
         sys.modules["finvizfinance.screener.overview"] = broken
         try:
-            out = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
+            out, err = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
             assert out is not None and list(out["Ticker"]) == ["AAPL"]
+            assert err and "rate limited" in err, "the real reason must survive"
         finally:
             _restore(saved)
 
@@ -1918,8 +1919,10 @@ def test_fetch_us_universe_offline_without_cache_is_none():
     from qbs.finviz import fetch_us_universe
 
     with tempfile.TemporaryDirectory() as d:
-        assert fetch_us_universe(offline=True, verbose=False,
-                                 cache_path=os.path.join(d, "u.csv")) is None
+        out, err = fetch_us_universe(offline=True, verbose=False,
+                                     cache_path=os.path.join(d, "u.csv"))
+        assert out is None
+        assert err and "offline" in err, "must say WHY, not just fail"
 
 
 def test_sector_map_is_empty_rather_than_unclassified():
@@ -1940,8 +1943,10 @@ def test_load_universe_bars_offline_without_cache_is_none():
     from qbs.finviz import load_universe_bars
 
     with tempfile.TemporaryDirectory() as d:
-        c, v = load_universe_bars(["AAPL"], cache_dir=d, offline=True, verbose=False)
+        c, v, err = load_universe_bars(["AAPL"], cache_dir=d, offline=True,
+                                       verbose=False)
         assert c is None and v is None
+        assert err and "offline" in err
 
 
 def test_load_universe_bars_reads_both_cached_frames():
@@ -1954,8 +1959,45 @@ def test_load_universe_bars_reads_both_cached_frames():
             .to_csv(os.path.join(d, "us_closes.csv"))
         pd.DataFrame({"AAPL": 10, "MSFT": 20}, index=idx).rename_axis("Date") \
             .to_csv(os.path.join(d, "us_volumes.csv"))
-        c, v = load_universe_bars(["AAPL", "MSFT"], cache_dir=d, offline=True,
-                                  verbose=False)
-        assert c is not None and v is not None
+        c, v, err = load_universe_bars(["AAPL", "MSFT"], cache_dir=d, offline=True,
+                                       verbose=False)
+        assert c is not None and v is not None and err is None
         assert list(c.columns) == ["AAPL", "MSFT"] and len(c) == 6
         assert (v["MSFT"] == 20).all()
+
+
+def test_fetch_us_universe_names_a_missing_package():
+    """The commonest failure by far: installed in a notebook or on Colab, not
+    for the interpreter running Streamlit. The message has to say that."""
+    import tempfile, os, sys, builtins
+    from qbs.finviz import fetch_us_universe
+
+    real_import = builtins.__import__
+
+    def _no_finviz(name, *a, **k):
+        if name.startswith("finvizfinance"):
+            raise ImportError("No module named 'finvizfinance'")
+        return real_import(name, *a, **k)
+
+    dropped = {k: sys.modules.pop(k) for k in list(sys.modules)
+               if k.startswith("finvizfinance")}
+    builtins.__import__ = _no_finviz
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            out, err = fetch_us_universe(cache_path=os.path.join(d, "u.csv"),
+                                         verbose=False)
+            assert out is None
+            assert "not installed" in err
+            assert "requirements-dashboard" in err
+    finally:
+        builtins.__import__ = real_import
+        sys.modules.update(dropped)
+
+
+def test_diagnose_reports_each_step():
+    from qbs.finviz import diagnose
+
+    steps = diagnose(verbose=False)
+    assert "python" in steps and "finvizfinance" in steps
+    # Whatever the outcome, every reported step must carry a verdict.
+    assert all(isinstance(v, str) and v for v in steps.values())

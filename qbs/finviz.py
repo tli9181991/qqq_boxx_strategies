@@ -78,11 +78,15 @@ def fetch_us_universe(
     max_age_days: int = 1,
     sleep_sec: int = 1,
     verbose: bool = True,
-) -> Optional[pd.DataFrame]:
-    """Ticker / Sector / Industry / Country for the broad US universe.
+) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """`(universe, error)` -- Ticker / Sector / Industry / Country for the US market.
 
-    Returns None rather than raising when it cannot be had -- the caller is a
-    dashboard that falls back to the cached index universe and says so.
+    Returns `(None, reason)` rather than raising: the caller is a dashboard
+    that falls back to the cached index universe. But it returns the REASON,
+    which the first version did not -- it only printed when `verbose`, and the
+    dashboard calls it with `verbose=False`, so every failure surfaced as the
+    same useless "not available" message no matter what actually went wrong.
+    A failure you cannot diagnose from the screen is a failure you cannot fix.
 
     The cache is reused while it is younger than `max_age_days`. Membership of
     "every liquid US common stock" moves slowly; re-scraping 120 pages on
@@ -100,14 +104,25 @@ def fetch_us_universe(
             cached = None
 
     if offline:
-        return cached if cached is not None and not cached.empty else None
+        if cached is not None and not cached.empty:
+            return cached, None
+        return None, ("offline and no cached universe on disk — run once with "
+                      "Source set to Online to build it")
     if cached is not None and not cached.empty and not refresh and (age or 0) <= max_age_days:
         if verbose:
             print(f"[finviz] universe cache hit: {len(cached)} tickers ({age}d old)")
-        return cached
+        return cached, None
 
     try:
-        from finvizfinance.screener.overview import Overview
+        try:
+            from finvizfinance.screener.overview import Overview
+        except ImportError as exc:
+            raise RuntimeError(
+                "finvizfinance is not installed in the environment running this "
+                "app. Install it with `pip install -r requirements-dashboard.txt` "
+                "(installing it in a notebook or Colab does not help here -- it "
+                f"has to be the same interpreter running Streamlit). [{exc}]"
+            ) from exc
 
         view = Overview()
         view.set_filter(filters_dict=filters.as_dict())
@@ -130,11 +145,14 @@ def fetch_us_universe(
         if verbose:
             print(f"[finviz] {len(out)} tickers · {out['Sector'].nunique()} sectors"
                   if "Sector" in out.columns else f"[finviz] {len(out)} tickers")
-        return out
+        return out, None
     except Exception as exc:  # noqa: BLE001
+        reason = f"{type(exc).__name__}: {exc}"
         if verbose:
-            print(f"[finviz] universe fetch failed ({exc})")
-        return cached if cached is not None and not cached.empty else None
+            print(f"[finviz] universe fetch failed ({reason})")
+        if cached is not None and not cached.empty:
+            return cached, f"using a stale cached universe — live fetch failed ({reason})"
+        return None, reason
 
 
 def sector_map(universe: Optional[pd.DataFrame]) -> Dict[str, str]:
@@ -160,8 +178,8 @@ def load_universe_bars(
     offline: bool = False,
     batch_size: int = 100,
     verbose: bool = True,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """`(closes, volumes)` for a wide universe, cached as two CSVs.
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
+    """`(closes, volumes, error)` for a wide universe, cached as two CSVs.
 
     Volume is kept because it arrives in the same yfinance response as the
     closes -- no extra network -- and it is the only thing standing between
@@ -172,7 +190,8 @@ def load_universe_bars(
     A batch that fails is reported and skipped rather than aborting the run:
     losing 40 names out of 2,400 is a slightly smaller sample, and the row
     still carries `n_stocks` so the reading stays honest. Losing all of them
-    returns `(None, None)`.
+    returns the reason, so the UI can say what went wrong instead of only
+    that something did.
     """
     os.makedirs(cache_dir, exist_ok=True)
     c_path = os.path.join(cache_dir, f"{prefix}_closes.csv")
@@ -191,18 +210,23 @@ def load_universe_bars(
     if offline or not refresh:
         c, v = _read()
         if offline:
-            return c, v
+            err = None if c is not None else (
+                "offline and no cached price frames on disk — run once with "
+                "Source set to Online to build them")
+            return c, v, err
         if c is not None and not c.empty:
-            return c, v
+            return c, v, None
 
     tickers = sorted({t for t in tickers if t})
     closes, volumes, failed = [], [], []
+    last_error = "unknown"
     try:
         import yfinance as yf
-    except ImportError:
+    except ImportError as exc:
         if verbose:
             print("[finviz] yfinance is not installed")
-        return _read()
+        c, v = _read()
+        return c, v, f"yfinance is not installed ({exc})"
 
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
@@ -223,6 +247,7 @@ def load_universe_bars(
                 volumes.append(v)
         except Exception as exc:  # noqa: BLE001
             failed.extend(batch)
+            last_error = f"{type(exc).__name__}: {exc}"
             if verbose:
                 print(f"[finviz] batch {i // batch_size + 1} failed ({exc})")
         if verbose and (i // batch_size) % 5 == 0:
@@ -231,7 +256,9 @@ def load_universe_bars(
     if not closes:
         if verbose:
             print("[finviz] no price data for any ticker")
-        return _read()
+        c, v = _read()
+        return c, v, (f"no price data returned for any of {len(tickers)} tickers "
+                      f"(every batch failed; last reason: {last_error})")
 
     cdf = pd.concat(closes, axis=1).sort_index()
     cdf = cdf.loc[:, ~cdf.columns.duplicated()]
@@ -254,4 +281,88 @@ def load_universe_bars(
     if verbose:
         print(f"[finviz] {cdf.shape[1]} tickers, {len(cdf)} rows"
               + (f" · no data for {len(set(failed))}" if failed else ""))
-    return cdf, vdf
+    warn = (f"{len(set(failed))} of {len(tickers)} tickers returned no data"
+            if failed else None)
+    return cdf, vdf, warn
+
+
+# --------------------------------------------------------------------------
+# Diagnostics
+# --------------------------------------------------------------------------
+
+def diagnose(verbose: bool = True) -> Dict[str, str]:
+    """Check every link in the chain and say which one is broken.
+
+    `python -m qbs.finviz`
+
+    Streamlit swallows tracebacks, so "the US universe is unavailable" on the
+    dashboard could be a missing package, a blocked network, a rate limit or
+    an empty result, and the screen cannot tell you which. This runs the same
+    steps outside Streamlit and names the failure.
+
+    The most common cause is the dullest: `finvizfinance` installed in a
+    notebook or on Colab is not installed for the interpreter running the app.
+    """
+    import sys
+
+    steps: Dict[str, str] = {}
+
+    steps["python"] = sys.executable
+    try:
+        import finvizfinance
+        steps["finvizfinance"] = f"OK (v{getattr(finvizfinance, '__version__', '?')})"
+    except ImportError as exc:
+        steps["finvizfinance"] = (
+            f"MISSING — {exc}. Fix: pip install -r requirements-dashboard.txt "
+            "using THIS interpreter")
+        if verbose:
+            _print_steps(steps)
+        return steps
+
+    try:
+        from finvizfinance.screener.overview import Overview
+        v = Overview()
+        v.set_filter(filters_dict=UniverseFilters().as_dict())
+        steps["filters"] = f"OK — {v.request_params.get('f')}"
+    except Exception as exc:  # noqa: BLE001
+        steps["filters"] = f"FAILED — {type(exc).__name__}: {exc}"
+        if verbose:
+            _print_steps(steps)
+        return steps
+
+    uni, err = fetch_us_universe(refresh=True, verbose=False)
+    if uni is None:
+        steps["screener"] = f"FAILED — {err}"
+        if verbose:
+            _print_steps(steps)
+        return steps
+    steps["screener"] = (f"OK — {len(uni)} tickers"
+                         + (f", {uni['Sector'].nunique()} sectors"
+                            if "Sector" in uni.columns else ", NO Sector column"))
+    steps["sector_map"] = f"{len(sector_map(uni))} tickers mapped to a sector"
+
+    try:
+        import yfinance as yf
+        probe = yf.download(uni["Ticker"].iloc[0], period="5d", progress=False,
+                            auto_adjust=True)
+        steps["yfinance"] = ("OK" if probe is not None and not probe.empty
+                             else "FAILED — empty response for a probe ticker")
+    except Exception as exc:  # noqa: BLE001
+        steps["yfinance"] = f"FAILED — {type(exc).__name__}: {exc}"
+
+    if verbose:
+        _print_steps(steps)
+    return steps
+
+
+def _print_steps(steps: Dict[str, str]) -> None:
+    width = max(len(k) for k in steps)
+    print("\nFinviz universe diagnostics")
+    print("-" * (width + 40))
+    for k, v in steps.items():
+        print(f"  {k:<{width}}  {v}")
+    print()
+
+
+if __name__ == "__main__":
+    diagnose()

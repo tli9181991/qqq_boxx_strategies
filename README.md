@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 140 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 142 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -853,7 +853,29 @@ that looks entirely plausible.**
 
 Turn the toggle **off** and it falls back to the cached Nasdaq-100 and says plainly
 that it is measuring an index, not the market. If the Finviz fetch fails it does the
-same thing with a red banner rather than quietly substituting the smaller universe.
+same thing with a red banner rather than quietly substituting the smaller universe —
+and the banner carries **the actual reason**, not a generic "unavailable".
+
+**If the US universe will not load:**
+
+```bash
+python -m qbs.finviz     # in the SAME environment that runs streamlit
+```
+
+Streamlit swallows tracebacks, so that check runs the same steps outside it and names
+the one that breaks — interpreter, package, filter encoding, screener, yfinance:
+
+```
+  python         /usr/bin/python3
+  finvizfinance  OK (v1.5.0)
+  filters        OK — ind_stocksonly,sh_price_o5,sh_avgvol_o300
+  screener       OK — 2431 tickers, 11 sectors
+  yfinance       OK
+```
+
+The commonest cause is the dullest: `finvizfinance` installed in a notebook or on
+Colab is **not** installed for the interpreter running Streamlit. `pip install -r
+requirements-dashboard.txt` with that interpreter fixes it.
 
 The SPY column and S&P 500 level are still blank — this package caches QQQ, not SPY.
 
