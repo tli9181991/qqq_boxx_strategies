@@ -36,7 +36,8 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import BreadthParams, atr_class, daily_breadth, ma_class, pulse_class
-from qbs.config import Config, FinvizScreenParams
+from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
+from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import load_prices
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
@@ -124,6 +125,55 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str):
     return daily_breadth(_uni, qqq=_qqq, universe_note=note)
 
 
+EMA_SPANS = (10, 20, 50, 200)
+EMA_COLOURS = {"EMA 10": "#eb6834", "EMA 20": "#eda100",
+               "EMA 50": "#2a78d6", "EMA 200": "#8a63d2"}
+
+
+@st.cache_data(show_spinner=False)
+def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
+                 lookback: int, max_levels: int = 8):
+    """Price, EMAs and support/resistance for one name, as of one date.
+
+    Levels are derived from history up to `asof` ONLY — the same causal rule
+    `qbs.breakout.candidate_trades` uses. Drawing levels from the full series
+    would show the chart lines that the strategy could not have seen on the
+    date being inspected, which is the look-ahead the breakout port exists to
+    remove; a dashboard that quietly reintroduces it is worse than none.
+    """
+    close = _uni[ticker].dropna().loc[:asof]
+    if close.empty:
+        return None
+
+    emas = pd.DataFrame({f"EMA {n}": close.ewm(span=n, adjust=False,
+                                               min_periods=n).mean()
+                         for n in EMA_SPANS})
+
+    levels = sr_levels(closes_to_bars(close.to_frame(ticker))[ticker],
+                       BreakoutParams())
+
+    window = close.iloc[-lookback:]
+    price = window.rename("close").reset_index()
+    price.columns = ["date", "close"]
+
+    ema_long = (emas.loc[window.index].reset_index()
+                .melt(id_vars=emas.index.name or "Date",
+                      var_name="ema", value_name="value"))
+    ema_long.columns = ["date", "ema", "value"]
+    ema_long = ema_long.dropna(subset=["value"])
+
+    last = float(window.iloc[-1])
+    shown, n_in_view, has_overhead = levels_in_view(
+        levels, last, float(window.min()), float(window.max()), max_levels)
+
+    lvl = pd.DataFrame({"level": shown})
+    if not lvl.empty:
+        lvl["kind"] = np.where(lvl["level"] >= last, "Resistance", "Support")
+    else:
+        lvl["kind"] = pd.Series(dtype=object)
+    return price, ema_long, lvl, last, n_in_view, has_overhead
+
+
 def fmt(v, spec="{:.1f}", dash="—"):
     return dash if v is None or (isinstance(v, float) and pd.isna(v)) else spec.format(v)
 
@@ -172,9 +222,9 @@ with tab_picks:
     asof = st.select_slider("Date", options=dates, value=dates[-1],
                             format_func=lambda d: f"{d:%Y-%m-%d}")
 
-    cols = st.columns(3)
+    cols = st.columns([1, 1, 1, 2.6])
     picks: Dict[str, set] = {}
-    for col, key in zip(cols, ("momentum", "finviz", "breakout")):
+    for col, key in zip(cols[:3], ("momentum", "finviz", "breakout")):
         frame = selections[key]
         row = frame.loc[asof] if asof in frame.index else None
         raw = row["holdings"] if row is not None and row["holdings"] else ""
@@ -197,6 +247,80 @@ with tab_picks:
                 st.caption(f"🟢 Bought: {row['buys']}")
             if row is not None and row["sells"]:
                 st.caption(f"🔴 Sold: {row['sells']}")
+
+    # ---- right-hand panel: price, EMAs and the levels that matter ---------
+    with cols[3]:
+        st.markdown("**Price & levels**")
+        universe_names = list(uni.columns)
+        picked = sorted(set().union(*picks.values()))
+        options = picked + [t for t in universe_names if t not in picked]
+        if not options:
+            st.info("No name to chart.")
+        else:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            ticker = c1.selectbox(
+                "Ticker", options, index=0, key="chart_ticker",
+                help="Today's picks come first, then the rest of the universe.")
+            months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
+                                  format_func=lambda m: f"{m}m", key="chart_win")
+            n_lvl = c3.number_input("Levels", 0, 30, 8, key="chart_levels",
+                                    help="Nearest N support/resistance levels "
+                                         "to the last price. 0 hides them.")
+            frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
+            if frames is None:
+                st.info(f"No price history for {ticker} up to this date.")
+            else:
+                price, ema_long, lvl, last, n_levels, has_overhead = frames
+                y = alt.Y("close:Q", title=None,
+                          scale=alt.Scale(zero=False, nice=True))
+                line = alt.Chart(price).mark_line(color="#0b0b0b", size=1.7).encode(
+                    x=alt.X("date:T", title=None), y=y,
+                    tooltip=[alt.Tooltip("date:T", title="Date"),
+                             alt.Tooltip("close:Q", title="Close", format=".2f")])
+                emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
+                    x="date:T",
+                    y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
+                    color=alt.Color("ema:N", title=None, scale=alt.Scale(
+                        domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
+                        legend=alt.Legend(orient="top", direction="horizontal")),
+                    tooltip=[alt.Tooltip("ema:N", title="Line"),
+                             alt.Tooltip("value:Q", title="Value", format=".2f")])
+                layers = [line, emas]
+                if not lvl.empty:
+                    rules = alt.Chart(lvl).mark_rule(
+                        strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
+                        y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
+                        color=alt.Color("kind:N", title=None, scale=alt.Scale(
+                            domain=["Resistance", "Support"],
+                            range=["#d03b3b", "#0ca30c"]),
+                            legend=alt.Legend(orient="top", direction="horizontal")),
+                        tooltip=[alt.Tooltip("kind:N", title="Level"),
+                                 alt.Tooltip("level:Q", title="Price", format=".2f")])
+                    layers.append(rules)
+                st.altair_chart(
+                    alt.layer(*layers).resolve_scale(color="independent")
+                    .properties(height=430), use_container_width=True)
+
+                above = [f"EMA {n}" for n in EMA_SPANS
+                         if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
+                         and last > ema_long[ema_long["ema"] == f"EMA {n}"]["value"].iloc[-1]]
+                st.caption(
+                    f"**{ticker}** {last:,.2f} · above "
+                    f"{', '.join(above) if above else 'none'} · "
+                    f"showing {len(lvl)} of {n_levels} levels in view"
+                )
+                if not has_overhead:
+                    st.warning(
+                        "**No resistance overhead in this window.** The name has "
+                        "already cleared every level its chart shows, so a "
+                        "breakout entry has nothing to fire on. This is the state "
+                        "52% of Finviz picks are in — see the funnel notebook.",
+                        icon="⚠️")
+                st.caption(
+                    "Levels are re-derived from history **up to the selected date "
+                    "only** — the same causal rule the breakout strategy uses, so "
+                    "the chart never shows a level the strategy could not have seen."
+                )
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(

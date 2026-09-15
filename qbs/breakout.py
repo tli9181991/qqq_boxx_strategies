@@ -197,6 +197,35 @@ def sr_levels(daily: pd.DataFrame, p: BreakoutParams) -> List[float]:
     return sorted(float(x[1]) for x in merged[:p.max_levels])
 
 
+def levels_in_view(
+    levels: Sequence[float],
+    last: float,
+    lo: float,
+    hi: float,
+    n: int = 8,
+    pad_frac: float = 0.08,
+) -> Tuple[List[float], int, bool]:
+    """Pick the levels worth drawing on a chart window, nearest price first.
+
+    Returns `(shown, n_in_view, has_overhead)`.
+
+    A typical name puts 13-20 levels inside a one-year window, which is more
+    dashed lines than a chart can carry. The ones that survive are those
+    NEAREST the last price, because the next resistance overhead and the
+    support under it are what a trade actually turns on.
+
+    `has_overhead` reports whether ANY level in view sits above the last
+    price -- not just among the ones drawn. It is worth its own flag because
+    "nothing overhead to break through" is a real state for a breakout
+    strategy, not an empty chart: a name at its highs has already cleared
+    every level its chart shows, and no breakout entry can fire on it.
+    """
+    in_view = [float(L) for L in levels
+               if lo - (hi - lo) * pad_frac <= L <= hi + (hi - lo) * pad_frac]
+    shown = sorted(sorted(in_view, key=lambda L: abs(L - last))[:max(0, int(n))])
+    return shown, len(in_view), any(L > last for L in in_view)
+
+
 def var_risk(daily: pd.DataFrame, p: BreakoutParams) -> float:
     """|Var95| of daily returns -- the notebook's cap on the risk unit R."""
     rets = daily["Close"].pct_change().dropna()

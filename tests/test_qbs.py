@@ -1674,3 +1674,43 @@ def test_breadth_ma_denominator_excludes_names_without_an_average():
     r = daily_breadth(px, p=p)
     # YOUNG never has a 50-day average, so every row is 100% on OLD alone.
     assert np.allclose(r.table["pct_above_slow"], 100.0)
+
+
+def test_levels_in_view_keeps_the_nearest_and_counts_the_rest():
+    from qbs.breakout import levels_in_view
+
+    levels = [10, 20, 30, 40, 50, 60]
+    shown, n_in_view, overhead = levels_in_view(levels, last=32, lo=10, hi=60, n=3)
+    assert shown == [20.0, 30.0, 40.0], "the three nearest 32, in price order"
+    assert n_in_view == 6
+    assert overhead is True
+
+
+def test_levels_in_view_drops_levels_outside_the_window():
+    from qbs.breakout import levels_in_view
+
+    shown, n_in_view, _ = levels_in_view([1, 2, 100, 101], last=100, lo=99, hi=102,
+                                         n=10, pad_frac=0.0)
+    assert shown == [100.0, 101.0] and n_in_view == 2
+
+
+def test_levels_in_view_reports_nothing_overhead_at_the_highs():
+    """A name that has cleared every level has no breakout to make. The flag
+    must reflect every level in view, not just the ones drawn."""
+    from qbs.breakout import levels_in_view
+
+    shown, _, overhead = levels_in_view([10, 20, 30], last=35, lo=5, hi=40, n=2)
+    assert overhead is False
+    assert shown == [20.0, 30.0], "still draws the nearest support"
+
+    # One level overhead but outside the drawn set must still flip the flag.
+    _, _, overhead2 = levels_in_view([10, 20, 30, 39], last=35, lo=5, hi=40, n=2)
+    assert overhead2 is True
+
+
+def test_levels_in_view_handles_empty_and_zero():
+    from qbs.breakout import levels_in_view
+
+    assert levels_in_view([], last=10, lo=5, hi=15, n=5) == ([], 0, False)
+    shown, n_in_view, _ = levels_in_view([10, 12], last=11, lo=5, hi=15, n=0)
+    assert shown == [] and n_in_view == 2, "n=0 hides lines but still counts them"

@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 121 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 125 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -786,7 +786,14 @@ Two tabs:
 
 - **Daily picks** — what each of the three selection strategies held on any chosen
   day, the entries and exits that changed it, the momentum ∩ Finviz overlap, and a
-  downloadable history table.
+  downloadable history table. A chart panel on the right plots any name with its
+  10/20/50/200-day EMAs and the nearest support and resistance levels.
+
+  The levels are re-derived **from history up to the selected date only** — the same
+  causal rule `candidate_trades` uses, so the chart never draws a line the strategy
+  could not have seen on that date. When a name has cleared everything overhead the
+  panel says so outright: that is the state 52% of Finviz picks are in, and it is the
+  reason a breakout entry has nothing to fire on.
 - **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.
