@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 130 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 133 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -794,6 +794,14 @@ Two tabs:
   could not have seen on that date. When a name has cleared everything overhead the
   panel says so outright: that is the state 52% of Finviz picks are in, and it is the
   reason a breakout entry has nothing to fire on.
+
+  Price is drawn as **candlesticks**, which need real Open/High/Low. The universe
+  cache holds closes only, so the panel fetches daily OHLC for the *selected name*
+  alone (`data.load_daily_ohlc`, cached per ticker under `data/ohlc/`). Where that
+  cannot be had it draws a close line and says why. **Candles are never synthesised
+  from closes** — a body spanning previous-close to close with no wick asserts a
+  session high and low that never happened, and a chart that lies about range is worse
+  than one that admits it only has closes.
 - **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.

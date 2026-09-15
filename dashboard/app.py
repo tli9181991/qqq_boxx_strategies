@@ -38,7 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qbs.breadth import BreadthParams, atr_class, daily_breadth, ma_class, pulse_class
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
-from qbs.data import freshness_note, load_prices, sessions_behind
+from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
+                      sessions_behind)
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
@@ -176,6 +177,20 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str):
 EMA_SPANS = (10, 20, 50, 200)
 EMA_COLOURS = {"EMA 10": "#eb6834", "EMA 20": "#eda100",
                "EMA 50": "#2a78d6", "EMA 200": "#8a63d2"}
+
+
+CANDLE_UP, CANDLE_DN = "#1b7a4b", "#b02525"
+
+
+@st.cache_data(show_spinner=False)
+def ohlc_for(ticker: str, download_start: str, online: bool, _token: int):
+    """Real daily OHLC for one name, or None if it cannot be had.
+
+    None is a first-class answer: the chart draws a close line instead and
+    says why. Faking the missing columns from closes would put a body and no
+    wick on every bar, which asserts a high and a low that never happened.
+    """
+    return load_daily_ohlc(ticker, start=download_start, offline=not online)
 
 
 @st.cache_data(show_spinner=False)
@@ -368,12 +383,45 @@ with tab_picks:
                 st.info(f"No price history for {ticker} up to this date.")
             else:
                 price, ema_long, lvl, last, n_levels, has_overhead = frames
-                y = alt.Y("close:Q", title=None,
-                          scale=alt.Scale(zero=False, nice=True))
-                line = alt.Chart(price).mark_line(color="#0b0b0b", size=1.7).encode(
-                    x=alt.X("date:T", title=None), y=y,
-                    tooltip=[alt.Tooltip("date:T", title="Date"),
-                             alt.Tooltip("close:Q", title="Close", format=".2f")])
+
+                # Candles need real Open/High/Low. When they cannot be had the
+                # chart falls back to a close line and says so, rather than
+                # drawing a wickless body per bar off the close series -- that
+                # would assert a session high and low that never happened.
+                ohlc = ohlc_for(ticker, download_start, bool(online),
+                                st.session_state["refresh_token"])
+                bars = None
+                if ohlc is not None and not ohlc.empty:
+                    win = ohlc.loc[:asof].tail(int(months * 21))
+                    if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
+                        bars = win.reset_index()
+                        bars.columns = [str(c).lower() for c in bars.columns]
+
+                yscale = alt.Scale(zero=False, nice=True)
+                if bars is not None:
+                    body_colour = alt.condition(
+                        "datum.open <= datum.close",
+                        alt.value(CANDLE_UP), alt.value(CANDLE_DN))
+                    cbase = alt.Chart(bars).encode(
+                        x=alt.X("date:T", title=None), color=body_colour,
+                        tooltip=[alt.Tooltip("date:T", title="Date"),
+                                 alt.Tooltip("open:Q", format=".2f"),
+                                 alt.Tooltip("high:Q", format=".2f"),
+                                 alt.Tooltip("low:Q", format=".2f"),
+                                 alt.Tooltip("close:Q", format=".2f")])
+                    wick = cbase.mark_rule(size=1).encode(
+                        y=alt.Y("low:Q", title=None, scale=yscale),
+                        y2=alt.Y2("high:Q"))
+                    body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
+                        y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
+                    line = wick + body
+                else:
+                    line = alt.Chart(price).mark_line(
+                        color="#0b0b0b", size=1.7).encode(
+                        x=alt.X("date:T", title=None),
+                        y=alt.Y("close:Q", title=None, scale=yscale),
+                        tooltip=[alt.Tooltip("date:T", title="Date"),
+                                 alt.Tooltip("close:Q", title="Close", format=".2f")])
                 emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
                     x="date:T",
                     y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
@@ -397,6 +445,15 @@ with tab_picks:
                 st.altair_chart(
                     alt.layer(*layers).resolve_scale(color="independent")
                     .properties(height=430), use_container_width=True)
+                if bars is None:
+                    st.caption(
+                        "📉 Close line, not candles — no Open/High/Low for "
+                        f"**{ticker}**. The universe cache holds closes only; "
+                        "switch **Source** to Online so the panel can fetch "
+                        "real OHLC for the selected name. Candles are never "
+                        "drawn from closes, because a wickless body would "
+                        "assert a high and low that never happened."
+                    )
 
                 above = [f"EMA {n}" for n in EMA_SPANS
                          if not ema_long[ema_long["ema"] == f"EMA {n}"].empty

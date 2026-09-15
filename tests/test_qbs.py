@@ -1765,3 +1765,57 @@ def test_freshness_note_carries_no_remedy():
     assert "5 sessions behind" in msg
     for word in ("Online", "refresh", "Refresh"):
         assert word not in msg
+
+
+def test_load_daily_ohlc_offline_without_cache_returns_none():
+    """The caller is a chart that falls back to a close line. A missing candle
+    is not worth taking the page down for."""
+    import tempfile
+    from qbs.data import load_daily_ohlc
+
+    with tempfile.TemporaryDirectory() as d:
+        assert load_daily_ohlc("NOPE", offline=True, cache_dir=d) is None
+
+
+def test_load_daily_ohlc_offline_reads_the_cache():
+    import tempfile, os
+    from qbs.data import load_daily_ohlc
+
+    idx = pd.bdate_range("2026-01-01", periods=5)
+    frame = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5,
+                          "Volume": 100}, index=idx)
+    frame.index.name = "Date"
+    with tempfile.TemporaryDirectory() as d:
+        frame.to_csv(os.path.join(d, "XYZ.csv"))
+        got = load_daily_ohlc("XYZ", offline=True, cache_dir=d)
+        assert got is not None and len(got) == 5
+        assert {"Open", "High", "Low", "Close"} <= set(got.columns)
+
+
+def test_load_daily_ohlc_falls_back_to_cache_when_the_download_fails():
+    """Online mode must not lose a usable cache to a network blip."""
+    import tempfile, os, sys, types
+    from qbs.data import load_daily_ohlc
+
+    idx = pd.bdate_range("2026-01-01", periods=4)
+    frame = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5},
+                         index=idx)
+    frame.index.name = "Date"
+
+    boom = types.ModuleType("yfinance")
+    def _fail(*a, **k):
+        raise RuntimeError("network down")
+    boom.download = _fail
+    saved = sys.modules.get("yfinance")
+    sys.modules["yfinance"] = boom
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            frame.to_csv(os.path.join(d, "XYZ.csv"))
+            got = load_daily_ohlc("XYZ", offline=False, cache_dir=d)
+            assert got is not None and len(got) == 4, "cache must survive a failure"
+            assert load_daily_ohlc("GONE", offline=False, cache_dir=d) is None
+    finally:
+        if saved is not None:
+            sys.modules["yfinance"] = saved
+        else:
+            sys.modules.pop("yfinance", None)

@@ -74,6 +74,67 @@ def _download_one(ticker: str, start: str, end: Optional[str]) -> pd.Series:
     return s
 
 
+OHLC_CACHE = os.path.join(CACHE_DIR, "ohlc")
+
+
+def load_daily_ohlc(
+    ticker: str,
+    start: str = DOWNLOAD_START,
+    end: Optional[str] = None,
+    refresh: bool = False,
+    offline: bool = False,
+    cache_dir: str = OHLC_CACHE,
+) -> Optional[pd.DataFrame]:
+    """Daily Open/High/Low/Close/Volume for ONE ticker, cached per name.
+
+    Separate from `load_prices`, which is deliberately closes-only and one
+    wide frame. A candlestick needs the other three columns, and it only ever
+    draws one name at a time, so this fetches one name at a time rather than
+    quadrupling the size of the universe cache for a chart.
+
+    Returns None rather than raising when the data cannot be had: the caller
+    is a chart that can fall back to a close line, and a missing candle is not
+    worth taking the page down for.
+
+    Never synthesise the missing columns from closes. `closes_to_bars` exists
+    for indicator maths where a close-to-close envelope is a defensible
+    stand-in for range; on a candlestick it would draw a body spanning
+    previous-close to close with no wick at all, for every bar, which reads as
+    a factual claim about the session's high and low that is simply untrue.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{ticker.upper()}.csv")
+
+    cached = None
+    if os.path.exists(path) and not refresh:
+        try:
+            cached = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+        except Exception:  # noqa: BLE001
+            cached = None
+    if offline:
+        return cached if cached is not None and not cached.empty else None
+
+    try:
+        import yfinance as yf
+        raw = yf.download(ticker, start=start, end=end, auto_adjust=True,
+                          progress=False, actions=False)
+        if raw is None or raw.empty:
+            raise RuntimeError("no rows returned")
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [c[0] for c in raw.columns]
+        cols = [c for c in ("Open", "High", "Low", "Close", "Volume")
+                if c in raw.columns]
+        raw = raw[cols].dropna(subset=["Close"])
+        raw.index = pd.to_datetime(raw.index).tz_localize(None).normalize()
+        raw.index.name = "Date"
+        fresh = raw if cached is None else pd.concat([cached, raw])
+        fresh = fresh[~fresh.index.duplicated(keep="last")].sort_index()
+        fresh.to_csv(path)
+        return fresh
+    except Exception:  # noqa: BLE001
+        return cached if cached is not None and not cached.empty else None
+
+
 def sessions_behind(last: pd.Timestamp,
                     now: Optional[pd.Timestamp] = None) -> int:
     """How many completed weekday sessions sit between `last` and now.

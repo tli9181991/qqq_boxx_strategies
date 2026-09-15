@@ -34,3 +34,6 @@ deploy/docker/.env
 
 # Hourly OHLCV cache (one CSV per name, large)
 data/hourly/
+
+# Per-ticker daily OHLC cache for the dashboard candlesticks
+data/ohlc/
