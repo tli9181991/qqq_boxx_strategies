@@ -14,3 +14,8 @@ pandas>=2.0
 numpy>=1.24
 yfinance>=0.2.40
 lxml>=4.9          # universe scrape (pd.read_html)
+
+# Optional: the Google Sheets mirror (`runner sheets`). Nothing else imports
+# these, and sheets.py imports them lazily, so the trader runs without them.
+gspread>=6.0
+google-auth>=2.30

@@ -330,6 +330,17 @@ the reconcile unit fail, and is cross-checked on every run.
 QBS_POSITION_SOURCE=ledger
 ```
 
+Switch it on **while the account is flat**. That is the only moment a tally
+starts from a guaranteed-correct zero. Switching later leaves an empty ledger
+beside a non-empty account, and the strategy then reads its own book as flat
+and buys the whole thing a second time. If you have already traded, seed it
+from the fills the run log has been recording all along:
+
+```bash
+$C run --rm --no-deps qbs ledger --rebuild     # reconstruct from the run log
+$C run --rm --no-deps qbs ledger               # ledger vs account, side by side
+```
+
 `var/strategy_trades.csv` is appended from IB's own execution records at
 reconcile — never from orders sent, so an order that did not fill leaves no row.
 Rows are keyed on IB's execution id, so re-running reconcile after a failure
@@ -419,6 +430,60 @@ costs nothing — which is precisely what makes it safe to keep. A CSV the
 strategy read back as its position of record would drift the first time a fill
 was missed, and no amount of price history could repair it. That is why the
 strategy's position is derived rather than tallied.
+
+## Optional — mirror the run log to a Google Sheet
+
+The database stays the record; this pushes a copy you can read from a phone,
+share, and chart by hand. Nothing is ever read back from the sheet.
+
+It runs as **its own timer**, ten minutes after reconcile. That is the whole
+design: the Sheets API is the least reliable dependency here — someone else's
+service, over the internet, behind a quota — and putting it on the same code
+path as recording what was traded would let a network blip fail the record.
+
+**1. A service account.** Nothing else works unattended: the OAuth consent flow
+needs a browser, and a refresh token eventually needs a human.
+
+- In the Google Cloud console, create a project and enable the **Google Sheets
+  API**.
+- Create a **service account**, then a **JSON key** for it.
+- Put the key at `var/google-sa.json` on the VM. `var/` is gitignored and
+  bind-mounted, so the key never enters the image or the repository.
+  `chmod 600 var/google-sa.json`.
+
+**2. Share the sheet with it.** Create a spreadsheet, then share it with the
+service account's email (`something@project.iam.gserviceaccount.com`) as an
+**Editor**. The account owns nothing and can reach nothing else in your Drive —
+only what you share with it.
+
+**3. Point the trader at it.** The id is the long string in the sheet's URL,
+`docs.google.com/spreadsheets/d/<THIS BIT>/edit`:
+
+```bash
+# deploy/docker/.env
+QBS_SHEETS_ID=1AbC...xyz
+```
+
+**4. Try it, then schedule it.**
+
+```bash
+C="docker compose -f deploy/docker/docker-compose.yml"
+$C build qbs                       # gspread is a new dependency
+$C run --rm --no-deps qbs sheets
+
+sudo cp deploy/docker/systemd/qbs-sheets.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now qbs-sheets.timer
+```
+
+Five tabs, each cleared and rewritten from the database on every push:
+`trades`, `selection`, `closes`, `nav`, `runs`. Rewriting rather than appending
+means the push needs no memory of what it last sent — one more piece of state
+that could drift — and running it twice, or after missing a week, produces the
+same correct sheet.
+
+Leave `QBS_SHEETS_ID` blank and the phase logs that there is nothing to do and
+exits 0, so the timer is harmless to install before you have a sheet.
 
 ## Step 10 — The instance schedule
 

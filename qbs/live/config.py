@@ -124,6 +124,14 @@ class LiveConfig:
     # "account"  the whole account is the strategy's. Only for a dedicated one.
     position_source: str = "account"
 
+    # ---- optional Google Sheets mirror -----------------------------------
+    # A read-only-to-you copy of the run log. The database stays the record;
+    # nothing is ever read back from the sheet. Runs as its own timer after
+    # reconcile, so a quota, a network blip or a revoked share fails only
+    # itself and can never reach an order.
+    sheets_id: str = ""            # the long id in the sheet's URL; blank = off
+    sheets_key_file: str = ""      # service-account JSON; defaults into state_dir
+
     state_dir: str = DEFAULT_STATE_DIR
     kill_switch: str = ""        # if this path exists, every phase refuses to trade
     dry_run: bool = False        # log the orders, send nothing
@@ -186,6 +194,11 @@ class LiveConfig:
         return os.path.join(self.state_dir, "external_positions.json")
 
     @property
+    def sheets_key_path(self) -> str:
+        """Kept in state_dir: gitignored, bind-mounted, never in the image."""
+        return self.sheets_key_file or os.path.join(self.state_dir, "google-sa.json")
+
+    @property
     def ledger_path(self) -> str:
         """The strategy's own executions, appended from IB's fill records."""
         return os.path.join(self.state_dir, "strategy_trades.csv")
@@ -241,6 +254,8 @@ class LiveConfig:
                                              cfg.exclude_own_holdings)
         cfg.position_source = os.environ.get("QBS_POSITION_SOURCE",
                                              cfg.position_source)
+        cfg.sheets_id = os.environ.get("QBS_SHEETS_ID", cfg.sheets_id)
+        cfg.sheets_key_file = os.environ.get("QBS_SHEETS_KEY", cfg.sheets_key_file)
         cfg.__post_init__()
         return cfg
 
