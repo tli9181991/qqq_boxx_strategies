@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 125 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 130 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -798,8 +798,21 @@ Two tabs:
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.
 
-It reads **only the CSV cache in `data/`** and never touches the network, so run
-`python run_backtest.py` once first.
+**Data source** is a sidebar control:
+
+- **Online (default)** — downloads and caches. It only reaches the network when the
+  cache is actually behind, so a fresh cache costs nothing. If the download fails it
+  falls back to the cache and says so rather than pretending to be live.
+- **Offline** — cache only, never touches the network. Build the cache first with
+  `python run_backtest.py`.
+
+**Refresh now** forces a re-download even when the cache looks current.
+
+Every tab carries a freshness banner: how many sessions behind the data is, and what
+to do about it. The remedy is context-aware — it will not tell you to switch to Online
+while an online download is the thing failing. Staleness is counted in weekdays with no
+exchange-holiday calendar, so around a holiday it nags a day early, which is the safe
+direction.
 
 > ⚠️ **The market tab samples ~99 Nasdaq-100 constituents, not the US market.** The
 > commercial dashboards this mirrors sample ~2,400 US common stocks and ADRs. The

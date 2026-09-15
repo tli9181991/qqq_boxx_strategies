@@ -1714,3 +1714,54 @@ def test_levels_in_view_handles_empty_and_zero():
     assert levels_in_view([], last=10, lo=5, hi=15, n=5) == ([], 0, False)
     shown, n_in_view, _ = levels_in_view([10, 12], last=11, lo=5, hi=15, n=0)
     assert shown == [] and n_in_view == 2, "n=0 hides lines but still counts them"
+
+
+# --------------------------------------------------------------------------
+# Data freshness (qbs/data.py)
+# --------------------------------------------------------------------------
+
+def test_sessions_behind_counts_weekdays_only():
+    from qbs.data import sessions_behind
+
+    now = pd.Timestamp("2026-09-15")          # a Tuesday
+    assert sessions_behind(pd.Timestamp("2026-09-15"), now) == 0
+    assert sessions_behind(pd.Timestamp("2026-09-14"), now) == 1
+    assert sessions_behind(pd.Timestamp("2026-09-11"), now) == 2   # Fri -> Mon,Tue
+    assert sessions_behind(pd.Timestamp("2026-09-08"), now) == 5
+
+
+def test_sessions_behind_ignores_the_weekend():
+    """Saturday and Sunday are not missing sessions."""
+    from qbs.data import sessions_behind
+
+    friday = pd.Timestamp("2026-09-11")
+    assert sessions_behind(friday, pd.Timestamp("2026-09-12")) == 0   # Sat
+    assert sessions_behind(friday, pd.Timestamp("2026-09-13")) == 0   # Sun
+    assert sessions_behind(friday, pd.Timestamp("2026-09-14")) == 1   # Mon
+
+
+def test_sessions_behind_never_goes_negative():
+    from qbs.data import sessions_behind
+
+    assert sessions_behind(pd.Timestamp("2026-09-15"), pd.Timestamp("2026-09-10")) == 0
+
+
+def test_freshness_note_levels():
+    from qbs.data import freshness_note
+
+    now = pd.Timestamp("2026-09-15")
+    assert freshness_note(pd.Timestamp("2026-09-15"), now)[1] == "ok"
+    assert freshness_note(pd.Timestamp("2026-09-14"), now)[1] == "info"
+    assert freshness_note(pd.Timestamp("2026-09-08"), now)[1] == "warn"
+
+
+def test_freshness_note_carries_no_remedy():
+    """The fix depends on why it is stale, and only the caller knows that --
+    telling someone to go online while their download is the thing failing is
+    worse than saying nothing."""
+    from qbs.data import freshness_note
+
+    _, _, msg = freshness_note(pd.Timestamp("2026-09-08"), pd.Timestamp("2026-09-15"))
+    assert "5 sessions behind" in msg
+    for word in ("Online", "refresh", "Refresh"):
+        assert word not in msg

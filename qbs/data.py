@@ -14,7 +14,7 @@ pipeline can be exercised (and unit-tested) with no data feed at all.
 from __future__ import annotations
 
 import os
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -72,6 +72,48 @@ def _download_one(ticker: str, start: str, end: Optional[str]) -> pd.Series:
     s = s[~s.index.duplicated(keep="last")].sort_index()
     s.name = ticker
     return s
+
+
+def sessions_behind(last: pd.Timestamp,
+                    now: Optional[pd.Timestamp] = None) -> int:
+    """How many completed weekday sessions sit between `last` and now.
+
+    0 means the most recent weekday is already in the data. 1 is normal
+    during a session and before the close is published. 2 or more means the
+    cache has genuinely fallen behind.
+
+    Weekdays only -- there is no exchange holiday calendar here. Around a
+    market holiday this OVER-reports by a day, which is the safe direction
+    for a staleness warning: it nags early rather than staying quiet while
+    the data rots. Do not use it to decide whether a session existed.
+    """
+    last = pd.Timestamp(last).tz_localize(None).normalize()
+    now = (pd.Timestamp(now) if now is not None
+           else pd.Timestamp.utcnow()).tz_localize(None).normalize()
+    if now <= last:
+        return 0
+    return max(0, len(pd.bdate_range(last + pd.Timedelta(days=1), now)))
+
+
+def freshness_note(last: pd.Timestamp,
+                   now: Optional[pd.Timestamp] = None) -> Tuple[int, str, str]:
+    """`(sessions_behind, level, message)` for a UI banner.
+
+    `level` is one of "ok", "info", "warn" so the caller picks the styling
+    without re-deriving the rule.
+    """
+    n = sessions_behind(last, now)
+    stamp = pd.Timestamp(last).strftime("%Y-%m-%d")
+    if n == 0:
+        return n, "ok", f"Data current through {stamp}."
+    if n == 1:
+        return n, "info", (f"Data through {stamp} — the latest session is not in "
+                           "yet, which is normal before the close is published.")
+    # Deliberately no remedy here: what to do about staleness depends on why
+    # it happened, and the caller is the only one that knows. Telling someone
+    # to "switch to Online" while their online download is failing is worse
+    # than saying nothing.
+    return n, "warn", f"Data through {stamp} — **{n} sessions behind**."
 
 
 def load_prices(

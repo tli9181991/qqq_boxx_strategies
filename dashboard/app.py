@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qbs.breadth import BreadthParams, atr_class, daily_breadth, ma_class, pulse_class
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
-from qbs.data import load_prices
+from qbs.data import freshness_note, load_prices, sessions_behind
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
@@ -68,15 +68,63 @@ PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
 # Data
 # --------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Loading prices…")
-def load_data(download_start: str):
-    """Cached closes for the ranking universe plus the core ETFs."""
-    tickers = load_universe(fetch=False, warn=False)
+def _read_cache(download_start: str, fetch_universe: bool = False):
+    """Whatever is on disk, without touching the network."""
+    tickers = load_universe(fetch=fetch_universe, warn=False)
     uni = load_universe_prices(tickers, start=download_start, verbose=False)
     px = load_prices(["QQQ", "VEU", "BOXX"], start=download_start, offline=True)
+    return uni, px
+
+
+@st.cache_data(show_spinner="Loading prices…")
+def load_data(download_start: str, online: bool, force: bool, _token: int):
+    """Closes for the ranking universe plus the core ETFs.
+
+    Returns `(uni, px, status)` where `status` explains what actually
+    happened, because "online" and "fresh" are not the same thing and the UI
+    must not imply otherwise.
+
+    Why online mode is not simply `offline=False`
+    ---------------------------------------------
+    `load_universe_prices` returns a cache HIT without asking how old it is,
+    so the download only happens when `refresh=True`. Flipping the offline
+    flag alone would have left the app pinned to whatever the cache held --
+    which is exactly the bug this is fixing. So online mode reads the cache
+    first, measures how far behind it is, and re-downloads only when there is
+    something to fetch. A fresh cache costs no network at all.
+
+    A failed download falls back to the cache and says so. Showing stale
+    numbers is fine; showing them while claiming to be live is not.
+    """
+    status = {"mode": "online" if online else "offline", "downloaded": False,
+              "error": None}
+
+    uni, px = None, None
+    try:
+        uni, px = _read_cache(download_start)
+    except Exception as exc:  # noqa: BLE001
+        if not online:
+            raise
+        status["error"] = f"no usable cache ({exc})"
+
+    behind = (sessions_behind(px.index.max()) if px is not None else 99)
+    if online and (force or behind >= 1 or uni is None):
+        try:
+            tickers = load_universe(fetch=True, warn=False)
+            uni = load_universe_prices(tickers, start=download_start,
+                                       refresh=True, verbose=False)
+            px = load_prices(["QQQ", "VEU", "BOXX"], start=download_start,
+                             refresh=True, offline=False)
+            status["downloaded"] = True
+            status["error"] = None
+        except Exception as exc:  # noqa: BLE001
+            status["error"] = str(exc)
+            if uni is None or px is None:
+                raise
+
     uni = uni.reindex(px.index).ffill()
     uni = uni.loc[:, uni.notna().sum() >= 260]
-    return uni, px
+    return uni, px, status
 
 
 @st.cache_data(show_spinner="Building selections…")
@@ -184,23 +232,71 @@ def fmt(v, spec="{:.1f}", dash="—"):
 
 cfg = Config()
 st.sidebar.header("Settings")
+
+st.sidebar.subheader("Data")
+online = st.sidebar.radio(
+    "Source", [True, False], index=0,
+    format_func=lambda v: "Online (download + cache)" if v else "Offline (cache only)",
+    help="Online downloads only when the cache is behind, so a fresh cache "
+         "costs no network. Offline never reaches the internet.",
+) 
+st.session_state.setdefault("refresh_token", 0)
+if st.sidebar.button("Refresh now", width="stretch",
+                     help="Force a re-download even if the cache looks current."):
+    st.session_state["refresh_token"] += 1
+    st.cache_data.clear()
+
 download_start = st.sidebar.text_input("Data start", cfg.download_start)
 n_hold = st.sidebar.number_input("Names held (n_hold)", 1, 20, cfg.momentum.n_hold)
 exit_rank = st.sidebar.number_input("Exit rank (band)", int(n_hold), 50,
                                     max(cfg.momentum.exit_rank, int(n_hold)))
 n_watch = st.sidebar.number_input("Breakout watchlist size", 5, 50, 20)
 
+force = st.session_state["refresh_token"] > st.session_state.get("applied_token", -1)
 try:
-    uni, px = load_data(download_start)
+    uni, px, data_status = load_data(download_start, bool(online), bool(force),
+                                     st.session_state["refresh_token"])
+    st.session_state["applied_token"] = st.session_state["refresh_token"]
 except Exception as exc:  # noqa: BLE001
-    st.error(f"Could not load data: {exc}\n\nThis app reads only the CSV cache in "
-             "`data/` and never goes to the network. Run `python run_backtest.py` "
-             "once to build the cache.")
+    st.error(
+        f"Could not load data: {exc}\n\n"
+        "Offline mode reads only the CSV cache in `data/`. Build it once with "
+        "`python run_backtest.py`, or switch the sidebar to **Online**."
+    )
     st.stop()
 
-UNIVERSE_NOTE = f"{uni.shape[1]} Nasdaq-100 constituents (local cache, closes only)"
+LAST_BAR = uni.index.max()
+N_BEHIND, FRESH_LEVEL, FRESH_MSG = freshness_note(LAST_BAR)
+
+
+def freshness_banner():
+    """Say how old the data is, on every tab. A dashboard that is quietly a
+    week behind is worse than one that admits it."""
+    failed = bool(data_status["error"])
+    if failed:
+        st.error(f"**Download failed — showing the cached data instead.** "
+                 f"{data_status['error']}", icon="🚫")
+    if FRESH_LEVEL == "warn":
+        # The remedy depends on why it is stale. Do not tell someone to go
+        # online when they already are and the download is what broke.
+        if failed:
+            remedy = ("Check your connection, then press **Refresh now**. "
+                      "Everything below is from the cache.")
+        elif online:
+            remedy = "Press **Refresh now** in the sidebar to force a re-download."
+        else:
+            remedy = ("Switch **Source** to Online, or run "
+                      "`python run_backtest.py --refresh`.")
+        st.warning(f"{FRESH_MSG} {remedy}", icon="🕒")
+    elif FRESH_LEVEL == "info":
+        st.caption(f"🕒 {FRESH_MSG}")
+
+SRC = "downloaded" if data_status["downloaded"] else "cache"
+UNIVERSE_NOTE = f"{uni.shape[1]} Nasdaq-100 constituents (closes only)"
 st.sidebar.caption(f"Universe: {UNIVERSE_NOTE}")
-st.sidebar.caption(f"Data through {uni.index.max():%Y-%m-%d}")
+st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")
+st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
+                    "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
 selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_watch))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
@@ -213,9 +309,10 @@ tab_picks, tab_market = st.tabs(["📋 Daily picks", "📊 Market overview"])
 # ==========================================================================
 
 with tab_picks:
+    freshness_banner()
     st.subheader("Daily picks")
     st.caption(f"Three selection strategies · universe {UNIVERSE_NOTE} · "
-               f"data through {uni.index.max():%Y-%m-%d}")
+               f"data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 
     dates = [d for d in selections["momentum"].index
              if d >= pd.Timestamp(cfg.backtest_start)]
@@ -350,6 +447,7 @@ with tab_picks:
 # ==========================================================================
 
 with tab_market:
+    freshness_banner()
     st.subheader("Breadth & momentum monitor")
 
     st.warning(
@@ -372,7 +470,7 @@ with tab_market:
 
     st.caption(
         f"Close {tbl.index[-1]:%Y-%m-%d} · universe {UNIVERSE_NOTE} · "
-        f"sample {int(last['n_stocks'])} names · source local CSV cache"
+        f"sample {int(last['n_stocks'])} names · source {SRC}"
     )
 
     # ---- KPI row ---------------------------------------------------------
