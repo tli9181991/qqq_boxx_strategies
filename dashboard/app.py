@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Dict
+from typing import Dict, Optional
 
 import altair as alt
 import numpy as np
@@ -35,11 +35,14 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qbs.breadth import BreadthParams, atr_class, daily_breadth, ma_class, pulse_class
+from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
+                         pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
+from qbs.finviz import (UniverseFilters, fetch_us_universe, load_universe_bars,
+                        sector_map)
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
@@ -170,8 +173,37 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
 
 
 @st.cache_data(show_spinner="Computing breadth…")
-def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str):
-    return daily_breadth(_uni, qqq=_qqq, universe_note=note)
+def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
+                  _volumes: Optional[pd.DataFrame] = None):
+    return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note)
+
+
+@st.cache_data(show_spinner="Fetching the US universe from Finviz…")
+def load_us_market(download_start: str, online: bool, force: bool, _token: int):
+    """The broad US universe for the breadth tab: closes, volumes, sectors.
+
+    Returns `(closes, volumes, sectors, note, error)`. `error` is not fatal --
+    the caller falls back to the cached index universe and says so on screen,
+    because breadth computed over a truncated sample is wrong in a way that
+    looks entirely plausible.
+    """
+    filters = UniverseFilters()
+    uni = fetch_us_universe(filters, refresh=force, offline=not online,
+                            verbose=False)
+    if uni is None or uni.empty:
+        return None, None, {}, filters.label, (
+            "no Finviz universe available — it needs one online fetch to build "
+            "its cache (`finvizfinance` installed, network reachable)")
+
+    tickers = uni["Ticker"].tolist()
+    closes, volumes = load_universe_bars(tickers, start=download_start,
+                                         refresh=force, offline=not online,
+                                         verbose=False)
+    if closes is None or closes.empty:
+        return None, None, {}, filters.label, (
+            f"Finviz listed {len(tickers)} tickers but no price history could "
+            "be loaded for them")
+    return closes, volumes, sector_map(uni), filters.label, None
 
 
 EMA_SPANS = (10, 20, 50, 200)
@@ -267,7 +299,11 @@ exit_rank = st.sidebar.number_input("Exit rank (band)", int(n_hold), 50,
                                     max(cfg.momentum.exit_rank, int(n_hold)))
 n_watch = st.sidebar.number_input("Breakout watchlist size", 5, 50, 20)
 
-force = st.session_state["refresh_token"] > st.session_state.get("applied_token", -1)
+# Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
+# app force-refreshed on EVERY start -- re-downloading the whole universe
+# before it had shown anything. "Refresh now" is the only thing that should
+# set this.
+force = st.session_state["refresh_token"] > st.session_state.get("applied_token", 0)
 try:
     uni, px, data_status = load_data(download_start, bool(online), bool(force),
                                      st.session_state["refresh_token"])
@@ -308,7 +344,8 @@ def freshness_banner():
 
 SRC = "downloaded" if data_status["downloaded"] else "cache"
 UNIVERSE_NOTE = f"{uni.shape[1]} Nasdaq-100 constituents (closes only)"
-st.sidebar.caption(f"Universe: {UNIVERSE_NOTE}")
+st.sidebar.caption(f"Picks universe: {UNIVERSE_NOTE}")
+st.sidebar.caption("The market tab has its own universe selector.")
 st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
@@ -507,16 +544,42 @@ with tab_market:
     freshness_banner()
     st.subheader("Breadth & momentum monitor")
 
-    st.warning(
-        f"**This tab samples {uni.shape[1]} Nasdaq-100 constituents, not the US market.** "
-        "The reference version samples ~2,400 US common stocks and ADRs. The arithmetic "
-        "is the same but the readings are not comparable: a count of names up 4% out of "
-        "99 mega-caps measures something different from the same count out of 2,432 — "
-        "it is not a smaller version of the same number. Real readings need a "
-        "full-market feed.",
-        icon="⚠️",
-    )
+    use_us = st.toggle(
+        "Measure the US market (Finviz universe)", value=True, key="use_us",
+        help="Off falls back to the cached Nasdaq-100 constituents, which is "
+             "an index, not the market.")
 
+    mkt_closes = mkt_vols = None
+    mkt_sectors: Dict[str, str] = {}
+    mkt_note, mkt_err = "", None
+    if use_us:
+        mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err = load_us_market(
+            download_start, bool(online), bool(force),
+            st.session_state["refresh_token"])
+
+    if use_us and mkt_closes is not None:
+        m_uni = mkt_closes
+        m_vols = mkt_vols
+        universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
+        breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols)
+    else:
+        if use_us:
+            st.error(
+                f"**Falling back to the Nasdaq-100.** {mkt_err} — so the numbers "
+                "below are an index, not the market. Switch **Source** to Online "
+                "and press **Refresh now** to build the US universe.", icon="🚫")
+        else:
+            st.warning(
+                f"**Measuring {uni.shape[1]} Nasdaq-100 constituents, not the US "
+                "market.** A count of names up 4% out of 99 mega-caps is a "
+                "different measurement from the same count out of ~2,400 — not a "
+                "smaller version of it. Turn the toggle on for the real universe.",
+                icon="⚠️")
+        m_uni, m_vols, mkt_sectors = uni, None, {}
+        universe_label = UNIVERSE_NOTE
+        breadth_m = breadth
+
+    breadth = breadth_m
     tbl = breadth.table
     tbl = tbl.loc[tbl.index >= pd.Timestamp(cfg.backtest_start)]
     if tbl.empty:
@@ -526,7 +589,7 @@ with tab_market:
     prev = tbl.iloc[-2] if len(tbl) > 1 else None
 
     st.caption(
-        f"Close {tbl.index[-1]:%Y-%m-%d} · universe {UNIVERSE_NOTE} · "
+        f"Close {tbl.index[-1]:%Y-%m-%d} · universe {universe_label} · "
         f"sample {int(last['n_stocks'])} names · source {SRC}"
     )
 
@@ -635,7 +698,9 @@ with tab_market:
     p = BreadthParams()
     note = (f"Rules: close ≥ ${p.leader_min_price:.0f} · "
             f"quarterly gain ≥ {p.leader_min_quarter_return:.0%}")
-    if not breadth.has_volume:
+    if breadth.has_volume:
+        note += f" · turnover ≥ ${p.leader_min_turnover/1e6:.0f}M/day ✅"
+    else:
         note += (f" · ⚠️ the turnover test (≥ ${p.leader_min_turnover/1e6:.0f}M/day) "
                  "cannot run without volume, so this leader count is an over-estimate")
     st.caption(note)
@@ -662,10 +727,45 @@ with tab_market:
         ).properties(height=240),
         use_container_width=True)
 
-    st.info(
-        "**The sector-composition table is not shown.** It needs a `ticker → sector` "
-        "map to compute share, pool weight, penetration and excess pp. This package "
-        "stores no sector classification, so the panel is left blank rather than "
-        "filled with a guess — `qbs.breadth.sector_breakdown()` is written and will "
-        "produce the table as soon as you pass it a sector map.",
-        icon="ℹ️")
+    # ---- sector concentration --------------------------------------------
+    st.markdown("##### Sector composition")
+    if not mkt_sectors:
+        st.info(
+            "**Not shown — no `ticker → sector` map.** The Nasdaq-100 cache carries "
+            "no sector classification, so the panel stays blank rather than "
+            "bucketing everything into one label and rendering that as a finding. "
+            "Turn on the US universe above: the Finviz screener returns Sector in "
+            "the same response, which is what fills this in.", icon="ℹ️")
+    else:
+        sect = sector_breakdown(m_uni, mkt_sectors, asof=tbl.index[-1],
+                                volumes=m_vols)
+        if sect.empty:
+            st.info("No momentum leaders on this date, so there is nothing to "
+                    "break down by sector.", icon="ℹ️")
+        else:
+            top3 = sect["share_pct"].head(3).sum()
+            sc = st.columns(3)
+            sc[0].metric("Sectors represented", int(sect["sector"].nunique()))
+            sc[1].metric("Top-3 concentration", f"{top3:.1f}%")
+            sc[2].metric("Strongest sector", sect.iloc[0]["sector"])
+            sc[2].caption(f"{sect.iloc[0]['share_pct']:.1f}% of leaders · "
+                          f"{sect.iloc[0]['excess_pp']:+.1f}pp vs its own weight")
+
+            show = sect.rename(columns={
+                "sector": "Sector", "n": "N", "share_pct": "Share %",
+                "pool_pct": "Pool %", "penetration": "Penetration %",
+                "excess_pp": "Excess pp"})
+            st.dataframe(
+                show.style
+                .format({"Share %": "{:.1f}", "Pool %": "{:.1f}",
+                         "Penetration %": "{:.1f}", "Excess pp": "{:+.1f}"})
+                .background_gradient(subset=["Excess pp"], cmap="RdYlGn"),
+                hide_index=True, width="stretch",
+                height=min(560, 45 + 35 * len(show)))
+            st.caption(
+                "**Excess pp is the column that carries information.** A sector "
+                "holding 20% of the leaders is unremarkable if it is 20% of the "
+                "universe; the same 20% from a sector that is 5% of the universe "
+                "is the finding. Pool % is that sector's own weight — the bar it "
+                "has to beat. Penetration is leaders ÷ analysed names in the sector."
+            )

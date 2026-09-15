@@ -1819,3 +1819,143 @@ def test_load_daily_ohlc_falls_back_to_cache_when_the_download_fails():
             sys.modules["yfinance"] = saved
         else:
             sys.modules.pop("yfinance", None)
+
+
+# --------------------------------------------------------------------------
+# The broad US universe from Finviz (qbs/finviz.py)
+# --------------------------------------------------------------------------
+
+def _fake_overview(rows):
+    """A stand-in for finvizfinance's Overview, so the parsing is testable
+    without scraping 120 pages."""
+    import sys, types
+
+    class _Overview:
+        def set_filter(self, **kw):
+            self.filters = kw.get("filters_dict")
+
+        def screener_view(self, **kw):
+            return pd.DataFrame(rows)
+
+    mod = types.ModuleType("finvizfinance.screener.overview")
+    mod.Overview = _Overview
+    pkg = types.ModuleType("finvizfinance")
+    scr = types.ModuleType("finvizfinance.screener")
+    saved = {k: sys.modules.get(k) for k in
+             ("finvizfinance", "finvizfinance.screener",
+              "finvizfinance.screener.overview")}
+    sys.modules["finvizfinance"] = pkg
+    sys.modules["finvizfinance.screener"] = scr
+    sys.modules["finvizfinance.screener.overview"] = mod
+    return saved
+
+
+def _restore(saved):
+    import sys
+    for k, v in saved.items():
+        if v is not None:
+            sys.modules[k] = v
+        else:
+            sys.modules.pop(k, None)
+
+
+def test_universe_filters_use_finvizs_own_vocabulary():
+    """These strings are passed straight to the screener; a typo silently
+    returns a different universe rather than an error."""
+    from qbs.finviz import UniverseFilters
+
+    d = UniverseFilters().as_dict()
+    assert d == {"Industry": "Stocks only (ex-Funds)",
+                 "Price": "Over $5",
+                 "Average Volume": "Over 300K"}
+
+
+def test_fetch_us_universe_parses_and_normalises():
+    import tempfile, os
+    from qbs.finviz import fetch_us_universe
+
+    saved = _fake_overview([
+        {"Ticker": "brk.b", "Company": "B", "Sector": "Financial", "Country": "USA"},
+        {"Ticker": "AAPL", "Company": "A", "Sector": "Technology", "Country": "USA"},
+        {"Ticker": "AAPL", "Company": "dupe", "Sector": "Technology", "Country": "USA"},
+    ])
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "u.csv")
+            out = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
+            assert out is not None
+            assert list(out["Ticker"]) == ["BRK-B", "AAPL"], "upper, dots->dashes, deduped"
+            assert os.path.exists(path), "result must be cached"
+    finally:
+        _restore(saved)
+
+
+def test_fetch_us_universe_falls_back_to_cache_on_failure():
+    import tempfile, os, sys, types
+    from qbs.finviz import fetch_us_universe
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "u.csv")
+        pd.DataFrame({"Ticker": ["AAPL"], "Sector": ["Technology"]}).to_csv(path, index=False)
+
+        broken = types.ModuleType("finvizfinance.screener.overview")
+        class _Boom:
+            def set_filter(self, **kw): pass
+            def screener_view(self, **kw): raise RuntimeError("rate limited")
+        broken.Overview = _Boom
+        saved = {"finvizfinance.screener.overview":
+                 sys.modules.get("finvizfinance.screener.overview")}
+        sys.modules["finvizfinance.screener.overview"] = broken
+        try:
+            out = fetch_us_universe(refresh=True, cache_path=path, verbose=False)
+            assert out is not None and list(out["Ticker"]) == ["AAPL"]
+        finally:
+            _restore(saved)
+
+
+def test_fetch_us_universe_offline_without_cache_is_none():
+    import tempfile, os
+    from qbs.finviz import fetch_us_universe
+
+    with tempfile.TemporaryDirectory() as d:
+        assert fetch_us_universe(offline=True, verbose=False,
+                                 cache_path=os.path.join(d, "u.csv")) is None
+
+
+def test_sector_map_is_empty_rather_than_unclassified():
+    """An empty map makes sector_breakdown return an empty table. Inventing
+    an 'Unclassified' bucket for everything would render as a finding."""
+    from qbs.finviz import sector_map
+
+    assert sector_map(None) == {}
+    assert sector_map(pd.DataFrame()) == {}
+    assert sector_map(pd.DataFrame({"Ticker": ["A"]})) == {}, "no Sector column"
+    got = sector_map(pd.DataFrame({"Ticker": ["A", "B"],
+                                   "Sector": ["Tech", None]}))
+    assert got == {"A": "Tech"}, "a missing sector is dropped, not relabelled"
+
+
+def test_load_universe_bars_offline_without_cache_is_none():
+    import tempfile
+    from qbs.finviz import load_universe_bars
+
+    with tempfile.TemporaryDirectory() as d:
+        c, v = load_universe_bars(["AAPL"], cache_dir=d, offline=True, verbose=False)
+        assert c is None and v is None
+
+
+def test_load_universe_bars_reads_both_cached_frames():
+    import tempfile, os
+    from qbs.finviz import load_universe_bars
+
+    idx = pd.bdate_range("2026-01-01", periods=6)
+    with tempfile.TemporaryDirectory() as d:
+        pd.DataFrame({"AAPL": 1.0, "MSFT": 2.0}, index=idx).rename_axis("Date") \
+            .to_csv(os.path.join(d, "us_closes.csv"))
+        pd.DataFrame({"AAPL": 10, "MSFT": 20}, index=idx).rename_axis("Date") \
+            .to_csv(os.path.join(d, "us_volumes.csv"))
+        c, v = load_universe_bars(["AAPL", "MSFT"], cache_dir=d, offline=True,
+                                  verbose=False)
+        assert c is not None and v is not None
+        assert list(c.columns) == ["AAPL", "MSFT"] and len(c) == 6
+        assert (v["MSFT"] == 20).all()

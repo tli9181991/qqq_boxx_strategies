@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 133 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 140 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -822,21 +822,40 @@ while an online download is the thing failing. Staleness is counted in weekdays 
 exchange-holiday calendar, so around a holiday it nags a day early, which is the safe
 direction.
 
-> ⚠️ **The market tab samples ~99 Nasdaq-100 constituents, not the US market.** The
-> commercial dashboards this mirrors sample ~2,400 US common stocks and ADRs. The
-> arithmetic is identical; the readings are not comparable. A count of names up 4% out
-> of 99 mega-caps measures something different from the same count out of 2,432 — it is
-> not a smaller version of the same number. The app repeats its own sample size on
-> every screen for that reason.
+### The market tab measures the US market
 
-Three panels are deliberately **left blank rather than approximated**, because the data
-to fill them honestly is not in this repo:
+A toggle on that tab picks the universe. **On** (the default) pulls the broad US
+universe from the Finviz screener — the same definition the commercial dashboards
+quote:
 
-| Panel | Needs |
+| Finviz filter | Value |
 |---|---|
-| Sector concentration | a `ticker → sector` map. `breadth.sector_breakdown()` is written and works the moment you pass one |
-| Turnover leg of the leader screen | share volume. Without it the leader count is an over-estimate, and the app says so |
-| SPY column, S&P 500 level | an index this package does not cache (it holds QQQ) |
+| Industry | `Stocks only (ex-Funds)` — drops ETFs and closed-end funds |
+| Price | `Over $5` |
+| Average Volume | `Over 300K` |
+
+That is ~2,400 names rather than 99, which is what makes the readings *breadth* rather
+than an index summary. Two panels light up as a consequence:
+
+- **Sector concentration** — the screener returns `Sector` in the same response, so the
+  share / pool-weight / penetration / excess-pp table now computes. `Excess pp` is the
+  column to read: a sector holding 20% of the leaders is unremarkable if it *is* 20% of
+  the universe.
+- **The turnover leg of the leader screen** — volume arrives in the same yfinance
+  response as the closes, so the $5m/day test applies instead of being skipped.
+
+**What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
+requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real
+download and the cache runs to tens of megabytes. Finviz is a scrape, not an API: it
+rate-limits and the layout is not a contract, so every entry point returns None rather
+than half a universe — **a breadth reading over a truncated sample is wrong in a way
+that looks entirely plausible.**
+
+Turn the toggle **off** and it falls back to the cached Nasdaq-100 and says plainly
+that it is measuring an index, not the market. If the Finviz fetch fails it does the
+same thing with a red banner rather than quietly substituting the smaller universe.
+
+The SPY column and S&P 500 level are still blank — this package caches QQQ, not SPY.
 
 ---
 

@@ -10,3 +10,6 @@ streamlit>=1.40
 
 # Support/resistance levels for the breakout strategy's picks.
 scipy>=1.10
+
+# Finviz screener for the broad US universe (market-breadth tab)
+finvizfinance>=1.0

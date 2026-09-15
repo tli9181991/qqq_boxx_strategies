@@ -37,3 +37,8 @@ data/hourly/
 
 # Per-ticker daily OHLC cache for the dashboard candlesticks
 data/ohlc/
+
+# Broad US universe pulled from Finviz (large, regenerated on demand)
+data/finviz_universe.csv
+data/universe/us_closes.csv
+data/universe/us_volumes.csv
