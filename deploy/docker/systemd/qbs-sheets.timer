@@ -1,0 +1,17 @@
+[Unit]
+Description=QBS Google Sheets mirror at 16:25 ET
+
+[Timer]
+# Ten minutes after reconcile, so the day's fills and closes are already in the
+# database. A separate unit from reconcile on purpose: this one talks to
+# someone else's API over the internet, and must not be able to fail the job
+# that records what was traded.
+OnCalendar=Mon-Fri *-*-* 16:25:00 America/New_York
+# A missed push is nothing to catch up: the next one rewrites every tab from
+# the database anyway.
+Persistent=false
+AccuracySec=60s
+Unit=qbs-sheets.service
+
+[Install]
+WantedBy=timers.target

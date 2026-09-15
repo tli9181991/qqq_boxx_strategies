@@ -1307,3 +1307,83 @@ def test_several_names_can_be_excluded_at_once():
     assert not set(two) & set(after.raw_holdings)
     assert len(after.raw_holdings) == len(base.raw_holdings), "slots were lost"
     assert all(t in after.universe for t in two), "excluded names must stay sellable"
+
+
+# --------------------------------------------------------------------------
+# The Google Sheets mirror
+# --------------------------------------------------------------------------
+
+def test_tabs_are_built_from_the_run_log_without_a_network(db):
+    from qbs.live import sheets
+    from qbs.live.orders import Order
+
+    store.log_orders(db, "2026-09-15", "trade",
+                     [Order("MU", "BUY", 6, 974.27)], {"MU": "Submitted"},
+                     dry_run=False)
+    store.log_selection(db, "2026-09-15", [
+        dict(symbol="MU", event="hold", rank=1, score=5.52,
+             reason="still within the exit band")])
+
+    tabs = sheets.build_tabs(db)
+
+    assert set(tabs) == {"trades", "selection", "closes", "nav", "runs"}
+    assert tabs["trades"][0][:4] == ["id", "ts_utc", "session_date", "phase"]
+    assert "MU" in tabs["trades"][1]
+    assert "MU" in tabs["selection"][1]
+
+
+def test_an_empty_table_still_sends_its_header():
+    """A tab with only a header reads as 'nothing happened', not as broken."""
+    from qbs.live import sheets
+    import tempfile as _tf
+
+    db = os.path.join(_tf.mkdtemp(), "qbs.db")
+    with store.connect(db):
+        pass                       # create the schema, write nothing
+    tabs = sheets.build_tabs(db)
+
+    assert tabs["trades"] and len(tabs["trades"]) == 1
+    assert "session_date" in tabs["trades"][0]
+
+
+def test_nulls_become_blank_cells_not_the_string_none(db):
+    """"None" in a numeric column poisons every formula written against it."""
+    from qbs.live import sheets
+
+    store.log_portfolio_nav(db, "2026-09-15", total_market_value=99042.0,
+                            net_liquidation=None, cash=None, n_positions=7)
+    row = dict(zip(*sheets.build_tabs(db)["nav"][:2]))
+
+    assert row["net_liquidation"] == ""
+    assert row["total_market_value"] == 99042.0
+
+
+def test_the_mirror_refuses_an_unknown_table(db):
+    from qbs.live import sheets
+
+    with pytest.raises(sheets.SheetsError, match="unknown table"):
+        sheets.build_tabs(db, {"evil": ("sqlite_master", "1", 10)})
+
+
+def test_a_missing_key_file_is_a_clear_error_not_a_traceback(tmp_path):
+    from qbs.live import sheets
+
+    with pytest.raises(sheets.SheetsError, match="service-account key not found"):
+        sheets.push("sheet-id", str(tmp_path / "nope.json"), {"trades": [["a"]]})
+
+
+def test_no_spreadsheet_configured_is_not_a_failure(tmp_path, capsys):
+    """The mirror is optional; leaving it off must not fail a timer."""
+    from qbs.live import runner
+
+    live = LiveConfig(state_dir=str(tmp_path))
+    assert live.sheets_id == ""
+    assert runner.phase_sheets(live) == runner.EXIT_OK
+
+
+def test_the_key_defaults_into_the_gitignored_state_dir(tmp_path):
+    live = LiveConfig(state_dir=str(tmp_path))
+    assert live.sheets_key_path == str(tmp_path / "google-sa.json")
+
+    live.sheets_key_file = "/etc/qbs/sa.json"
+    assert live.sheets_key_path == "/etc/qbs/sa.json"

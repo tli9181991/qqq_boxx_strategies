@@ -1,0 +1,25 @@
+[Unit]
+Description=QBS mirror the run log to Google Sheets (Docker)
+Documentation=file:/opt/qbs/deploy/docker/README.md
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qbs
+
+ExecStart=/usr/bin/docker compose -f /opt/qbs/deploy/docker/docker-compose.yml run --rm --no-deps qbs sheets
+
+TimeoutStartSec=300
+# Safe to retry, unlike the trade phase: each push rewrites the tabs from the
+# database, so running it twice writes the same thing twice.
+Restart=on-failure
+RestartSec=120
+StartLimitBurst=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=qbs-sheets
+
+[Install]
+WantedBy=multi-user.target

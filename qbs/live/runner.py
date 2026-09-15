@@ -641,6 +641,37 @@ def phase_baseline(live: LiveConfig, capture: bool = False,
     return EXIT_OK
 
 
+def phase_sheets(live: LiveConfig) -> int:
+    """Mirror the run log into a Google Sheet. Touches no broker.
+
+    Deliberately its own phase and its own timer. Pushing from inside reconcile
+    would put the least reliable dependency in the system -- someone else's API,
+    over the internet, behind a quota -- on the same code path as recording
+    what was traded.
+    """
+    from qbs.live import sheets
+
+    log.info("=== SHEETS ===")
+    if not live.sheets_id:
+        log.info("no spreadsheet configured (QBS_SHEETS_ID); nothing to do")
+        return EXIT_OK
+
+    try:
+        tabs = sheets.build_tabs(live.db_path)
+        written = sheets.push(live.sheets_id, live.sheets_key_path, tabs)
+    except sheets.SheetsError as exc:
+        log.error("sheets: %s", exc)
+        return EXIT_CONFIG
+    except Exception as exc:
+        log.error("sheets push failed: %s: %s", type(exc).__name__, exc)
+        return EXIT_ERROR
+
+    log.info("sheets: %s", ", ".join(f"{k}={v}" for k, v in sorted(written.items()))
+             or "(nothing written)")
+    st.record_run(live.state_path, "sheets", "ok", written)
+    return EXIT_OK
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -650,7 +681,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("phase",
                    choices=["preflight", "trade", "reconcile", "signal", "report",
-                            "baseline"],
+                            "baseline", "sheets"],
                    help="which phase to run. 'signal' prints the target book and "
                         "exits, touching no broker; 'report' prints the run log "
                         "and touches neither broker nor network")
@@ -713,6 +744,8 @@ def main(argv=None) -> int:
         return phase_report(live, days=args.days)
     if args.phase == "baseline":
         return phase_baseline(live, capture=args.capture, force=args.force)
+    if args.phase == "sheets":
+        return phase_sheets(live)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":
