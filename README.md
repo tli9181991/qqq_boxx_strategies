@@ -673,7 +673,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 142 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 149 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 ```
@@ -794,6 +794,27 @@ Two tabs:
   could not have seen on that date. When a name has cleared everything overhead the
   panel says so outright: that is the state 52% of Finviz picks are in, and it is the
   reason a breakout entry has nothing to fire on.
+
+  **Below the plot, the same name in numbers:** returns over 1w/1m/3m/6m/12m plus the
+  book's own 12-1 score, each with its **percentile rank in the universe on that date**
+  and the universe median beside it — a twelve-month return means nothing alone, since
+  the question a momentum strategy asks is relative. Then where price sits against each
+  EMA, the SMA 200, its 52-week high and its own ATR.
+
+  Last comes the row that ties the panel to the three above it: **every gate each
+  strategy actually applies, with the reading that decides it and a ✅/❌**. On the last
+  cached bar MU ranks 99 on 12-1 momentum and is blocked *only* by "within 10% of the
+  252-day high" at 17.6% off — which is the whole zero-overlap finding, per name, on
+  one screen.
+
+  Every threshold in that table is read off `FinvizScreenParams` and `BreadthParams`
+  rather than written out again, so retuning a strategy retunes its gate rows, labels
+  and verdicts with it; turn the band floor on and its row appears, turn "quarter up"
+  off and its row goes. Two legs are deliberately missing: the screen's average-volume
+  filter and the leader rule's turnover both need share volume, which this panel does
+  not carry, so clearing every row shown is **necessary but not sufficient**. The 12-1
+  hurdle is BOXX where a safe asset is supplied and zero where it is not — the row
+  says which.
 
   Price is drawn as **candlesticks**, which need real Open/High/Low. The universe
   cache holds closes only, so the panel fetches daily OHLC for the *selected name*

@@ -2001,3 +2001,138 @@ def test_diagnose_reports_each_step():
     assert "python" in steps and "finvizfinance" in steps
     # Whatever the outcome, every reported step must carry a verdict.
     assert all(isinstance(v, str) and v for v in steps.values())
+
+
+# --------------------------------------------------------------------------
+# Per-name momentum profile (qbs/breadth.py)
+# --------------------------------------------------------------------------
+
+def _profile_universe():
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    return pd.DataFrame({
+        "WIN": np.linspace(10.0, 40.0, n),        # strongest
+        "MID": np.linspace(10.0, 14.0, n),
+        "FLAT": np.full(n, 10.0),
+        "LOSE": np.linspace(40.0, 12.0, n),       # weakest
+    }, index=idx)
+
+
+def test_momentum_profile_ranks_within_the_universe():
+    """A return means nothing alone; the rank is the point."""
+    from qbs.breadth import momentum_profile
+
+    px = _profile_universe()
+    win = momentum_profile(px, "WIN")["returns"].set_index("Horizon")
+    lose = momentum_profile(px, "LOSE")["returns"].set_index("Horizon")
+
+    assert win.loc["12 months", "Rank"] > lose.loc["12 months", "Rank"]
+    assert win.loc["12 months", "Return"] > win.loc["12 months", "Universe median"]
+    assert lose.loc["12 months", "Return"] < lose.loc["12 months", "Universe median"]
+    assert win["Rank"].between(1, 99).all()
+
+
+def test_momentum_profile_uses_12_1_not_12_0():
+    """The momentum book scores 12-1, skipping the most recent month. The row
+    must differ from the 12-month row, or it is measuring the wrong thing."""
+    from qbs.breadth import momentum_profile
+
+    px = _profile_universe().copy()
+    # A spike confined to the last month: 12-0 sees it, 12-1 must not.
+    px.iloc[-15:, px.columns.get_loc("MID")] *= 3.0
+    r = momentum_profile(px, "MID")["returns"].set_index("Horizon")
+    assert r.loc["12 months", "Return"] > r.loc["12-1 momentum", "Return"]
+
+
+def test_momentum_profile_gates_explain_a_rejection():
+    """The gate table is the point of the panel: it has to name the rule that
+    blocks a name, not merely that something did."""
+    from qbs.breadth import momentum_profile
+
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    # Rises hard, then gives back 14%. Chosen so it is MORE than 10% off its
+    # high while still above the 200-day average: that isolates the proximity
+    # rule as the only thing blocking it, which is the case worth pinning.
+    path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
+    px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
+
+    g = momentum_profile(px, "PULLBACK")["gates"].set_index("Rule")
+    proximity = "within 10% of 252-day high"
+    # Truthiness, not identity: pandas stores these as numpy bools, and
+    # `np.False_ is False` is False.
+    assert not g.loc[proximity, "Pass"]
+    assert g.loc["above SMA 200", "Pass"], "the pullback must stay above SMA 200"
+    blocked = g[~g["Pass"].astype(bool)]
+    assert proximity in blocked.index
+    assert "above SMA 200" not in blocked.index, "only the proximity rule blocks it"
+
+
+def test_momentum_profile_gates_follow_the_screen_parameters():
+    """The panel reports the screen that is configured, not the one that was
+    configured when the panel was written. Retune the params and every
+    threshold, label and verdict has to move with them."""
+    from qbs.breadth import momentum_profile
+    from qbs.config import FinvizScreenParams
+
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
+    px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
+
+    # 14% off the high fails a 10% ceiling and clears a 20% one.
+    tight = momentum_profile(px, "PULLBACK",
+                             screen=FinvizScreenParams())["gates"].set_index("Rule")
+    loose = momentum_profile(
+        px, "PULLBACK",
+        screen=FinvizScreenParams(within_52w_high_pct=0.20))["gates"].set_index("Rule")
+    assert not tight.loc["within 10% of 252-day high", "Pass"]
+    assert loose.loc["within 20% of 252-day high", "Pass"]
+
+    # A configured band floor adds its row; the default ceiling-only rule
+    # must not claim a floor the screen does not apply.
+    assert not any("off the high" in r for r in tight.index)
+    banded = momentum_profile(
+        px, "PULLBACK",
+        screen=FinvizScreenParams(min_off_high_pct=0.05))["gates"].set_index("Rule")
+    assert banded.loc["at least 5% off the high", "Pass"], "14% off clears a 5% floor"
+
+    # The quarter-up row disappears when the screen stops requiring it.
+    assert any("quarter up" in r for r in tight.index)
+    off = momentum_profile(
+        px, "PULLBACK",
+        screen=FinvizScreenParams(require_quarter_up=False))["gates"].set_index("Rule")
+    assert not any("quarter up" in r for r in off.index)
+
+
+def test_momentum_profile_hurdle_uses_the_safe_asset_when_given():
+    from qbs.breadth import momentum_profile
+
+    px = _profile_universe()
+    idx = px.index
+    safe = pd.Series(np.linspace(100.0, 130.0, len(idx)), index=idx)  # strong cash
+
+    without = momentum_profile(px, "MID")["gates"].set_index("Rule")
+    with_safe = momentum_profile(px, "MID", safe=safe)["gates"].set_index("Rule")
+
+    rules_without = [r for r in without.index if r.startswith("12-1 beats")]
+    rules_with = [r for r in with_safe.index if r.startswith("12-1 beats")]
+    assert "zero" in rules_without[0], "no safe asset -> the weaker test, and it says so"
+    assert "BOXX" in rules_with[0], "the hurdle used must be named"
+
+
+def test_momentum_profile_unknown_ticker_is_empty_not_an_error():
+    from qbs.breadth import momentum_profile
+
+    prof = momentum_profile(_profile_universe(), "NOPE")
+    assert all(v.empty for v in prof.values())
+
+
+def test_momentum_profile_trend_rows_are_present():
+    from qbs.breadth import momentum_profile
+
+    tr = momentum_profile(_profile_universe(), "WIN")["trend"].set_index("Measure")
+    for row in ("vs EMA 10", "vs EMA 200", "Off 52-week high", "vs SMA 200",
+                "Distance from 50-day EMA", "Annualised volatility"):
+        assert row in tr.index
+    assert tr.loc["Off 52-week high", "Value"] >= -1e-9, "a high is never below price"

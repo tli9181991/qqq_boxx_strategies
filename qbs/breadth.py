@@ -37,10 +37,12 @@ passed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+from .config import FinvizScreenParams
 
 
 @dataclass
@@ -343,3 +345,212 @@ def atr_class(value: float, p: Optional[BreadthParams] = None) -> str:
     if value <= -p.atr_stretched:
         return "oversold"
     return "normal"
+
+
+# --------------------------------------------------------------------------
+# One name's momentum, numerically
+# --------------------------------------------------------------------------
+
+MOMENTUM_HORIZONS = (("1 week", 5), ("1 month", 21), ("3 months", 63),
+                     ("6 months", 126), ("12 months", 252))
+
+
+def momentum_profile(
+    closes: pd.DataFrame,
+    ticker: str,
+    asof: Optional[pd.Timestamp] = None,
+    p: Optional[BreadthParams] = None,
+    safe: Optional[pd.Series] = None,
+    ema_spans: Sequence[int] = (10, 20, 50, 200),
+    screen: Optional[FinvizScreenParams] = None,
+) -> Dict[str, pd.DataFrame]:
+    """The numbers behind a price chart: returns, rank, location, and gates.
+
+    Returns three frames under the keys `returns`, `trend` and `gates`.
+
+    **Rank is a percentile within the universe you pass**, on the date you
+    ask about, computed from the same trailing returns. A "+120% over twelve
+    months" tells you nothing on its own -- the whole question a momentum
+    strategy asks is *relative*, so the number only means something next to
+    what every other candidate did over the same window.
+
+    `gates` is the part worth reading. Each row is a rule one of the
+    strategies in this package actually applies, with the value that decides
+    it, so a chart can answer "why is the Finviz screen not holding this?"
+    instead of leaving the reader to infer it. Every threshold is read off
+    `screen` and `p`, never written out again, so retuning the strategy
+    retunes the table with it.
+
+    Two honest gaps. The 12-1 hurdle is measured against `safe` (BOXX) when
+    supplied and against zero when not -- a weaker test, and the row says
+    which was used. And the two legs that need share volume (the screen's
+    average-volume filter, the leader rule's turnover) are omitted rather
+    than guessed, so passing every row here is necessary but not sufficient.
+
+    `Fmt` tells a caller how to render `Value`: `pct` a signed percentage,
+    `price` a dollar level, `off` a distance BELOW the 52-week high, which is
+    a positive number meaning the opposite of a gain and must not be printed
+    with a `+`.
+    """
+    p = p or BreadthParams()
+    screen = screen or FinvizScreenParams()
+    px = closes.sort_index()
+    asof = pd.Timestamp(asof) if asof is not None else px.index[-1]
+    px = px.loc[:asof]
+    if ticker not in px.columns or px[ticker].dropna().empty:
+        return {"returns": pd.DataFrame(), "trend": pd.DataFrame(),
+                "gates": pd.DataFrame()}
+
+    s = px[ticker]
+    last = float(s.iloc[-1])
+
+    # ---- returns and the cross-sectional rank of each ---------------------
+    rows = []
+    for label, n in MOMENTUM_HORIZONS:
+        if len(px) <= n:
+            continue
+        universe_ret = px.iloc[-1] / px.iloc[-1 - n] - 1.0
+        r = universe_ret.get(ticker, np.nan)
+        rows.append({"Horizon": label, "Return": r,
+                     "Rank": _percentile(universe_ret, ticker),
+                     "Universe median": universe_ret.median()})
+
+    # 12-1: the momentum book's own score, skipping the most recent month.
+    mom_12_1 = np.nan
+    if len(px) > 252:
+        u = px.iloc[-1 - 21] / px.iloc[-1 - 252] - 1.0
+        mom_12_1 = u.get(ticker, np.nan)
+        rows.append({"Horizon": "12-1 momentum", "Return": mom_12_1,
+                     "Rank": _percentile(u, ticker),
+                     "Universe median": u.median()})
+    returns = pd.DataFrame(rows)
+
+    # ---- where the price sits ---------------------------------------------
+    trend_rows = []
+    for span in ema_spans:
+        ema = s.ewm(span=span, adjust=False, min_periods=span).mean()
+        v = float(ema.iloc[-1]) if ema.notna().any() else np.nan
+        trend_rows.append({"Measure": f"vs EMA {span}",
+                           "Value": (last / v - 1.0) if v and not np.isnan(v) else np.nan,
+                           "Unit": "%"})
+
+    high_252 = float(s.tail(252).max()) if len(s) >= 2 else np.nan
+    trend_rows.append({"Measure": "Off 52-week high",
+                       "Value": (high_252 - last) / high_252 if high_252 else np.nan,
+                       "Unit": "%"})
+    sma200 = s.rolling(200, min_periods=200).mean()
+    sma_v = float(sma200.iloc[-1]) if sma200.notna().any() else np.nan
+    trend_rows.append({"Measure": "vs SMA 200",
+                       "Value": (last / sma_v - 1.0) if sma_v and not np.isnan(sma_v) else np.nan,
+                       "Unit": "%"})
+    atr_pct = _atr_pct(s, p.atr_window)
+    trend_rows.append({"Measure": f"ATR({p.atr_window})", "Value": atr_pct, "Unit": "%"})
+    trend_rows.append({"Measure": "Distance from 50-day EMA",
+                       "Value": float(atr_distance(s, ema_span=p.ema_span,
+                                                   atr_window=p.atr_window).iloc[-1]),
+                       "Unit": "ATR"})
+    trend_rows.append({"Measure": "Annualised volatility",
+                       "Value": float(s.pct_change().tail(252).std() * np.sqrt(252)),
+                       "Unit": "%"})
+    trend = pd.DataFrame(trend_rows)
+
+    # ---- the gates each strategy actually applies --------------------------
+    # Every threshold here is read off the screen parameters rather than
+    # written out again, so the panel cannot drift from the screen it claims
+    # to be reporting: retune `FinvizScreenParams` and these rows retune with
+    # it. Only the quarter window is the screen's own (`quarter_lookback`),
+    # which is why the leader row below recomputes its gain separately.
+    def _gain(n: int) -> float:
+        return last / float(s.iloc[-1 - n]) - 1.0 if len(s) > n else np.nan
+
+    screen_qtr = _gain(screen.quarter_lookback)
+    leader_qtr = _gain(p.leader_quarter_days)
+    high_w = float(s.tail(screen.high_window).max()) if len(s) >= 2 else np.nan
+    off_high = (high_w - last) / high_w if high_w else np.nan
+    sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
+    sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
+
+    hurdle, hurdle_label = 0.0, "zero (no safe asset supplied)"
+    if safe is not None:
+        sf = safe.reindex(px.index).ffill()
+        if len(sf) > 252 and pd.notna(sf.iloc[-1 - 21]) and pd.notna(sf.iloc[-1 - 252]):
+            hurdle = float(sf.iloc[-1 - 21] / sf.iloc[-1 - 252] - 1.0)
+            hurdle_label = f"BOXX 12-1 ({hurdle:+.1%})"
+
+    rows = [
+        {"Strategy": "Momentum book", "Rule": f"12-1 beats {hurdle_label}",
+         "Value": mom_12_1, "Fmt": "pct",
+         "Pass": bool(mom_12_1 > hurdle) if pd.notna(mom_12_1) else None},
+        # `>=`, matching `priced` in `finviz_momentum_screen` -- a name sitting
+        # exactly on the threshold passes the screen, so it passes here too.
+        {"Strategy": "Finviz screen",
+         "Rule": f"close at or above ${screen.min_price:,.0f}",
+         "Value": last, "Fmt": "price", "Pass": bool(last >= screen.min_price)},
+        {"Strategy": "Finviz screen", "Rule": f"above SMA {screen.above_sma}",
+         "Value": (last / sma_last - 1.0) if sma_last and pd.notna(sma_last) else np.nan,
+         "Fmt": "pct", "Pass": bool(last > sma_last) if pd.notna(sma_last) else None},
+        {"Strategy": "Finviz screen",
+         "Rule": f"within {screen.within_52w_high_pct:.0%} of "
+                 f"{screen.high_window}-day high",
+         "Value": off_high, "Fmt": "off",
+         "Pass": bool(off_high <= screen.within_52w_high_pct)
+         if pd.notna(off_high) else None},
+    ]
+    if screen.min_off_high_pct:
+        # The band floor, only when one is configured -- the notebook's rule is
+        # a ceiling alone, and a row asserting a floor it does not apply would
+        # be reporting a strategy nobody is running.
+        rows.append({"Strategy": "Finviz screen",
+                     "Rule": f"at least {screen.min_off_high_pct:.0%} off the high",
+                     "Value": off_high, "Fmt": "off",
+                     "Pass": bool(off_high >= screen.min_off_high_pct)
+                     if pd.notna(off_high) else None})
+    if screen.require_quarter_up:
+        rows.append({"Strategy": "Finviz screen",
+                     "Rule": f"quarter up ({screen.quarter_lookback}d)",
+                     "Value": screen_qtr, "Fmt": "pct",
+                     "Pass": bool(screen_qtr > 0) if pd.notna(screen_qtr) else None})
+    if screen.min_quarter_return is not None:
+        rows.append({"Strategy": "Finviz screen",
+                     "Rule": f"quarterly gain over {screen.min_quarter_return:.0%}",
+                     "Value": screen_qtr, "Fmt": "pct",
+                     "Pass": bool(screen_qtr >= screen.min_quarter_return)
+                     if pd.notna(screen_qtr) else None})
+    # The leader rule has three legs (`leader_mask`): price, dollar turnover
+    # and quarterly gain. Two are shown. The turnover leg needs share volume,
+    # which this panel does not carry, so it is left out rather than guessed --
+    # a name passing both rows below may still miss on turnover.
+    rows.append({"Strategy": "Momentum leader",
+                 "Rule": f"close at or above ${p.leader_min_price:,.0f}",
+                 "Value": last, "Fmt": "price",
+                 "Pass": bool(last >= p.leader_min_price)})
+    rows.append({"Strategy": "Momentum leader",
+                 "Rule": f"quarterly gain over {p.leader_min_quarter_return:.0%} "
+                         f"({p.leader_quarter_days}d)",
+                 "Value": leader_qtr, "Fmt": "pct",
+                 "Pass": bool(leader_qtr >= p.leader_min_quarter_return)
+                 if pd.notna(leader_qtr) else None})
+    gates = pd.DataFrame(rows)
+    return {"returns": returns, "trend": trend, "gates": gates}
+
+
+def _percentile(universe: pd.Series, ticker: str) -> float:
+    """Where `ticker` sits in the cross-section, 1-99 like the notebook's RS Rank."""
+    clean = universe.dropna()
+    if ticker not in clean.index or len(clean) < 2:
+        return np.nan
+    return float(round(clean.rank(pct=True)[ticker] * 98 + 1))
+
+
+def _atr_pct(close: pd.Series, window: int) -> float:
+    """ATR as a fraction of price, from the close-to-close range.
+
+    Close-only input, so this is the conservative (narrower) reading of range
+    -- see `atr_distance` for the same caveat.
+    """
+    prev = close.shift()
+    tr = pd.concat([(close - prev).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window).mean()
+    if atr.notna().sum() == 0 or close.iloc[-1] == 0:
+        return float("nan")
+    return float(atr.iloc[-1] / close.iloc[-1])

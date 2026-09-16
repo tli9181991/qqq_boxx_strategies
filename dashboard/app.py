@@ -36,7 +36,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
-                         pulse_class, sector_breakdown)
+                         momentum_profile, pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
@@ -512,6 +512,69 @@ with tab_picks:
                     "only** — the same causal rule the breakout strategy uses, so "
                     "the chart never shows a level the strategy could not have seen."
                 )
+
+                # ---- the numbers behind the picture -----------------------
+                # Same params the picks table above was screened with, so the
+                # gate rows report the screen actually running, not a default.
+                prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
+                                        screen=FinvizScreenParams(n_hold=int(n_hold)))
+                if not prof["returns"].empty:
+                    st.markdown("###### Momentum")
+                    ret = prof["returns"].copy()
+                    st.dataframe(
+                        ret.style.format({"Return": "{:+.1%}",
+                                          "Universe median": "{:+.1%}",
+                                          "Rank": "{:.0f}"}, na_rep="—")
+                        .background_gradient(subset=["Rank"], cmap="RdYlGn",
+                                             vmin=1, vmax=99),
+                        hide_index=True, width="stretch",
+                        height=45 + 35 * len(ret))
+                    st.caption(
+                        "**Rank is a percentile within this universe on this date**, "
+                        "1–99. A twelve-month return means nothing on its own — the "
+                        "question a momentum strategy asks is relative, so the number "
+                        "only counts next to what every other candidate did. "
+                        "*Universe median* is that comparison in one column."
+                    )
+
+                    tr = prof["trend"].copy()
+                    tr["Value"] = [
+                        ("—" if pd.isna(v) else
+                         f"{v:+.2f} ATR" if u == "ATR" else f"{v:+.1%}")
+                        for v, u in zip(tr["Value"], tr["Unit"])]
+                    st.dataframe(tr[["Measure", "Value"]], hide_index=True,
+                                 width="stretch", height=45 + 35 * len(tr))
+
+                    st.markdown("###### Which strategies would take it, and why")
+                    g = prof["gates"].copy()
+                    # `off` is a distance below the high, so it never carries
+                    # a "+" -- 17.6% there means 17.6% WORSE than the high.
+                    g["Reading"] = [
+                        ("—" if pd.isna(v) else
+                         f"${v:,.2f}" if f == "price" else
+                         f"{v:.1%} off high" if f == "off" else f"{v:+.1%}")
+                        for v, f in zip(g["Value"], g["Fmt"])]
+                    g["✓"] = ["—" if x is None else ("✅" if x else "❌")
+                              for x in g["Pass"]]
+                    st.dataframe(g[["Strategy", "Rule", "Reading", "✓"]],
+                                 hide_index=True, width="stretch",
+                                 height=45 + 35 * len(g))
+                    failed = g[g["Pass"] == False]          # noqa: E712
+                    if not failed.empty:
+                        note = ("Blocked by: "
+                                + "; ".join(f"**{r.Strategy}** — {r.Rule} "
+                                            f"({r.Reading})"
+                                            for r in failed.itertuples()) + ".")
+                        # Only claim the overlap finding when it is the
+                        # proximity rule doing the blocking -- that is the
+                        # specific disagreement it describes.
+                        if any("high" in r.Rule and r.Strategy == "Finviz screen"
+                               for r in failed.itertuples()):
+                            note += (" This is the per-name version of the overlap "
+                                     "finding: a name can rank at the very top on "
+                                     "momentum and still fail the proximity test, "
+                                     "which is why the two screens rarely agree.")
+                        st.caption(note)
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(
