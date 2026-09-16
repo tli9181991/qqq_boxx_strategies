@@ -18,7 +18,8 @@ from .metrics import format_summary, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
-    cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
+    cross_sectional_momentum, gem, residual_momentum, vix_circuit_breaker,
+    vol_target_overlay,
 )
 from .universe import (
     load_universe, load_universe_prices, membership_mask, pit_tickers,
@@ -69,6 +70,7 @@ def run(
     with_vix: bool = True,
     with_book_vt: bool = True,
     with_finviz: bool = True,
+    with_resmom: bool = True,
     vix: Optional[pd.Series] = None,
     fetch_universe: bool = True,
     pit_membership: Optional[pd.DataFrame] = None,
@@ -80,6 +82,7 @@ def run(
     `with_book_vt=False` drops the vol-targeted variant of the momentum book.
     `with_finviz=False` drops the Finviz screen, which shares the same universe
     download and so is free once the momentum book has been built.
+    `with_resmom=False` drops the residual-momentum book, likewise free.
     `pit_membership` takes a point-in-time membership frame (see
     `universe.load_pit_universe`) to remove survivorship bias from the ranking.
     """
@@ -176,6 +179,16 @@ def run(
                 mom_sig, combined, cfg.book_vol, lag=cfg.execution_lag,
                 name="momentum_vt")
 
+        # ---- the same slots, ranked on residual instead of total momentum -
+        # Total-return momentum ranks a name partly for its beta in a rising
+        # market, which is why the six slots keep collapsing into one sector
+        # bet. This strips the market component out of the SCORE and changes
+        # nothing else, so the comparison against `momentum` isolates it.
+        if with_resmom:
+            signals["resmom"] = residual_momentum(
+                uni, prices[SAFE_ASSET], prices[RISK_ASSET], cfg.resmom,
+                eligible=eligible, name="resmom")
+
         # ---- the Finviz screen, ranking the SAME universe ----------------
         # Same names, same slots, same engine, same costs, so the only thing
         # the comparison against `momentum` can be measuring is the selection
@@ -191,7 +204,8 @@ def run(
     results: Dict[str, BacktestResult] = {}
     for key, sig in signals.items():
         book = (combined
-                if key in ("momentum", "momentum_vix", "momentum_vt", "finviz")
+                if key in ("momentum", "momentum_vix", "momentum_vt", "finviz",
+                           "resmom")
                 else prices)
         results[key] = run_backtest(
             book, sig, start=cfg.backtest_start, end=cfg.backtest_end,

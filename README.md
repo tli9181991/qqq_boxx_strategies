@@ -1,6 +1,6 @@
 # QQQ / BOXX strategy lab
 
-Seven trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
+Eight trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
 that shows you where every signal fired.
 
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
@@ -11,6 +11,8 @@ that shows you where every signal fired.
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
 - **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
   can be held against the momentum book on identical assumptions
+- **Top-6 residual momentum** — the same six slots ranked on what the market *cannot*
+  explain, which is the one change in this lab that survived a paired robustness test
 
 Plus one strategy that does not fit the daily model and runs on its own:
 
@@ -254,6 +256,55 @@ bought after it. The cap gates entry only.
 `sweep_corr_cap()` runs the table above. **[`docs/HYBRID_ANALYSIS.md`](docs/HYBRID_ANALYSIS.md)**
 is the full study this came out of — including the candidates that did *not*
 survive, and why a 20-month sample cannot resolve most of what people ask it.
+
+---
+
+### 4c. Residual momentum — rank on what the market cannot explain
+
+The one addition to this lab that passed the robustness test several
+better-looking ideas failed. Full write-up:
+**[`docs/RESIDUAL_MOMENTUM.md`](docs/RESIDUAL_MOMENTUM.md)**.
+
+| | Rule |
+|---|---|
+| Market model | rolling single-factor regression against QQQ, `beta_window` (252) days |
+| Residual | `r − β·r_mkt`, net of its own rolling mean |
+| Score | sum of residuals over the 12-1 window ÷ their own standard deviation |
+| Everything else | unchanged — six slots, band 10, absolute filter vs BOXX, cash leg |
+
+Only the ranking changes, so held against `momentum` the difference can only be
+the score.
+
+**Why it helps here.** Total-return momentum ranks a name highly partly for
+having a *large beta in a rising market* — so it keeps selecting the crowded
+trade, and section 6's concentration blow-up is the result. Stripping the
+market component raises effective bets from **1.91 to 2.19** out of six slots,
+better than the explicit correlation cap manages, without any diversification
+constraint at all.
+
+| | CAGR | Vol | Sharpe | Max DD | Calmar | Turnover |
+|---|---|---|---|---|---|---|
+| Top-6 NDX momentum (12-1) | 46.1% | 49.0% | 0.94 | −34.8% | 1.32 | 5.7× |
+| **Top-6 residual momentum** | **68.4%** | **39.6%** | **1.41** | −34.9% | **1.96** | 14.5× |
+
+**Read the paired test, not that table.** Across 41 `(n_hold, exit_rank)`
+cells it wins Sharpe in **36/41** and lowers volatility in **40/41** (median
+−9.6%), but wins CAGR in only 23/41. So this is a *risk* reduction that holds
+return flat-to-better — which is exactly the source paper's claim — not a
+return generator. It trades 2.5× as much as the plain book and still beats it
+at 100bp of slippage, twenty times the default.
+
+Unlike the candidates in `HYBRID_ANALYSIS.md`, its main parameter has a
+plateau: every `beta_window` from 126 to 504 days beats the baseline on both
+Sharpe and volatility.
+
+⚠️ Ehsani & Linnainmaa (2022) argue residual momentum may just be harvesting
+factors *omitted* from the regression. This uses one factor where the paper
+used three, so that critique applies with more force here, not less. Read it
+as "momentum with the market bet removed" — measurable — rather than as a
+separate anomaly, which is contested. It also does **not** compose with the
+correlation cap: both decorrelate, and stacking them over-constrains the
+universe (Sharpe 1.33 against 1.41). Pick one.
 
 ---
 
@@ -716,7 +767,9 @@ qbs/
   data.py         yfinance download + CSV cache + synthetic market and VIX generators
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
-  strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
+  strategies.py   the ranking/overlay strategies -> weights + diagnostics + events;
+                  includes residual momentum, which reuses the Top-N slot machinery
+                  and only swaps the score it sorts on
   screens.py      filter-based screens: the trend template and the Finviz screen,
                   both rolled forward from a notebook so they can be backtested
   breakout.py     hourly resistance-breakout trading + the weekly six-slot book;
@@ -760,7 +813,7 @@ look-ahead would have been worth.
 
 ```python
 from qbs.config import (BookVolTargetParams, Config, MomentumParams,
-                        RSI2Params, VolTargetParams)
+                        RSI2Params, ResidualMomentumParams, VolTargetParams)
 from qbs.pipeline import run, sweep_band
 
 cfg = Config()
@@ -772,6 +825,7 @@ cfg.momentum = MomentumParams(n_hold=8, exit_rank=20,        # wider band, less 
                               rebalance="ME")                # monthly instead of daily
 cfg.book_vol = BookVolTargetParams(target_vol=0.15)          # a calmer momentum book
 cfg.momentum = MomentumParams(max_corr=0.75)                 # decorrelate the six slots
+cfg.resmom = ResidualMomentumParams(beta_window=252)         # rank on residuals
 
 lab = run(cfg)
 lab.summary_pretty
@@ -782,11 +836,12 @@ sweep_band(lab)                                              # is there a platea
 python run_backtest.py --start 2024-09-01 --n-hold 8 --exit-rank 20 --sweep-band --csv
 python run_backtest.py --slippage-bps 20            # does it survive worse fills?
 python run_backtest.py --sweep-corr-cap             # six slots, or six bets?
+python run_backtest.py --beta-window 126            # residual momentum's other end
 python run_backtest.py --sweep-vix --vix-exit 25    # where should the VIX trigger sit?
 python tests/test_qbs.py
 ```
 
-Adding a seventh strategy means writing a function that returns a `StrategySignals`
+Adding another strategy means writing a function that returns a `StrategySignals`
 and adding it to `pipeline.build_signals`. Everything downstream — engine, metrics,
 charts — works on it unchanged.
 

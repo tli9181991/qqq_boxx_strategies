@@ -148,6 +148,68 @@ class MomentumParams:
 
 
 @dataclass
+class ResidualMomentumParams:
+    """Residual (idiosyncratic) momentum -- Blitz, Huij & Martens (2009).
+
+    Rank on the part of a stock's return the market cannot explain, rather
+    than on its total return. Fit a market model over a trailing window, keep
+    the residual return stream, and score the 12-1 window of residuals divided
+    by their own standard deviation.
+
+    Why it belongs in THIS lab specifically. The Top-6 book's problem is not
+    that it picks weak names, it is that it picks the same bet six times: the
+    held names run a mean pairwise correlation of 0.43, about 1.9 independent
+    positions across six slots, because whatever is trending hardest in the
+    Nasdaq-100 is usually one sector. Total-return momentum ranks a name highly
+    for having a large beta in a rising market, so it systematically selects
+    the crowded trade. Stripping the market component removes exactly that.
+
+    The academic construction regresses on Fama-French three factors over 36
+    months. This uses a SINGLE factor -- QQQ -- because the lab has no SMB/HML
+    offline, and because on a Nasdaq-100 universe the market/tech factor is the
+    one doing the damage. That is a real simplification and it cuts in a
+    specific direction: see the warning below.
+
+    `standardise` is what makes this a risk-adjusted score rather than a
+    residual return. It is the difference between Sharpe 1.41 and 1.10 on the
+    cached window, and it is in the source paper, so it defaults on.
+
+    ⚠️ Ehsani & Linnainmaa (2022) argue residual momentum may simply be
+    harvesting factors OMITTED from the regression that happen to be more
+    autocorrelated than the ones included. A one-factor model omits more than
+    a three-factor model does, so that critique applies here with more force,
+    not less. Treat this as "momentum with the market bet removed", which is
+    measurable, rather than as a distinct anomaly, which is contested.
+    """
+    beta_window: int = 252        # trailing days behind the market-model beta
+    lookback_months: int = 12
+    skip_months: int = 1          # the same 12-1 convention as the total-return book
+    standardise: bool = True      # divide by the residual's own vol -- the paper's score
+    # Below this daily residual standard deviation the score is a 0/0 and the
+    # name is simply not rankable. Guards the degenerate case of a name the
+    # market explains exactly; see `residual_momentum_score`.
+    resid_vol_floor: float = 1e-6
+    market_asset: str = RISK_ASSET
+    n_hold: int = 6
+    exit_rank: int = 10
+    rebalance: str = "daily"
+    absolute_filter: bool = True  # still judged on 12-1 vs the safe asset
+    safe_asset: str = SAFE_ASSET
+    min_history: int = 260
+    max_corr: float | None = None   # the correlation cap composes with this too
+    corr_window: int = 60
+    corr_pool: int = 30
+
+    def __post_init__(self):
+        if self.exit_rank < self.n_hold:
+            raise ValueError("exit_rank must be >= n_hold (the band cannot be negative)")
+        if self.lookback_months <= self.skip_months:
+            raise ValueError("lookback_months must exceed skip_months")
+        if self.beta_window < 20:
+            raise ValueError("beta_window is too short to estimate a beta from")
+
+
+@dataclass
 class FinvizScreenParams:
     """The Finviz screener strategy, rolled forward so it can be backtested.
 
@@ -393,6 +455,7 @@ class Config:
     gem: GEMParams = field(default_factory=GEMParams)
     vol: VolTargetParams = field(default_factory=VolTargetParams)
     momentum: MomentumParams = field(default_factory=MomentumParams)
+    resmom: ResidualMomentumParams = field(default_factory=ResidualMomentumParams)
     finviz: FinvizScreenParams = field(default_factory=FinvizScreenParams)
     breakout: BreakoutParams = field(default_factory=BreakoutParams)
     weekly_book: WeeklyBookParams = field(default_factory=WeeklyBookParams)
@@ -421,6 +484,10 @@ PALETTE = {
     # hues are used up, so this one separates by lightness instead.
     "finviz":    "#3d4f5c",   # slot 7 -- dark slate
     "breakout":  "#a8572c",   # slot 8 -- burnt umber, also outside the set
+    # Slot 9 is also outside the validated six-hue set: it separates from the
+    # momentum yellow by lightness, which is what the eye uses when the
+    # categorical hues are spent.
+    "resmom":    "#00696e",   # slot 9 -- deep teal
     "bh_qqq":    "#898781",   # benchmark -- muted
     "bh_boxx":   "#c3c2b7",   # benchmark -- fainter still
     "buy":       "#0ca30c",   # status: good
@@ -444,6 +511,7 @@ STRATEGY_LABELS = {
     "momentum_vt": "Top-6 vol-targeted",
     "finviz": "Top-6 Finviz screen",
     "breakout": "Weekly breakout, 6 slots",
+    "resmom": "Top-6 residual momentum",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",
 }
