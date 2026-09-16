@@ -1,0 +1,28 @@
+[Unit]
+Description=Patreon pipeline: campaign sweep (backstop for missed emails)
+Documentation=file:/opt/qbs/docs/PATREON_PIPELINE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=patreon
+Group=patreon
+WorkingDirectory=/opt/qbs
+EnvironmentFile=/etc/patreon/patreon.env
+ExecStart=/opt/qbs/.venv/bin/python -m patreon_pipeline.runner sweep --limit 20
+ProtectHome=false
+
+# Deliberately no Restart. The sweep is idempotent and runs again in six
+# hours; a failed sweep needs no immediate retry.
+Restart=no
+TimeoutStartSec=1800
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patreon-sweep
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/patreon

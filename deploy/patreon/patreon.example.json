@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to /etc/patreon/config.json and edit. Secrets do NOT go here -- the Gmail app password is read from the environment only (see patreon.env.example).",
+
+  "imap_user": "you@gmail.com",
+  "imap_folder": "Patreon",
+
+  "campaign_urls": [
+    "https://www.patreon.com/c/somecreator"
+  ],
+
+  "cookies_from_browser": "firefox",
+
+  "drive_folder_name": "Patreon",
+  "drive_subfolder_per_creator": true,
+
+  "audio_only": false,
+  "delete_after_upload": true,
+  "max_attempts": 4
+}
