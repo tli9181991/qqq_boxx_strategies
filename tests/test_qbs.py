@@ -260,6 +260,90 @@ def test_momentum_has_no_lookahead_in_the_score():
         sig.momentum.loc[:dt, col], sig2.momentum.loc[:dt, col], check_names=False)
 
 
+def test_corr_cap_off_is_bit_identical_to_the_plain_ranker():
+    """The cap must default to OFF and change nothing when it is.
+
+    A new selection filter that quietly moves the shipped strategy would
+    invalidate every number in the README, so this is the test that matters
+    most about it.
+    """
+    uni, safe = _mom_fixture()
+    plain = cross_sectional_momentum(uni, safe, MomentumParams())
+    explicit_off = cross_sectional_momentum(uni, safe, MomentumParams(max_corr=None))
+    pd.testing.assert_frame_equal(plain.weights, explicit_off.weights)
+
+
+def test_corr_cap_raises_the_number_of_independent_bets():
+    """Tightening the cap must lower the held book's mean pairwise correlation.
+
+    This is the mechanism the parameter exists for, and unlike its effect on
+    return it should be close to monotone. The fixture is built so that the
+    top-ranked names are deliberately near-duplicates of each other.
+    """
+    uni, safe = _mom_fixture()
+    rets = uni.pct_change()
+
+    def mean_corr(sig):
+        vals = []
+        for dt, names in sig.holdings_log.items():
+            if len(names) < 2:
+                continue
+            win = rets.loc[:dt, names].tail(60)
+            if len(win) < 30:
+                continue
+            c = win.corr().to_numpy()
+            iu = np.triu_indices_from(c, 1)
+            if np.isfinite(c[iu]).any():
+                vals.append(np.nanmean(c[iu]))
+        return float(np.mean(vals)) if vals else np.nan
+
+    loose = mean_corr(cross_sectional_momentum(uni, safe, MomentumParams()))
+    tight = mean_corr(cross_sectional_momentum(uni, safe, MomentumParams(max_corr=0.5)))
+    assert tight <= loose + 1e-9, f"cap did not decorrelate the book: {loose} -> {tight}"
+
+
+def test_corr_cap_never_exceeds_the_slot_count():
+    """The cap may leave slots in cash, but must never overfill the book."""
+    uni, safe = _mom_fixture()
+    p = MomentumParams(max_corr=0.3, n_hold=6)
+    sig = cross_sectional_momentum(uni, safe, p)
+    assert all(len(v) <= p.n_hold for v in sig.holdings_log.values())
+    risky = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risky <= 1.0 + 1e-9).all()
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+
+
+def test_corr_cap_has_no_look_ahead():
+    """The correlation matrix at t must not see a single return after t."""
+    uni, safe = _mom_fixture()
+    cut = uni.index[len(uni) // 2]
+    rng = np.random.default_rng(0)
+    tampered = uni.copy()
+    after = tampered.index > cut
+    tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
+
+    p = MomentumParams(max_corr=0.7)
+    a = cross_sectional_momentum(uni, safe, p).weights.loc[:cut]
+    b = cross_sectional_momentum(tampered, safe, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_corr_cap_rejects_an_impossible_pool():
+    """corr_pool below n_hold could never fill the book -- fail loudly."""
+    try:
+        MomentumParams(n_hold=6, corr_pool=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("corr_pool < n_hold should be rejected")
+    try:
+        MomentumParams(max_corr=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an out-of-range max_corr should be rejected")
+
+
 def test_momentum_absolute_filter_goes_to_cash():
     """When nothing beats the safe asset, the book must sit in the safe asset."""
     base, _ = _mom_fixture()

@@ -361,6 +361,24 @@ def cross_sectional_momentum(
     Anything that cannot be filled -- too few eligible names, or (with
     `absolute_filter`) too few names beating the safe asset -- goes to cash in
     the safe asset rather than being force-allocated into a falling stock.
+
+    The correlation cap
+    -------------------
+    With `params.max_corr` set, a candidate is skipped when its trailing
+    correlation with a name already chosen exceeds the cap. The rank decides
+    which names are strong; the cap decides whether the book is holding six
+    bets or one bet six times. Momentum is a trend signal, so the names
+    trending hardest at any moment tend to be one sector -- on the cached
+    window the unconstrained book ran a mean pairwise correlation of 0.43,
+    about 1.9 independent bets across its 6 slots.
+
+    Held names are NOT re-tested against the cap: the band already decides
+    what is held, and re-testing would evict a name for the sin of being
+    correlated with something bought after it. The cap gates entry only.
+
+    The estimate is strictly causal -- the correlation matrix at date `t` is
+    built from returns up to and including `t`, then used to pick weights
+    that the engine lags again before trading.
     """
     p = params or MomentumParams()
 
@@ -389,6 +407,10 @@ def cross_sectional_momentum(
         vol = px.pct_change().rolling(p.vol_lookback, min_periods=p.vol_lookback // 2).std()
     else:
         vol = None
+
+    # Only computed when the cap is on: on a 100-name universe this is the
+    # one part of the loop that is not O(1) per date.
+    corr_rets = px.pct_change() if p.max_corr is not None else None
 
     # Rebalance calendar.
     if p.rebalance == "daily":
@@ -438,17 +460,49 @@ def cross_sectional_momentum(
                         score=float(row.get(t, np.nan)),
                     ))
 
+            # With the cap on, the correlation matrix is computed once per
+            # rebalance over the top `corr_pool` candidates -- not per
+            # candidate, and never over the whole universe.
+            cmat = None
+            if corr_rets is not None and len(keep) < p.n_hold:
+                # The pool is the candidates a slot may reach PLUS whatever is
+                # already held. A name kept by the band can sit below
+                # `corr_pool` in the ranking, and leaving it out would let a
+                # new pick be accepted without ever being tested against it.
+                pool = list(dict.fromkeys(list(order.index[:p.corr_pool]) + keep))
+                pool = [t for t in pool if t in corr_rets.columns]
+                if pool:
+                    win = corr_rets.loc[:dt, pool].tail(p.corr_window)
+                    if len(win) >= max(2, p.corr_window // 2):
+                        cmat = win.corr()
+
             for t in order.index:
                 if len(keep) >= p.n_hold:
                     break
-                if t not in keep:
-                    keep.append(t)
-                    events.append(dict(
-                        date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
-                        reason=f"rank {rank[t]:.0f}, 12-1 mom {order[t]:+.1%}",
-                        rank=float(rank[t]),
-                        score=float(order[t]),
-                    ))
+                if t in keep:
+                    continue
+                if cmat is not None and t in cmat.index:
+                    # Reject a name too close to something already chosen.
+                    # A NaN correlation (a name with too little overlapping
+                    # history) is not evidence of independence, but it is not
+                    # evidence against it either -- it is allowed through, and
+                    # `min_history` is what keeps those rare.
+                    too_close = next(
+                        (u for u in keep
+                         if u in cmat.columns
+                         and not np.isnan(cmat.at[t, u])
+                         and cmat.at[t, u] > p.max_corr),
+                        None,
+                    )
+                    if too_close is not None:
+                        continue
+                keep.append(t)
+                events.append(dict(
+                    date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
+                    reason=f"rank {rank[t]:.0f}, 12-1 mom {order[t]:+.1%}",
+                    rank=float(rank[t]),
+                    score=float(order[t]),
+                ))
             held = keep
             # The rank each held name survived at, recorded where it is known
             # exactly. Recomputing this outside the loop would mean redoing the

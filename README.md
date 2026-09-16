@@ -198,10 +198,64 @@ and short-term capital gains. On the bundled synthetic universe, widening the ba
 far noisier than that, which is the point: `sweep_band()` and section 9c of the notebook
 exist so you look for a *plateau* rather than picking the best cell.
 
+**And a plateau is not enough on this sample.** Swept across `(n_hold,
+exit_rank)`, this strategy's own CAGR ranges from 19% to 141%, and the shipped
+`(6, 10)` default is a *below-median* cell of that surface. Any variant you
+measure only at the default is being scored against one of the baseline's
+unluckiest draws. `docs/HYBRID_ANALYSIS.md` shows a candidate that had a
+plateau, two positive sub-periods, a clean look-ahead test and cost robustness
+— and was still noise.
+
 **Slot weighting, not survivor weighting.** With only 4 of 6 slots qualifying, the book
 is 4/6 invested and 2/6 in cash. Spreading 100% across the survivors would concentrate
 the portfolio exactly when the fewest names were qualifying — i.e. in a deteriorating
 market, which is precisely backwards.
+
+### 4b. The correlation cap — six slots, or six bets?
+
+`MomentumParams.max_corr` is off by default and changes nothing when it is.
+Switched on, it refuses a candidate whose trailing correlation with a name
+already selected exceeds the cap; the slot passes to the next name down, or to
+cash. The rank decides which names are strong, the cap decides whether the book
+is holding six bets or one bet six times.
+
+It exists because of a number the rank never looks at:
+
+```
+mean pairwise correlation of the held book   0.43
+effective independent bets, 6/(1+5p)         1.91  of 6 slots
+```
+
+Momentum is a trend signal, so the names trending hardest at any moment tend to
+be one sector — on the last cached bar the book held six semiconductors. The
+concentration blow-up in section 6 (−30% with VIX at 16–20) is that fact
+expressing itself, and it is the drawdown no index-level signal can see.
+
+| Max corr | CAGR | Vol | Sharpe | Max DD | Turnover | Book corr | Eff. bets |
+|---|---|---|---|---|---|---|---|
+| off | 46.1% | 49.0% | 0.94 | −34.8% | 5.7× | 0.43 | 1.91 |
+| 0.85 | 52.7% | 49.1% | 1.03 | −36.0% | 6.4× | 0.40 | 2.01 |
+| 0.75 | 62.4% | 48.1% | 1.17 | −35.7% | 7.4× | 0.37 | 2.11 |
+| 0.65 | 49.4% | 44.9% | 1.03 | −35.7% | 13.5× | 0.32 | 2.31 |
+| 0.55 | 49.9% | 44.6% | 1.04 | −35.7% | 14.1× | 0.30 | 2.39 |
+
+**Read the last two columns, not the first.** Effective bets rise monotonically
+and volatility falls monotonically; that is close to mechanical and it is what
+the parameter is for. CAGR is not monotone, which is what noise looks like.
+Paired against the plain ranker across a grid of `(n_hold, exit_rank)` cells the
+cap lowers volatility in 12 of 16 cells while its *return* effect is a coin flip
+— so treat the 62.4% as the sample's, not the strategy's, and size off the
+volatility column.
+
+Held names are not re-tested against the cap: the band already decides what is
+held, and re-testing would evict a name for being correlated with something
+bought after it. The cap gates entry only.
+
+`sweep_corr_cap()` runs the table above. **[`docs/HYBRID_ANALYSIS.md`](docs/HYBRID_ANALYSIS.md)**
+is the full study this came out of — including the candidates that did *not*
+survive, and why a 20-month sample cannot resolve most of what people ask it.
+
+---
 
 ### 5. VIX circuit breaker
 
@@ -671,7 +725,8 @@ qbs/
   metrics.py      CAGR, Sharpe/Sortino vs BOXX, drawdown, turnover, trade log
   plotting.py     the chart system
   pipeline.py     load -> signals -> backtest in one call; sweep_band(),
-                  sweep_vix(), sweep_target_vol()
+                  sweep_vix(), sweep_target_vol(), sweep_corr_cap(),
+                  book_correlation()
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
   agent/          an LLM analyst that READS the results above
@@ -716,6 +771,7 @@ cfg.rsi2 = RSI2Params(entry_threshold=10)                    # trade more often
 cfg.momentum = MomentumParams(n_hold=8, exit_rank=20,        # wider band, less churn
                               rebalance="ME")                # monthly instead of daily
 cfg.book_vol = BookVolTargetParams(target_vol=0.15)          # a calmer momentum book
+cfg.momentum = MomentumParams(max_corr=0.75)                 # decorrelate the six slots
 
 lab = run(cfg)
 lab.summary_pretty
@@ -725,6 +781,7 @@ sweep_band(lab)                                              # is there a platea
 ```bash
 python run_backtest.py --start 2024-09-01 --n-hold 8 --exit-rank 20 --sweep-band --csv
 python run_backtest.py --slippage-bps 20            # does it survive worse fills?
+python run_backtest.py --sweep-corr-cap             # six slots, or six bets?
 python run_backtest.py --sweep-vix --vix-exit 25    # where should the VIX trigger sit?
 python tests/test_qbs.py
 ```

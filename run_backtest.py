@@ -72,6 +72,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="skip the Finviz screen strategy")
     p.add_argument("--sweep-target-vol", action="store_true",
                    help="also print the book vol-target sensitivity table")
+    p.add_argument("--max-corr", type=float, default=None,
+                   help="momentum: refuse a candidate whose trailing correlation "
+                        "with a name already held exceeds this (off by default)")
+    p.add_argument("--sweep-corr-cap", action="store_true",
+                   help="also print the correlation-cap table (read 'Eff. bets' "
+                        "and vol, not CAGR)")
     p.add_argument("--synthetic", action="store_true", help="use generated prices, no network")
     p.add_argument("--offline", action="store_true", help="use only the CSV cache")
     p.add_argument("--refresh", action="store_true", help="re-download, ignoring the cache")
@@ -113,6 +119,8 @@ def main(argv=None) -> int:
         cfg.momentum.exit_rank = args.exit_rank
     if args.rebalance is not None:
         cfg.momentum.rebalance = args.rebalance
+    if args.max_corr is not None:
+        cfg.momentum.max_corr = args.max_corr
     if args.vix_exit is not None:
         cfg.vix.exit_level = args.vix_exit
     if args.vix_entry is not None:
@@ -131,6 +139,15 @@ def main(argv=None) -> int:
         cfg.finviz.rebalance = args.finviz_rebalance
     if cfg.finviz.exit_rank and cfg.finviz.exit_rank < cfg.finviz.n_hold:
         print("finviz-exit-rank must be 0 (no band) or >= the number of names held",
+              file=sys.stderr)
+        return 2
+    if cfg.momentum.max_corr is not None and not -1.0 <= cfg.momentum.max_corr <= 1.0:
+        print(f"--max-corr must be a correlation in [-1, 1] "
+              f"(got {cfg.momentum.max_corr})", file=sys.stderr)
+        return 2
+    if cfg.momentum.corr_pool < cfg.momentum.n_hold:
+        print(f"--n-hold {cfg.momentum.n_hold} exceeds the correlation pool "
+              f"({cfg.momentum.corr_pool}); the book could never fill",
               file=sys.stderr)
         return 2
     if cfg.momentum.exit_rank < cfg.momentum.n_hold:
@@ -220,6 +237,14 @@ def main(argv=None) -> int:
         print("\nVIX trigger sensitivity (read 'Time invested' first):")
         with pd.option_context("display.width", 200):
             print(svx.round(4).to_string(index=False))
+
+    if args.sweep_corr_cap and "momentum" in lab.signals:
+        from qbs.pipeline import sweep_corr_cap as _sweep_cc
+        scc = _sweep_cc(lab)
+        print("\nCorrelation-cap sensitivity (the monotone columns are 'Eff. bets' "
+              "and vol; CAGR is not, which is what noise looks like):")
+        with pd.option_context("display.width", 200):
+            print(scc.round(4).to_string(index=False))
 
     if args.sweep_band and "momentum" in lab.signals:
         sw = sweep_band(lab, n_holds=[cfg.momentum.n_hold],

@@ -117,9 +117,34 @@ class MomentumParams:
     vol_lookback: int = 60        # for inv_vol weighting
     min_history: int = 260        # trading days a name needs before it is rankable
 
+    # ---- correlation cap: how many DIFFERENT bets the six slots hold -----
+    # The rank alone has no opinion about whether the six names it picks are
+    # six bets or one bet held six times. On the Nasdaq-100 they are usually
+    # closer to the latter: momentum is a trend-following signal, and the
+    # names trending hardest at any moment are typically the same sector.
+    # Measured on the cached window the book's held names ran a mean pairwise
+    # correlation of 0.43, i.e. roughly 1.9 independent bets across 6 slots.
+    #
+    # `max_corr` refuses a candidate whose trailing correlation with a name
+    # already selected exceeds it; the slot then goes to the next name down,
+    # or to cash if nothing qualifies. None is OFF and reproduces the plain
+    # ranker exactly, which is the default so nothing changes silently.
+    #
+    # READ THE SWEEP BEFORE SETTING IT. `sweep_corr_cap()` exists because on
+    # the 20-month sample this lifts return at the shipped (6, 10) cell but
+    # is close to a coin flip across the wider (n_hold, exit_rank) surface.
+    # What it does do consistently is lower volatility.
+    max_corr: float | None = None   # None = off. 0.75 is the sweep's mid-range
+    corr_window: int = 60           # trading days of returns behind the estimate
+    corr_pool: int = 30             # how far down the ranking a slot may reach
+
     def __post_init__(self):
         if self.exit_rank < self.n_hold:
             raise ValueError("exit_rank must be >= n_hold (the band cannot be negative)")
+        if self.max_corr is not None and not -1.0 <= self.max_corr <= 1.0:
+            raise ValueError("max_corr must be a correlation in [-1, 1], or None for off")
+        if self.corr_pool < self.n_hold:
+            raise ValueError("corr_pool must be >= n_hold (the book could never fill)")
 
 
 @dataclass
