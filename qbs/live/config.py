@@ -88,6 +88,19 @@ class LiveConfig:
     # ---- what counts as worth trading ------------------------------------
     min_order_shares: int = 1
     min_order_notional: float = 250.0   # skip dust rebalances; they cost more than they fix
+    # No-trade band on a position already held, as a fraction of its target.
+    # Share counts are integers, so a holding sits a share away from target most
+    # days and crosses the rounding boundary on any one-percent price move --
+    # producing a single-share trade that corrects a few hundredths of a percent
+    # of the book. 0.25 holds the position still until the target has genuinely
+    # moved; entries and exits are never banded.
+    #
+    # Do not raise this much further. The vol overlay de-risks by cutting the
+    # whole book 30-50% when realised vol spikes, and a band wide enough to
+    # swallow that would suppress the drawdown protection the overlay exists
+    # for. 1.0 disables rebalancing altogether -- only entries and exits trade,
+    # and the book then holds whatever it holds through a vol event.
+    rebalance_drift: float = 0.25
 
     # ---- safety guards ---------------------------------------------------
     max_order_notional: float = 40_000.0   # per single order
@@ -157,6 +170,8 @@ class LiveConfig:
             t for t in (str(x).strip().upper() for x in self.exclude_tickers)
             if t and not (t in seen or seen.add(t))]
 
+        if not 0.0 <= self.rebalance_drift <= 1.0:
+            raise ValueError("rebalance_drift must be in [0, 1]")
         if self.position_source not in ("ledger", "baseline", "account"):
             raise ValueError(
                 f"position_source must be ledger, baseline or account, "
@@ -254,6 +269,7 @@ class LiveConfig:
                                              cfg.exclude_own_holdings)
         cfg.position_source = os.environ.get("QBS_POSITION_SOURCE",
                                              cfg.position_source)
+        cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
         cfg.sheets_id = os.environ.get("QBS_SHEETS_ID", cfg.sheets_id)
         cfg.sheets_key_file = os.environ.get("QBS_SHEETS_KEY", cfg.sheets_key_file)
         cfg.__post_init__()

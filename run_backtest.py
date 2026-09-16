@@ -228,10 +228,32 @@ def main(argv=None) -> int:
         with pd.option_context("display.width", 200):
             print(sw.round(4).to_string(index=False))
 
-    if args.charts or args.csv:
-        os.makedirs(args.outdir, exist_ok=True)
+    # Charts default to on, which is right at a laptop and wrong in the live
+    # image: that one omits matplotlib on purpose, and runs as a non-root user
+    # in a root-owned working directory. Neither is a reason to throw away a
+    # backtest that has already printed its results, so both degrade to a note.
+    want_charts = args.charts
+    if want_charts:
+        try:
+            import matplotlib            # noqa: F401
+        except ImportError:
+            want_charts = False
+            print("\ncharts skipped: matplotlib is not installed. The live "
+                  "deployment image leaves it out deliberately; pass --no-charts "
+                  "to silence this, or run on a machine with the full "
+                  "requirements.txt.")
 
-    if args.charts:
+    if want_charts or args.csv:
+        try:
+            os.makedirs(args.outdir, exist_ok=True)
+        except OSError as exc:
+            want_charts = False
+            args.csv = False
+            print(f"\ncannot write to {args.outdir!r} ({exc.strerror}); charts "
+                  "and CSVs skipped. Inside the container only var/ and data/ "
+                  "are writable -- pass --outdir var/backtest.")
+
+    if want_charts:
         import matplotlib
         matplotlib.use("Agg")
         from qbs import plotting as P

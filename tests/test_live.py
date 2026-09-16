@@ -975,7 +975,8 @@ def test_the_target_book_carries_its_universe():
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
 
-    book = compute_targets(cfg, frame, requested=list(uni.columns))
+    book = compute_targets(cfg, frame, requested=list(uni.columns),
+                           now=frame.index[-1])
 
     assert cfg.momentum.safe_asset in book.universe
     assert set(book.weights) <= set(book.universe)
@@ -1091,8 +1092,11 @@ def _excluded_book(exclude):
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    # `now` pinned to the data's own last bar. Left to the wall clock, the
+    # staleness guard starts failing these tests five business days after
+    # synthetic_prices() ends -- a date that is fixed while today is not.
     return compute_targets(cfg, frame, requested=list(uni.columns),
-                           exclude=exclude)
+                           exclude=exclude, now=frame.index[-1])
 
 
 def test_an_excluded_name_is_replaced_not_left_empty():
@@ -1445,3 +1449,69 @@ def test_rebuild_refuses_to_clobber_an_existing_ledger_without_force(db, tmp_pat
 
     rc = runner.phase_ledger(live, rebuild=True, force=False)
     assert rc == runner.EXIT_CONFIG
+
+
+# --------------------------------------------------------------------------
+# The no-trade band: hold the share count until the strategy changes its mind
+# --------------------------------------------------------------------------
+
+def _book(**kw):
+    from qbs.live.orders import build_orders
+    held = {"MU": 6, "LRCX": 21, "AMD": 12, "BOXX": 539}
+    px = {"MU": 927.66, "LRCX": 269.46, "AMD": 503.82, "BOXX": 118.17}
+    w = {"MU": 0.0593, "LRCX": 0.0593, "AMD": 0.0593, "BOXX": 0.822}
+    w.update(kw.pop("weights", {}))
+    return build_orders(w, px, kw.pop("held", held), notional=100_000,
+                        max_order_notional=200_000, max_gross_turnover=1.6,
+                        max_positions=12, universe=list(px), **kw)
+
+
+def test_a_one_share_rounding_drift_is_held_not_traded():
+    """The observed case: AMD 12->11 and LRCX 21->22 on a 1% price move."""
+    orders, _ = _book(min_drift=0.25)
+    assert orders == [], f"expected no orders, got {[str(o) for o in orders]}"
+
+
+def test_without_a_band_the_same_drift_trades():
+    orders, _ = _book(min_drift=0.0)
+    assert {o.symbol for o in orders} >= {"AMD", "LRCX"}
+
+
+def test_an_entry_is_never_banded():
+    """A name the strategy has just picked must be bought in full."""
+    orders, _ = _book(min_drift=0.25, held={"BOXX": 539})
+    bought = {o.symbol for o in orders if o.action == "BUY"}
+    assert {"MU", "LRCX", "AMD"} <= bought
+
+
+def test_an_exit_is_never_banded():
+    orders, _ = _book(min_drift=1.0,
+                      weights={"AMD": 0.0, "MU": 0.0593, "LRCX": 0.0593,
+                               "BOXX": 0.881})
+    sells = [o for o in orders if o.symbol == "AMD"]
+    assert len(sells) == 1 and sells[0].action == "SELL" and sells[0].quantity == 12
+
+
+def test_a_real_de_risking_move_still_trades_through_the_band():
+    """The band must not swallow the vol overlay cutting the book in half.
+
+    This is the failure that would matter: a band wide enough to ignore a
+    scalar move from 0.36 to 0.18 would suppress exactly the drawdown
+    protection the overlay exists to provide.
+    """
+    halved = {"MU": 0.0296, "LRCX": 0.0296, "AMD": 0.0296, "BOXX": 0.911}
+    orders, _ = _book(min_drift=0.25, weights=halved)
+    sells = {o.symbol for o in orders if o.action == "SELL"}
+    assert {"MU", "LRCX", "AMD"} <= sells, "the band suppressed a de-risking move"
+
+
+def test_the_band_is_validated():
+    with pytest.raises(ValueError, match="rebalance_drift"):
+        LiveConfig(rebalance_drift=1.5)
+    with pytest.raises(ValueError, match="rebalance_drift"):
+        LiveConfig(rebalance_drift=-0.1)
+
+
+def test_the_band_is_settable_from_the_environment(monkeypatch):
+    monkeypatch.setenv("QBS_REBALANCE_DRIFT", "0.4")
+    assert LiveConfig.from_env().rebalance_drift == pytest.approx(0.4)
