@@ -118,6 +118,38 @@ class PipelineConfig:
     max_sleep_interval: float = 15.0
     download_timeout: int = 7200  # seconds; a 2h ceiling on one post
 
+    # ---- transcription ---------------------------------------------------
+    # Whisper runs between the download and the upload and is *additive*: the
+    # media is still uploaded unless `upload_media` is turned off. A transcript
+    # is ~50 KB against a gigabyte of video, so keeping both is free.
+    transcribe: bool = True
+    # large-v3-turbo is the sweet spot on a fanless mini-PC: near large-v3
+    # quality at a fraction of the compute. Drop to "small" if an hour of audio
+    # takes materially longer than an hour to process.
+    whisper_model: str = "large-v3-turbo"
+    whisper_device: str = "cpu"          # "cuda" if the box has a usable GPU
+    whisper_compute_type: str = "int8"   # "float16" on CUDA
+    whisper_cpu_threads: int = 0         # 0 -> let ctranslate2 decide
+    whisper_language: str = "en"         # "" -> autodetect (slower, less exact)
+    whisper_beam_size: int = 5
+    whisper_vad: bool = True             # skip silence; a real speedup
+    whisper_txt_timestamps: bool = True  # [HH:MM:SS] prefix on each paragraph
+    whisper_formats: List[str] = field(default_factory=lambda: ["txt", "srt"])
+    whisper_root: str = ""               # blank -> <state_dir>/whisper-models
+    whisper_skip_extract_for_audio: bool = True
+    transcribe_timeout: int = 14400      # 4h ceiling on one file
+
+    # Domain vocabulary fed to Whisper as `initial_prompt`. This is the single
+    # highest-leverage setting for jargon-heavy audio: without it tickers and
+    # options terms come back mangled, and a bigger model does not fix it the
+    # way this does. Edit it to match what you actually archive.
+    whisper_vocabulary: List[str] = field(default_factory=lambda: [
+        "QQQ", "SPX", "SPY", "ES", "NDX", "IWM", "VIX", "BOXX",
+        "0DTE", "delta", "gamma", "theta", "vega", "implied volatility",
+        "IV crush", "box spread", "credit spread", "debit spread",
+        "iron condor", "strike", "expiry", "assignment", "the bid", "the ask",
+    ])
+
     # ---- google drive ----------------------------------------------------
     # The folder uploads land in. An ID is exact; a name is found-or-created
     # under My Drive root. ID wins when both are set.
@@ -130,6 +162,12 @@ class PipelineConfig:
     drive_token: str = ""          # blank -> <state_dir>/drive_token.json
     drive_chunk_mb: int = 8
     upload_info_json: bool = True  # the .info.json alongside the media
+    # Both default on: you said you might hand Gemini either artefact, so the
+    # pipeline ships both and lets you choose per post. Set upload_media to
+    # False to keep only transcripts -- an archive that then costs megabytes
+    # rather than terabytes.
+    upload_media: bool = True
+    upload_transcript: bool = True
     delete_after_upload: bool = True
 
     # ---- worker ----------------------------------------------------------
@@ -146,6 +184,9 @@ class PipelineConfig:
 
     def resolved_staging_dir(self) -> str:
         return self.staging_dir or os.path.join(self.state_dir, "staging")
+
+    def resolved_whisper_root(self) -> str:
+        return self.whisper_root or os.path.join(self.state_dir, "whisper-models")
 
     def resolved_client_secret(self) -> str:
         return self.drive_client_secret or os.path.join(
@@ -200,6 +241,20 @@ class PipelineConfig:
         cfg.download_timeout = _env_int(
             "PATREON_DOWNLOAD_TIMEOUT", cfg.download_timeout)
 
+        cfg.transcribe = _env_bool("PATREON_TRANSCRIBE", cfg.transcribe)
+        cfg.whisper_model = _env_str("PATREON_WHISPER_MODEL", cfg.whisper_model)
+        cfg.whisper_device = _env_str("PATREON_WHISPER_DEVICE", cfg.whisper_device)
+        cfg.whisper_compute_type = _env_str(
+            "PATREON_WHISPER_COMPUTE_TYPE", cfg.whisper_compute_type)
+        cfg.whisper_language = _env_str(
+            "PATREON_WHISPER_LANGUAGE", cfg.whisper_language)
+        cfg.whisper_root = _env_str("PATREON_WHISPER_ROOT", cfg.whisper_root)
+        cfg.whisper_vocabulary = _env_list(
+            "PATREON_WHISPER_VOCABULARY", cfg.whisper_vocabulary)
+        cfg.upload_media = _env_bool("PATREON_UPLOAD_MEDIA", cfg.upload_media)
+        cfg.upload_transcript = _env_bool(
+            "PATREON_UPLOAD_TRANSCRIPT", cfg.upload_transcript)
+
         cfg.drive_folder_id = _env_str("PATREON_DRIVE_FOLDER_ID", cfg.drive_folder_id)
         cfg.drive_folder_name = _env_str(
             "PATREON_DRIVE_FOLDER_NAME", cfg.drive_folder_name)
@@ -234,6 +289,17 @@ class PipelineConfig:
             problems.append(f"cookies_file does not exist: {self.cookies_file}")
         if self.max_attempts < 1:
             problems.append("max_attempts must be >= 1")
+        if not self.upload_media and not self.upload_transcript:
+            problems.append(
+                "upload_media and upload_transcript are both off: the pipeline "
+                "would download and then upload nothing")
+        if not self.upload_media and not self.transcribe:
+            problems.append(
+                "upload_media is off but transcribe is off too: nothing would "
+                "be produced")
+        if self.whisper_device == "cpu" and self.whisper_compute_type == "float16":
+            problems.append(
+                "whisper_compute_type float16 is not supported on CPU; use int8")
         return problems
 
     def describe(self) -> str:

@@ -26,8 +26,14 @@ ProtectHome=false
 Restart=always
 RestartSec=300
 
-# No timeout. One post can legitimately take two hours on a home connection,
-# and the downloader has its own ceiling (download_timeout).
+# No timeout. One post can legitimately take two hours to download on a home
+# connection and another hour to transcribe; both stages have their own
+# ceilings (download_timeout, transcribe_timeout).
+#
+# Whisper is the memory-hungry part: large-v3-turbo at int8 wants roughly 1.5
+# GB resident, and the model is loaded once and kept for the life of the
+# process. On a 4 GB box that is fine alongside everything else; on a 2 GB box,
+# drop whisper_model to "small" or set transcribe to false.
 TimeoutStartSec=0
 
 StandardOutput=journal

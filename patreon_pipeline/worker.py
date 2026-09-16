@@ -24,9 +24,9 @@ import os
 import shutil
 import sqlite3
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from . import download, drive, store
+from . import download, drive, store, transcribe as transcribe_mod
 from .config import PipelineConfig
 
 log = logging.getLogger(__name__)
@@ -39,7 +39,8 @@ EXIT_AUTH = 3
 AUTH_FLAG = "auth_alert"
 
 
-def _describe(job: sqlite3.Row, res: download.DownloadResult) -> str:
+def _describe(job: sqlite3.Row, res: download.DownloadResult,
+              tr: Optional["transcribe_mod.TranscriptResult"] = None) -> str:
     """The Drive file description.
 
     Worth populating: it is what tells you which post a file came from months
@@ -55,6 +56,11 @@ def _describe(job: sqlite3.Row, res: download.DownloadResult) -> str:
         bits.append(f"Posted: {res.upload_date}")
     if job["title"]:
         bits.append(f"Email subject: {job['title']}")
+    if tr:
+        bits.append(f"Duration: {tr.duration / 60.0:.1f} min")
+        if tr.language:
+            bits.append(f"Language: {tr.language}")
+        bits.append(f"Transcript: {os.path.basename(tr.txt_path)}")
     return "\n".join(bits)
 
 
@@ -91,14 +97,46 @@ def process_job(cfg: PipelineConfig, conn: sqlite3.Connection,
                   local_path=res.media_path, size_bytes=res.size_bytes,
                   post_id=res.post_id or job["post_id"])
 
+    # Transcription is best-effort by design. It is the slowest and most
+    # memory-hungry stage here, and it is the optional one: a box that runs out
+    # of RAM on a three-hour post should still end up with the video in Drive.
+    # So every failure is logged and swallowed, and the job carries on.
+    tr = None
+    if cfg.transcribe:
+        try:
+            tr = transcribe_mod.transcribe(cfg, res.media_path)
+            store._update(conn, job_id, transcript_path=tr.txt_path,
+                          language=tr.language, duration_sec=tr.duration)
+        except transcribe_mod.TranscribeError as exc:
+            log.warning("job %s: transcription failed, continuing without it: %s",
+                        job_id, exc)
+        except Exception as exc:
+            log.warning("job %s: transcription failed (%s), continuing: %s",
+                        job_id, type(exc).__name__, exc)
+
     try:
         folder_id = drive.target_folder(svc, cfg, res.creator)
-        meta = drive.upload(svc, res.media_path, folder_id,
-                            chunk_mb=cfg.drive_chunk_mb,
-                            description=_describe(job, res))
+        meta: Dict[str, Any] = {}
+        transcript_meta: Dict[str, Any] = {}
+
+        if cfg.upload_media:
+            meta = drive.upload(svc, res.media_path, folder_id,
+                                chunk_mb=cfg.drive_chunk_mb,
+                                description=_describe(job, res, tr))
+        if tr and cfg.upload_transcript:
+            for path in tr.paths:
+                got = drive.upload(svc, path, folder_id,
+                                   chunk_mb=cfg.drive_chunk_mb,
+                                   description=_describe(job, res, tr))
+                if path == tr.txt_path:
+                    transcript_meta = got
         if cfg.upload_info_json and res.info_path:
             drive.upload(svc, res.info_path, folder_id,
                          chunk_mb=cfg.drive_chunk_mb)
+
+        # With upload_media off, the transcript is the artefact, so it is what
+        # `status` should link to.
+        primary = meta or transcript_meta
     except Exception as exc:
         # Drive failures are overwhelmingly transient -- quota, a 5xx, the
         # connection dropping. Retry rather than fail, and keep the staged
@@ -110,12 +148,14 @@ def process_job(cfg: PipelineConfig, conn: sqlite3.Connection,
                                 backoff_cap=cfg.backoff_cap)
 
     store.mark_done(conn, job_id,
-                    drive_file_id=meta.get("id"),
-                    drive_link=meta.get("webViewLink"))
+                    drive_file_id=primary.get("id"),
+                    drive_link=primary.get("webViewLink"),
+                    transcript_link=transcript_meta.get("webViewLink"))
     if cfg.delete_after_upload:
         shutil.rmtree(staging, ignore_errors=True)
-        store._update(conn, job_id, local_path=None)
-    log.info("job %s: done -> %s", job_id, meta.get("webViewLink") or meta.get("id"))
+        store._update(conn, job_id, local_path=None, transcript_path=None)
+    log.info("job %s: done -> %s", job_id,
+             primary.get("webViewLink") or primary.get("id"))
     return "done"
 
 

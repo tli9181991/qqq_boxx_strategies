@@ -678,7 +678,8 @@ tests/test_qbs.py 142 tests: indicators, engine, momentum, circuit-breaker,
                   shuffled-future look-ahead test)
 
 patreon_pipeline/ nothing to do with the strategy. A Gmail-triggered Patreon
-                  downloader that uploads to Google Drive, living here because
+                  downloader that transcribes with Whisper and uploads both the
+                  media and the transcript to Google Drive, living here because
                   it runs on the same box under the same systemd conventions.
                   See docs/PATREON_PIPELINE.md
 ```

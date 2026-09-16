@@ -13,6 +13,23 @@
   "drive_folder_name": "Patreon",
   "drive_subfolder_per_creator": true,
 
+  "_transcription": "Both artefacts are uploaded by default, so you can hand Gemini either the video or the transcript. Set upload_media false for a transcript-only archive (megabytes instead of terabytes); set transcribe false to skip Whisper entirely.",
+  "transcribe": true,
+  "upload_media": true,
+  "upload_transcript": true,
+  "whisper_model": "large-v3-turbo",
+  "whisper_device": "cpu",
+  "whisper_compute_type": "int8",
+  "whisper_language": "en",
+
+  "_vocabulary": "Fed to Whisper as initial_prompt. THE highest-leverage setting for jargon: without it tickers and options terms come back mangled. Edit to match what you actually archive.",
+  "whisper_vocabulary": [
+    "QQQ", "SPX", "SPY", "ES", "NDX", "IWM", "VIX", "BOXX",
+    "0DTE", "delta", "gamma", "theta", "vega", "implied volatility",
+    "IV crush", "box spread", "credit spread", "debit spread",
+    "iron condor", "strike", "expiry", "assignment"
+  ],
+
   "audio_only": false,
   "delete_after_upload": true,
   "max_attempts": 4

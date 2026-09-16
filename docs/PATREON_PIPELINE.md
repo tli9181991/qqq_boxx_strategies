@@ -1,7 +1,8 @@
 # Patreon → Google Drive pipeline
 
 Gmail notification arrives → the post is queued → a worker downloads it with
-yt-dlp → the file lands in Google Drive, where Gemini can read it.
+yt-dlp → Whisper transcribes it → both the media and the transcript land in
+Google Drive, where Gemini can read either one.
 
 Unrelated to the trading strategy. It lives here because it runs on the same
 mini-PC under the same systemd conventions, and a second repo for ~1,500 lines
@@ -15,7 +16,10 @@ Gmail (IMAP IDLE)          patreon-watch.service ─┐
 campaign sweep (6-hourly)  patreon-sweep.timer  ──┘           │
                                                               ▼
                                             patreon-work.service
-                                          yt-dlp ──→ staging ──→ Drive
+                                                              │
+                              yt-dlp ──→ staging ──→ whisper ──┤
+                                                              ▼
+                                        Drive:  video + .txt + .srt
 ```
 
 The queue in the middle is the whole design. The watcher only writes rows; a
@@ -41,6 +45,11 @@ sudo mkdir -p /opt/qbs /var/lib/patreon /etc/patreon
 sudo chown -R patreon:patreon /var/lib/patreon
 git clone <this repo> /opt/qbs && cd /opt/qbs
 python3 -m venv .venv && .venv/bin/pip install -r requirements-patreon.txt
+
+# ffmpeg is not a pip dependency but both stages need it: yt-dlp merges
+# separate audio/video streams with it, and Whisper is fed 16 kHz mono audio
+# extracted with it.
+sudo apt install ffmpeg
 ```
 
 ### 2. Log into Patreon, once, by hand
@@ -131,6 +140,7 @@ runner add URL ...            # queue a post by hand
 runner sweep --limit 50       # catch up after downtime
 runner retry                  # move failed jobs back to the queue
 runner probe URL              # is the Patreon session still good?
+runner transcribe FILE        # one-off, no queue and no Drive
 ```
 
 ## When the Patreon session expires
@@ -150,15 +160,77 @@ The `patreon-probe` timer checks this daily against one patron-only post, so
 you find out the day it happens rather than the day you go looking for a post
 that never arrived.
 
+## Transcription
+
+Whisper runs between the download and the upload, and it is **additive**: the
+video still goes to Drive unless you turn that off. Both artefacts are uploaded
+by default, so you can hand Gemini whichever suits the question — the video
+when you want it to see a chart being drawn, the transcript when you want it to
+search a year of commentary cheaply. A transcript is ~50 KB against a gigabyte
+of video, so keeping both costs nothing.
+
+Three files land per post: the media, a `.txt` of readable paragraphs prefixed
+with `[HH:MM:SS]`, and a `.srt`. The timestamps are the point — they let you
+(or Gemini) point back at the moment in the video a claim came from, which is
+most of the value of having the transcript *next to* the media rather than
+instead of it.
+
+### Failure here is never fatal
+
+Transcription is the slowest, most memory-hungry and most optional stage in the
+pipeline. Every failure is caught, logged, and the media is uploaded anyway. A
+box that runs out of RAM on a three-hour post should still end up with the
+video in Drive; losing a download because the nice-to-have failed would be the
+wrong trade.
+
+### The vocabulary setting is not optional
+
+`whisper_vocabulary` is fed to Whisper as its `initial_prompt`, which
+conditions the model as though that text were the transcript of the audio
+immediately preceding the file. For jargon-heavy content this is the single
+highest-leverage knob in the whole config. Without it, tickers and options
+terms come back mangled — "QQQ" as "Q3", "0DTE" as "zero DT", strikes and
+expiries garbled — and a bigger model does not fix it the way this does.
+
+The default list is trading vocabulary. Edit it to match what you actually
+archive.
+
+### Benchmark before you trust it
+
+```bash
+sudo -u patreon /opt/qbs/.venv/bin/python -m patreon_pipeline.runner \
+  transcribe /path/to/one-real-post.mp4
+```
+
+It prints segments, audio duration, wall-clock time and a real-time multiple.
+On an N100-class CPU expect `large-v3-turbo` at `int8` to land somewhere near
+1x real time — an hour of audio in roughly an hour — but that varies enough by
+chip that guessing is pointless. If it is too slow, `whisper_model: "small"` is
+several times faster and still good on clean narration. If the box has a usable
+GPU, `whisper_device: "cuda"` with `whisper_compute_type: "float16"` makes the
+question disappear.
+
+Because the worker is serial, a long post occupies it for download **plus**
+transcription. That is the intended trade — it keeps request rates polite — but
+it does mean a backlog after downtime drains slowly. `transcribe: false` turns
+the stage off entirely if you would rather have the videos first.
+
+### Model files
+
+faster-whisper downloads the model on first use into
+`<state_dir>/whisper-models` rather than `~/.cache/huggingface`, because the
+systemd units run with `ProtectHome` and the default location is not writable.
+`large-v3-turbo` is about 1.5 GB on disk and wants roughly the same resident.
+
 ## Notes
 
 - **Keep yt-dlp updated.** It is the one dependency that should move —
   extractor fixes land within days of Patreon or Vimeo changing something. A
   stale yt-dlp is the most common cause of "this post is not available".
   `pip install -U yt-dlp` on a schedule.
-- **Transcripts instead of video.** Set `audio_only: true` and an hour of
-  content goes from ~1 GB to ~30 MB. Whisper on the audio is the natural next
-  step; it is not built here yet.
+- **Transcript-only archive.** `upload_media: false` keeps the transcripts and
+  discards the video after transcription, which turns terabytes into megabytes.
+  See the transcription section above.
 - **Untrusted input.** Notification emails are parsed as untrusted: sender
   domain is checked on a label boundary (so `evilpatreon.com` is not
   `patreon.com`), links are only followed when already on a patreon.com host,
@@ -176,6 +248,8 @@ python -m pytest tests/test_patreon_pipeline.py -q
 python tests/test_patreon_pipeline.py
 ```
 
-No network, no Gmail, no Drive, no yt-dlp — they cover URL canonicalisation
-(the dedupe key), queue semantics under retry, and the error classification
-that decides whether a failure costs a job its attempts or stops the worker.
+33 tests, and none of them touch the network, Gmail, Drive, yt-dlp or Whisper.
+They cover URL canonicalisation (the dedupe key), queue semantics under retry,
+the schema migration that adds the transcript columns to an existing database,
+transcript formatting, and the error classification that decides whether a
+failure costs a job its attempts or stops the worker.

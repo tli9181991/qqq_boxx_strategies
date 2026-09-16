@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Job states. A job is in exactly one of these at all times.
 #   queued  -- waiting for a worker; `next_attempt_at` may hold it back
@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     size_bytes      INTEGER,
     drive_file_id   TEXT,
     drive_link      TEXT,
+    transcript_path TEXT,
+    transcript_link TEXT,
+    language        TEXT,
+    duration_sec    REAL,
     last_error      TEXT,
     created_at      TEXT    NOT NULL,
     updated_at      TEXT    NOT NULL
@@ -93,6 +97,33 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+# Columns added after v1. `CREATE TABLE IF NOT EXISTS` does nothing to a table
+# that already exists, so a database created by the pre-transcription version
+# needs these added by hand. Adding a nullable column is instant and
+# non-destructive, which is why the schema only ever grows this way.
+_ADDED_COLUMNS = {
+    "jobs": [
+        ("transcript_path", "TEXT"),
+        ("transcript_link", "TEXT"),
+        ("language", "TEXT"),
+        ("duration_sec", "REAL"),
+    ],
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, columns in _ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in have:
+                log.info("migrating %s: adding column %s", table, name)
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(SCHEMA_VERSION),))
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -112,9 +143,7 @@ def connect(db_path: str) -> Iterator[sqlite3.Connection]:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA)
-        conn.execute(
-            "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),))
+        _migrate(conn)
         conn.commit()
         yield conn
         conn.commit()
@@ -247,7 +276,8 @@ def requeue(conn: sqlite3.Connection, job_id: int) -> None:
 def _update(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
     allowed = {"state", "attempts", "next_attempt_at", "creator", "title",
                "upload_date", "local_path", "size_bytes", "drive_file_id",
-               "drive_link", "last_error", "post_id"}
+               "drive_link", "last_error", "post_id", "transcript_path",
+               "transcript_link", "language", "duration_sec"}
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"cannot update {sorted(bad)}")

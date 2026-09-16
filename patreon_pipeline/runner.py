@@ -7,6 +7,7 @@
     python -m patreon_pipeline.runner status        # what is in the queue
     python -m patreon_pipeline.runner add URL ...   # queue a post by hand
     python -m patreon_pipeline.runner probe URL     # is the session still good?
+    python -m patreon_pipeline.runner transcribe FILE  # one-off, no queue
 
 `watch` and `work` are two units rather than one process with two threads. They
 fail for unrelated reasons -- one is a mail socket, the other is a two-hour
@@ -22,7 +23,7 @@ import os
 import sys
 from typing import List, Optional
 
-from . import drive, mail, store, worker
+from . import drive, mail, store, transcribe as transcribe_mod, worker
 from .config import PipelineConfig
 from .worker import EXIT_AUTH, EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -68,6 +69,12 @@ def cmd_status(cfg: PipelineConfig, args) -> int:
             line += f"\n        {r['title'][:90]}"
         if r["drive_link"]:
             line += f"\n        {r['drive_link']}"
+        if r["transcript_link"] and r["transcript_link"] != r["drive_link"]:
+            line += f"\n        transcript: {r['transcript_link']}"
+        if r["duration_sec"]:
+            line += f"\n        {r['duration_sec'] / 60.0:.0f} min"
+            if r["language"]:
+                line += f" ({r['language']})"
         if r["last_error"] and r["state"] in ("failed", "queued", "skipped"):
             line += f"\n        ! {r['last_error'][:160]}"
         print(line)
@@ -106,6 +113,30 @@ def cmd_probe(cfg: PipelineConfig, args) -> int:
 def download_probe(cfg: PipelineConfig, url: str):
     from .download import probe_session
     return probe_session(cfg, url)
+
+
+def cmd_transcribe(cfg: PipelineConfig, args) -> int:
+    """Transcribe a local file without touching the queue or Drive.
+
+    This is how you benchmark the model on your own hardware before trusting
+    it to an unattended worker -- run it on one real post and see whether an
+    hour of audio takes ten minutes or ninety.
+    """
+    import time
+    started = time.monotonic()
+    try:
+        res = transcribe_mod.transcribe(cfg, args.path, args.out_dir)
+    except transcribe_mod.TranscribeError as exc:
+        log.error("transcription failed: %s", exc)
+        return EXIT_ERROR
+    elapsed = time.monotonic() - started
+    speed = (res.duration / elapsed) if elapsed > 0 else 0.0
+    for path in res.paths:
+        print(path)
+    print(f"\n{res.segments} segments, {res.duration / 60.0:.1f} min of audio "
+          f"in {elapsed / 60.0:.1f} min ({speed:.2f}x real time), "
+          f"language={res.language}")
+    return EXIT_OK
 
 
 def cmd_retry(cfg: PipelineConfig, args) -> int:
@@ -154,6 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("probe", help="check the Patreon session is still valid")
     pr.add_argument("url", help="any patron-only post URL")
 
+    tr = sub.add_parser("transcribe",
+                        help="transcribe a local media file (no queue, no Drive)")
+    tr.add_argument("path")
+    tr.add_argument("--out-dir", default=None,
+                    help="where to write .txt/.srt (default: next to the file)")
+
     sub.add_parser("retry", help="move failed jobs back to the queue")
     sub.add_parser("config", help="print the resolved configuration")
     return p
@@ -198,6 +235,8 @@ def main(argv=None) -> int:
             return cmd_add(cfg, args)
         if args.command == "probe":
             return cmd_probe(cfg, args)
+        if args.command == "transcribe":
+            return cmd_transcribe(cfg, args)
         if args.command == "retry":
             return cmd_retry(cfg, args)
     except drive.DriveError as exc:

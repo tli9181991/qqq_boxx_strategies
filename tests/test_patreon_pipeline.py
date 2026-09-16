@@ -16,7 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from patreon_pipeline import download, mail, store
+from patreon_pipeline import download, mail, store, transcribe
 from patreon_pipeline.config import PipelineConfig
 
 
@@ -233,6 +233,72 @@ def test_audio_only_switches_the_format():
 
 
 # ----------------------------------------------------------------------
+# Transcription
+# ----------------------------------------------------------------------
+
+def test_timestamp_formatting():
+    assert transcribe.format_timestamp(0) == "00:00:00"
+    assert transcribe.format_timestamp(3725.5) == "01:02:05"
+    assert transcribe.format_timestamp(3725.5, srt=True) == "01:02:05,500"
+    assert transcribe.format_timestamp(-1) == "00:00:00"
+
+
+def test_srt_is_well_formed():
+    segs = [transcribe.Segment(0.0, 2.5, "First line."),
+            transcribe.Segment(2.5, 5.0, "Second line.")]
+    out = transcribe.to_srt(segs)
+    lines = out.splitlines()
+    assert lines[0] == "1"
+    assert lines[1] == "00:00:00,000 --> 00:00:02,500"
+    assert lines[2] == "First line."
+    assert lines[4] == "2"
+
+
+def test_paragraphs_break_on_a_real_pause():
+    """Whisper emits a segment every few seconds. 3,000 one-line segments is
+    painful to read and wasteful to feed to a model, so they get grouped."""
+    segs = [transcribe.Segment(0, 3, "A" * 200),
+            transcribe.Segment(3, 6, "B" * 250),
+            transcribe.Segment(30, 33, "After a long gap.")]
+    out = transcribe.to_paragraphs(segs, gap_seconds=2.0, min_chars=400)
+    paras = [p for p in out.split("\n\n") if p.strip()]
+    assert len(paras) == 2
+    assert paras[0].startswith("[00:00:00]")
+    assert paras[1].startswith("[00:00:30]")
+
+
+def test_paragraphs_do_not_split_on_a_short_pause():
+    segs = [transcribe.Segment(0, 3, "A" * 500),
+            transcribe.Segment(3.5, 6, "Still the same thought.")]
+    out = transcribe.to_paragraphs(segs, gap_seconds=2.0, min_chars=400)
+    assert len([p for p in out.split("\n\n") if p.strip()]) == 1
+
+
+def test_paragraph_timestamps_can_be_turned_off():
+    segs = [transcribe.Segment(10, 12, "Hello.")]
+    assert transcribe.to_paragraphs(segs, timestamps=False).strip() == "Hello."
+    assert transcribe.to_paragraphs(segs, timestamps=True).startswith("[00:00:10]")
+
+
+def test_empty_transcript_formats_cleanly():
+    assert transcribe.to_paragraphs([]) == ""
+    assert transcribe.to_srt([]) == ""
+
+
+def test_initial_prompt_from_vocabulary():
+    """The single highest-leverage knob for jargon-heavy audio."""
+    assert transcribe.build_initial_prompt(["QQQ", "0DTE"]) == "QQQ, 0DTE."
+    assert transcribe.build_initial_prompt([]) is None
+    assert transcribe.build_initial_prompt(["  ", ""]) is None
+
+
+def test_default_vocabulary_is_populated():
+    cfg = PipelineConfig()
+    prompt = transcribe.build_initial_prompt(cfg.whisper_vocabulary)
+    assert prompt and "QQQ" in prompt and "0DTE" in prompt
+
+
+# ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 
@@ -254,6 +320,54 @@ def test_secrets_are_not_read_from_the_config_file():
     assert cfg.imap_user == "me@gmail.com"
     assert cfg.imap_password == ""
     assert "hunter2" not in cfg.describe()
+
+
+def test_validate_rejects_uploading_nothing():
+    cfg = PipelineConfig(upload_media=False, upload_transcript=False)
+    assert any("upload nothing" in p for p in cfg.validate())
+
+
+def test_validate_rejects_float16_on_cpu():
+    cfg = PipelineConfig(whisper_device="cpu", whisper_compute_type="float16")
+    assert any("float16" in p for p in cfg.validate())
+
+
+def test_transcript_only_mode_is_valid():
+    """Video off, transcript on: the archive that costs megabytes."""
+    cfg = PipelineConfig(upload_media=False, transcribe=True,
+                         upload_transcript=True)
+    assert cfg.validate() == []
+
+
+def test_new_columns_survive_a_migration_from_v1():
+    """A database created before transcription existed must gain the columns
+    without losing rows."""
+    import sqlite3
+    path = _db()
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT,
+          post_url TEXT NOT NULL UNIQUE, post_id TEXT, source TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT, creator TEXT, title TEXT, upload_date TEXT,
+          local_path TEXT, size_bytes INTEGER, drive_file_id TEXT, drive_link TEXT,
+          last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO jobs (post_url, source, state, created_at, updated_at)
+          VALUES ('https://www.patreon.com/posts/9', 'email', 'done', 'x', 'x');
+    """)
+    old.commit()
+    old.close()
+
+    with store.connect(path) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(jobs)")}
+        assert {"transcript_path", "transcript_link", "language",
+                "duration_sec"} <= cols
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        job_id = conn.execute("SELECT id FROM jobs").fetchone()["id"]
+        store._update(conn, job_id, language="en", duration_sec=1800.0)
+        row = conn.execute("SELECT * FROM jobs").fetchone()
+        assert row["language"] == "en" and row["duration_sec"] == 1800.0
 
 
 if __name__ == "__main__":
