@@ -42,3 +42,8 @@ data/ohlc/
 data/finviz_universe.csv
 data/universe/us_closes.csv
 data/universe/us_volumes.csv
+
+# Fundamentals snapshots fetched by the analyst. Deliberately untracked: each
+# file is a picture of ONE day's ratios with no history in it, so a committed
+# copy would age into a set of numbers that look current and are not.
+data/fundamentals/

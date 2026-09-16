@@ -42,6 +42,11 @@ The first live run downloads from Yahoo and caches to `data/`; later runs are in
 and work offline (`--offline`). `--no-momentum` skips the ~100-ticker Nasdaq-100
 download while you iterate on the other three.
 
+Optional extras, each in its own requirements file so the backtest never depends on
+them: `requirements-dashboard.txt` (Streamlit),
+`requirements-agent.txt` ([the LLM analyst](#the-llm-analyst)),
+`requirements-live.txt` (IB trading).
+
 ---
 
 ## ⚠️ Read this before trusting the momentum numbers
@@ -669,13 +674,21 @@ qbs/
                   sweep_vix(), sweep_target_vol()
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
+  agent/          an LLM analyst that READS the results above
+    evidence.py     the lab's own numbers as text, each with its caveat attached
+    fundamentals.py yfinance company data, cached      (no LangChain import)
+    news.py         web search + Yahoo headlines       (no LangChain import)
+    tools.py        the three above, as LangChain tools
+    analyst.py      a Gemini agent that may call them
 run_backtest.py   CLI
-dashboard/app.py  Streamlit: daily picks + market overview
+dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
 tests/test_qbs.py 149 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
+tests/test_agent.py 35 tests: the analyst's data layers, its tools, and one
+                  real agent run driven by a scripted model (no key, no network)
 ```
 
 ### The one convention that matters
@@ -899,6 +912,90 @@ Colab is **not** installed for the interpreter running Streamlit. `pip install -
 requirements-dashboard.txt` with that interpreter fixes it.
 
 The SPY column and S&P 500 level are still blank — this package caches QQQ, not SPY.
+
+---
+
+## The LLM analyst
+
+A Gemini agent, via LangChain, that reads everything above and writes about it. It
+lives in `qbs/agent/`, is entirely optional, and **produces no numbers of its own**.
+
+```bash
+pip install -r requirements.txt -r requirements-agent.txt
+export GOOGLE_API_KEY=...            # https://aistudio.google.com/apikey
+python -m qbs.agent --check
+
+python -m qbs.agent "Why is the momentum book holding names the Finviz screen rejects?"
+python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
+```
+
+Or use the dashboard's **🤖 Analyst** tab, which hands the agent the frames the app has
+already loaded instead of re-reading the cache.
+
+### What it can look at
+
+| Tool | Answers |
+|---|---|
+| `current_picks` | what each strategy holds on the latest bar, and how much they overlap |
+| `name_momentum` | one name's returns, universe rank, location vs every MA, and each strategy gate |
+| `market_breadth` | participation over the last N sessions, not the index |
+| `strategy_performance` | the backtest comparison table |
+| `breakout_funnel` | selection → breakout conversion, stage by stage |
+| `breakout_trades` | trade statistics in R, with the concentration check |
+| `fundamentals` | valuation, margins, growth, balance sheet, analyst view (yfinance) |
+| `search_news` / `ticker_headlines` | the web, and Yahoo's feed for one symbol |
+
+### The problem this is built around
+
+Ask a language model about a backtest and it will produce a fluent, confident,
+plausible paragraph **whether or not it has the numbers**. That paragraph is
+indistinguishable from a correct one until you check it. So:
+
+- **Every figure must come from a tool call.** The system prompt says an answer
+  containing an unsourced number is worse than no answer, and tells the model to say
+  "I don't have that" and name the missing tool instead.
+- **Caveats are welded to the numbers.** `breakout_trades` cannot return
+  "expectancy +1.37R" without also returning "over 11 closed trades, top 3 are 39% of
+  all R, below the 30-trade floor, do not size off it". The model has nowhere to put a
+  clean number.
+- **Every call is shown.** The CLI prints the tool list; the dashboard renders each
+  call and its full output in an expander under the answer. A figure that appears in
+  the prose and in none of the traces is a fabrication, and you can see that in a
+  glance rather than by re-deriving it.
+- **Nothing writes.** No tool changes a parameter, places an order, or produces an
+  input another run reads back. The agent is a reader of results.
+
+### Fundamentals are not a signal
+
+`yfinance`'s `Ticker.info` is a snapshot of **today**: today's trailing P/E, today's
+analyst target, today's short interest. There is no history in it and no way to ask
+what a ratio was in March. Feeding any of it into a backtest would date today's balance
+sheet back over the whole sample and report a return nobody could have earned.
+
+So the payload carries `backtest_safe=False` and an `as_of`, the rendered text leads
+with "a snapshot of today only", and the system prompt forbids using a fundamental to
+explain any dated signal. A missing field stays missing — never filled with a zero that
+would read as a measurement.
+
+### Search results are data, never instructions
+
+Web results reach a model that can call tools, so they arrive fenced in an
+`<untrusted_search_results>` block whose own text says what the fence means. A result
+containing "ignore your previous instructions" is quoted verbatim and treated as a
+string. Run with `--no-web` (or untick the box in the sidebar) and the search tools are
+**absent** rather than blocked, so the model cannot report having tried.
+
+### The escape hatch
+
+`python -m qbs.agent --report picks|name|breadth|universe|fundamentals|news` prints
+exactly what the agent would read, with no model, no key and no LangChain installed.
+When an answer looks wrong, diff it against the report rather than re-prompting.
+
+### What it is not
+
+A research note from a capable but unaccountable junior. The numbers in it are
+checkable against the tool traces; check them. Nothing here constitutes advice, and the
+model is instructed not to issue buy/sell calls or position sizes.
 
 ---
 

@@ -353,7 +353,8 @@ st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
 selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_watch))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
 
-tab_picks, tab_market = st.tabs(["📋 Daily picks", "📊 Market overview"])
+tab_picks, tab_market, tab_analyst = st.tabs(
+    ["📋 Daily picks", "📊 Market overview", "🤖 Analyst"])
 
 
 # ==========================================================================
@@ -840,3 +841,113 @@ with tab_market:
                 "is the finding. Pool % is that sector's own weight — the bar it "
                 "has to beat. Penetration is leaders ÷ analysed names in the sector."
             )
+
+
+# ==========================================================================
+# Tab 3 -- the LLM analyst
+# ==========================================================================
+# A Gemini agent that reads the tabs above through tools and writes about
+# them. Everything it can quote is computed by this package; it has no
+# arithmetic of its own and no way to change a parameter.
+#
+# The tool trace below every answer is not a debug view. It is how a reader
+# checks a number against the call it came from, which is the only thing that
+# separates a research note from a fluent guess.
+
+with tab_analyst:
+    freshness_banner()
+    st.subheader("Ask the analyst")
+
+    from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
+    from qbs.agent.evidence import Book
+    from qbs.agent.news import available_backends
+
+    blocker = check_requirements()
+    backends = available_backends()
+
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("**Analyst**")
+        model_name = st.text_input("Gemini model", DEFAULT_MODEL,
+                                   help="Model names move faster than this app. "
+                                        "Override here or set QBS_GEMINI_MODEL.")
+        allow_web = st.checkbox("Allow web search", value=bool(backends),
+                                disabled=not backends,
+                                help=("Search backends found: "
+                                      + (", ".join(backends) or "none — "
+                                         "pip install ddgs")))
+        live_fundamentals = st.checkbox(
+            "Fetch fundamentals live", value=True,
+            help="Off reads only what is already cached in data/fundamentals/.")
+
+    if blocker:
+        st.warning(
+            f"**The analyst is not configured.** {blocker}\n\n"
+            "Everything else in this dashboard works without it — the analyst "
+            "reads results, it never produces them.", icon="🔌")
+        st.markdown(
+            "```bash\n"
+            "pip install -r requirements-agent.txt\n"
+            "export GOOGLE_API_KEY=...   # https://aistudio.google.com/apikey\n"
+            "python -m qbs.agent --check\n"
+            "```")
+
+    st.caption(
+        "The analyst can read the current picks, any name's momentum profile, "
+        "market breadth, the breakout funnel and trade log, company "
+        "fundamentals from yfinance, and the web. It is told that every figure "
+        "must come from one of those tools, and every call it made is listed "
+        "under each answer so you can check the figures against their source."
+    )
+
+    EXAMPLES = [
+        "Why is the momentum book holding names the Finviz screen rejects?",
+        "Profile the top momentum pick and say what would take it out of the book.",
+        "Is the market broad or narrow right now, and what does that imply "
+        "for a breakout strategy?",
+        "Pull fundamentals and recent news for the strongest pick, and say "
+        "where they disagree with the price signal.",
+    ]
+    picked = st.selectbox("Start from an example, or write your own", 
+                          ["— write my own —"] + EXAMPLES)
+    default_q = "" if picked.startswith("—") else picked
+    question = st.text_area("Question", value=default_q, height=90,
+                            placeholder="Ask about the picks, a name, breadth, "
+                                        "or the backtest results…")
+
+    ask = st.button("Analyse", type="primary", disabled=bool(blocker) or not question.strip())
+
+    if ask:
+        # The agent gets the frames this app already loaded rather than
+        # re-reading the cache: a three-tool answer would otherwise spend a
+        # minute rebuilding a universe that is sitting in memory.
+        book = Book(universe=uni, prices=px, cfg=cfg, note=UNIVERSE_NOTE)
+        with st.spinner(f"Asking {model_name}…"):
+            answer = analyse(
+                question.strip(), model=model_name.strip() or None,
+                book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
+                offline_fundamentals=not live_fundamentals)
+
+        if answer.error:
+            st.error(f"**The analyst could not answer.** {answer.text}", icon="🚫")
+        else:
+            st.markdown(answer.text)
+
+        if answer.tool_calls:
+            st.markdown("---")
+            st.markdown(f"###### Evidence — {len(answer.tool_calls)} tool "
+                        f"call{'s' if len(answer.tool_calls) != 1 else ''}")
+            for i, call in enumerate(answer.tool_calls, 1):
+                args = ", ".join(f"{k}={v!r}" for k, v in call["args"].items())
+                with st.expander(f"{i}. `{call['name']}({args})`"):
+                    st.code(call["result"] or "(no output)", language="text")
+            st.caption(
+                "Every number in the answer above should appear in one of "
+                "these. One that does not is a fabrication, and worth telling "
+                "the model about in a follow-up.")
+        elif ask and not answer.error:
+            st.warning(
+                "The analyst answered without calling a single tool, which "
+                "means nothing in that answer is sourced from your data. "
+                "Treat it as opinion and ask again more specifically.",
+                icon="⚠️")
