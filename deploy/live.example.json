@@ -8,6 +8,7 @@
   "hold_safe_asset": true,
 
   "min_order_notional": 250.0,
+  "rebalance_drift": 0.25,
   "max_order_notional": 40000.0,
   "max_gross_turnover": 1.6,
   "max_positions": 12,
