@@ -1,7 +1,8 @@
 """An LLM analyst over the lab's results.
 
-Four layers, and only the top one needs LangChain:
+Layered so that only the top one needs LangChain:
 
+    env.py          `.env` loading: the shell wins, no value is ever printed
     evidence.py     the lab's own numbers, rendered as text with their caveats
     fundamentals.py yfinance company data, cached  (no LangChain)
     news.py         web search and headlines       (no LangChain)
@@ -20,13 +21,25 @@ how to summarise it.
 Needs `pip install -r requirements-agent.txt` and `GOOGLE_API_KEY`. Without
 them `check_requirements()` says which is missing, and every layer below
 `tools.py` still works.
+
+The key can live in a `.env` at the repository root -- importing this package
+reads it, filling in only what the shell has not already set. `ENV` holds
+what that load did (key names and the file, never a value).
 """
 
-from .analyst import Answer, analyse, build_analyst, check_requirements
-from .evidence import Book, load_book
-from .fundamentals import Snapshot, fetch_fundamentals
-from .news import search_web, ticker_news
+# `.env` is read HERE, before `.analyst` is imported: that module reads
+# QBS_GEMINI_MODEL at import time, so loading any later would pick up the
+# default and ignore the file. A real environment variable still wins --
+# `load_env` fills in what is missing and never overrides the shell.
+from .env import load_env
+
+ENV = load_env()
+
+from .analyst import Answer, analyse, build_analyst, check_requirements  # noqa: E402
+from .evidence import Book, load_book                                    # noqa: E402
+from .fundamentals import Snapshot, fetch_fundamentals                   # noqa: E402
+from .news import search_web, ticker_news                                # noqa: E402
 
 __all__ = ["Answer", "analyse", "build_analyst", "check_requirements",
            "Book", "load_book", "Snapshot", "fetch_fundamentals",
-           "search_web", "ticker_news"]
+           "search_web", "ticker_news", "ENV", "load_env"]

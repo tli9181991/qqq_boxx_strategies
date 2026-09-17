@@ -29,9 +29,11 @@ checkable against the tools; check them.
 
 Requirements
 ------------
-`pip install -r requirements-agent.txt` and a Google AI Studio key in
-`GOOGLE_API_KEY`. The model name moves faster than this file; override it
-with `QBS_GEMINI_MODEL` or the `model=` argument.
+`pip install -r requirements-agent.txt` and a Google AI Studio key, either
+exported as `GOOGLE_API_KEY` (or `GEMINI_API_KEY` -- both are accepted) or
+written into a `.env` at the repository root, which `qbs.agent` reads on
+import. The model name moves faster than this file; override it with
+`QBS_GEMINI_MODEL`, a line in `.env`, or the `model=` argument.
 """
 
 from __future__ import annotations
@@ -39,6 +41,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from .env import load_env, resolve_google_key
 
 DEFAULT_MODEL = os.environ.get("QBS_GEMINI_MODEL", "gemini-2.5-pro")
 DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
@@ -130,9 +134,16 @@ def check_requirements() -> Optional[str]:
     except ImportError:
         return ("langchain-google-genai is not installed — "
                 "pip install -r requirements-agent.txt")
-    if not os.environ.get("GOOGLE_API_KEY"):
-        return ("GOOGLE_API_KEY is not set — create a key at "
-                "https://aistudio.google.com/apikey and export it")
+    if resolve_google_key() is None:
+        # Importing `qbs.agent` already read any `.env`, but this function is
+        # reachable via `qbs.agent.analyst` directly. Re-reading is cheap and
+        # cannot clobber the shell, so the answer does not depend on which
+        # module the caller happened to import.
+        load_env()
+    if resolve_google_key() is None:
+        return ("GOOGLE_API_KEY is not set — put it in a .env at the repo "
+                "root (cp .env.example .env) or export it. Create a key at "
+                "https://aistudio.google.com/apikey")
     return None
 
 
@@ -145,6 +156,10 @@ def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
     """
     from langchain_google_genai import ChatGoogleGenerativeAI
 
+    # Passed explicitly rather than left to the library's own GOOGLE_API_KEY
+    # lookup, so a key supplied as GEMINI_API_KEY -- the name half of Google's
+    # docs use -- works instead of reporting itself as missing.
+    kwargs.setdefault("google_api_key", resolve_google_key())
     return ChatGoogleGenerativeAI(model=model, temperature=temperature, **kwargs)
 
 

@@ -22,6 +22,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from qbs.agent import env
 from qbs.agent import evidence as ev
 from qbs.agent import fundamentals as fund
 from qbs.agent import news as nw
@@ -137,6 +138,163 @@ def test_format_value_respects_units():
     assert fund.format_value(3.2e11, "usd") == "$320.0B"
     assert fund.format_value(None, "pct") == "n/a"
     assert fund.format_value("Technology", "raw") == "Technology"
+
+
+# --------------------------------------------------------------------------
+# .env loading
+# --------------------------------------------------------------------------
+
+def _write_env(tmp_path, text: str) -> str:
+    path = tmp_path / ".env"
+    path.write_text(text)
+    return str(path)
+
+
+def test_env_parses_the_syntax_it_documents():
+    values, bad = env.parse_env(
+        "# a comment\n"
+        "\n"
+        "GOOGLE_API_KEY=abc123\n"
+        "export TAVILY_API_KEY=xyz\n"
+        'QUOTED="with spaces"\n'
+        "SINGLE='also fine'\n"
+        "  SPACED = padded \n"
+    )
+    assert values["GOOGLE_API_KEY"] == "abc123"
+    assert values["TAVILY_API_KEY"] == "xyz", "the export prefix is ignored"
+    assert values["QUOTED"] == "with spaces"
+    assert values["SINGLE"] == "also fine"
+    assert values["SPACED"] == "padded"
+    assert bad == []
+
+
+def test_env_treats_a_hash_inside_a_value_as_part_of_it():
+    """An API key containing `#` is far likelier than a trailing comment on a
+    secret, so `#` starts a comment only at the start of a line."""
+    values, bad = env.parse_env("GOOGLE_API_KEY=abc#def\n")
+    assert values["GOOGLE_API_KEY"] == "abc#def"
+    assert bad == []
+
+
+def test_env_reports_a_bad_line_rather_than_dropping_it():
+    """A typo in the one file holding your API key must not present as "the
+    key is missing"."""
+    values, bad = env.parse_env("GOOGLE_API_KEY=ok\nOOPS NO EQUALS\n")
+    assert values == {"GOOGLE_API_KEY": "ok"}
+    assert bad == [2]
+
+
+def test_env_does_not_interpolate():
+    values, _ = env.parse_env("A=$OTHER\n")
+    assert values["A"] == "$OTHER", "no expansion; documented as unsupported"
+
+
+def test_env_fills_in_what_is_missing(tmp_path):
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=from-the-file\n")
+    fake = {}
+    load = env.load_env(path, environ=fake)
+    assert fake["GOOGLE_API_KEY"] == "from-the-file"
+    assert load.applied == ["GOOGLE_API_KEY"] and load.loaded
+
+
+def test_the_shell_beats_the_file(tmp_path):
+    """`GOOGLE_API_KEY=... python -m qbs.agent` has to win over a .env sitting
+    next to it, or a one-off override silently does nothing."""
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=from-the-file\n")
+    fake = {"GOOGLE_API_KEY": "from-the-shell"}
+    load = env.load_env(path, environ=fake)
+    assert fake["GOOGLE_API_KEY"] == "from-the-shell"
+    assert load.skipped == ["GOOGLE_API_KEY"] and load.applied == []
+
+
+def test_override_reverses_that(tmp_path):
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=from-the-file\n")
+    fake = {"GOOGLE_API_KEY": "from-the-shell"}
+    env.load_env(path, override=True, environ=fake)
+    assert fake["GOOGLE_API_KEY"] == "from-the-file"
+
+
+def test_an_empty_shell_value_does_not_shadow_the_file(tmp_path):
+    """`GOOGLE_API_KEY=` exported by a shell profile is not a key."""
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=real\n")
+    fake = {"GOOGLE_API_KEY": ""}
+    env.load_env(path, environ=fake)
+    assert fake["GOOGLE_API_KEY"] == "real"
+
+
+def test_a_bad_line_is_a_warning_not_a_failed_load(tmp_path):
+    """The other lines were applied. Calling the whole file failed would send
+    someone hunting for the wrong problem."""
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=ok\nOOPS\n")
+    fake = {}
+    load = env.load_env(path, environ=fake)
+    assert load.loaded and load.error is None
+    assert fake["GOOGLE_API_KEY"] == "ok"
+    assert any("unparseable" in w for w in load.warnings)
+
+
+def test_a_misspelled_key_is_pointed_out(tmp_path):
+    """A typo'd name is the likeliest reason a key "is not set" while sitting
+    right there in the file."""
+    path = _write_env(tmp_path, "GOOGEL_API_KEY=oops\n")
+    load = env.load_env(path, environ={})
+    assert load.unknown == ["GOOGEL_API_KEY"]
+    assert any("unrecognised key" in w for w in load.warnings)
+
+
+def test_a_missing_file_is_not_an_error():
+    load = env.load_env("/nonexistent/.env", environ={})
+    assert not load.loaded and load.applied == []
+
+
+def test_world_readable_is_flagged(tmp_path):
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=secret\n")
+    os.chmod(path, 0o644)
+    assert env.load_env(path, environ={}).insecure
+    os.chmod(path, 0o600)
+    assert not env.load_env(path, environ={}).insecure
+
+
+def test_the_summary_never_leaks_a_value(tmp_path):
+    """This string goes to a terminal, a Streamlit caption and screenshots."""
+    path = _write_env(tmp_path, "GOOGLE_API_KEY=super-secret-value\n"
+                                "TAVILY_API_KEY=another-secret\n")
+    summary = env.load_env(path, environ={}).summary()
+    assert "super-secret-value" not in summary
+    assert "another-secret" not in summary
+    assert "GOOGLE_API_KEY" in summary, "names are fine, values are not"
+
+
+def test_either_google_key_name_resolves():
+    """Google's own docs use both names, and people copy whichever they read.
+    Accepting one and ignoring the other reports a missing key that is
+    sitting in the file."""
+    assert env.resolve_google_key({"GOOGLE_API_KEY": "a"}) == "a"
+    assert env.resolve_google_key({"GEMINI_API_KEY": "b"}) == "b"
+    assert env.resolve_google_key({"GOOGLE_API_KEY": "a",
+                                   "GEMINI_API_KEY": "b"}) == "a"
+    assert env.resolve_google_key({}) is None
+    assert env.resolve_google_key({"GOOGLE_API_KEY": ""}) is None
+
+
+def test_find_env_file_does_not_walk_above_the_repo(tmp_path, monkeypatch):
+    """A .env two directories up belongs to another project, and reading a
+    stranger's secrets is not a convenience."""
+    deep = tmp_path / "a" / "b"
+    deep.mkdir(parents=True)
+    (tmp_path / ".env").write_text("GOOGLE_API_KEY=someone-elses\n")
+    monkeypatch.chdir(deep)
+    monkeypatch.setattr(env, "REPO_ROOT", str(tmp_path / "norepo"))
+    assert env.find_env_file() is None
+
+
+def test_check_requirements_accepts_the_gemini_name(monkeypatch):
+    from qbs.agent import analyst
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "present")
+    blocker = analyst.check_requirements()
+    # Whatever else may be missing (langchain, say), the key must not be it.
+    assert blocker is None or "API_KEY" not in blocker
 
 
 # --------------------------------------------------------------------------
@@ -333,16 +491,27 @@ def test_a_failing_tool_explains_rather_than_returning_nothing():
 # The agent itself
 # --------------------------------------------------------------------------
 
+def _no_key(monkeypatch):
+    """Unset BOTH key names.
+
+    Dropping only GOOGLE_API_KEY leaves GEMINI_API_KEY standing, and on a
+    machine with a real `.env` these tests would then build a live agent and
+    make a paid API call from the suite.
+    """
+    for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_check_requirements_names_the_missing_key(monkeypatch):
     from qbs.agent import analyst
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    _no_key(monkeypatch)
     missing = analyst.check_requirements()
     assert missing and "GOOGLE_API_KEY" in missing
 
 
 def test_analyse_without_a_key_returns_an_answer_not_an_exception(monkeypatch):
     from qbs.agent import analyst
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    _no_key(monkeypatch)
     answer = analyst.analyse("what do we hold?")
     assert answer.error and "GOOGLE_API_KEY" in answer.text
     assert answer.tool_calls == []

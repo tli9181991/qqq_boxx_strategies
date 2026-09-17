@@ -8,11 +8,15 @@
 `--report` is the escape hatch worth knowing about: it prints exactly what
 the agent would read, with no API key, no model and no network. When an
 answer looks wrong, diff it against the report rather than re-prompting.
+
+The key comes from a `.env` at the repository root (see `.env.example`) or
+from the environment, which wins. `--check` says which, without printing it.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 REPORTS = ("picks", "name", "breadth", "universe", "fundamentals", "news")
@@ -40,8 +44,16 @@ def main(argv=None) -> int:
 
     if args.check:
         from .analyst import DEFAULT_MODEL, check_requirements
+        from .env import KNOWN_KEYS, load_env, resolve_google_key
         from .news import available_backends
+        loaded = load_env()
         missing = check_requirements()
+        print(f".env:            {loaded.summary()}")
+        # Key names and set/unset only. Printing a secret to a terminal puts
+        # it in the scrollback and the shell history of whoever ran --check.
+        present = [k for k in KNOWN_KEYS if os.environ.get(k)]
+        print(f"keys set:        {', '.join(present) or 'none'}")
+        print(f"google key:      {'found' if resolve_google_key() else 'MISSING'}")
         print(f"model:           {DEFAULT_MODEL}")
         print(f"search backends: {', '.join(available_backends()) or 'none'}")
         print(f"analyst:         {'ready' if not missing else 'NOT ready — ' + missing}")

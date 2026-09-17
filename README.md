@@ -675,6 +675,7 @@ qbs/
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
   agent/          an LLM analyst that READS the results above
+    env.py          .env loading: the shell wins, and no value is ever printed
     evidence.py     the lab's own numbers as text, each with its caveat attached
     fundamentals.py yfinance company data, cached      (no LangChain import)
     news.py         web search + Yahoo headlines       (no LangChain import)
@@ -687,8 +688,9 @@ notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
 tests/test_qbs.py 149 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
-tests/test_agent.py 35 tests: the analyst's data layers, its tools, and one
-                  real agent run driven by a scripted model (no key, no network)
+tests/test_agent.py 51 tests: the analyst's data layers, .env loading and
+                  precedence, its tools, and one real agent run driven by a
+                  scripted model (no key, no network)
 ```
 
 ### The one convention that matters
@@ -922,7 +924,7 @@ lives in `qbs/agent/`, is entirely optional, and **produces no numbers of its ow
 
 ```bash
 pip install -r requirements.txt -r requirements-agent.txt
-export GOOGLE_API_KEY=...            # https://aistudio.google.com/apikey
+cp .env.example .env && chmod 600 .env       # paste your key into it
 python -m qbs.agent --check
 
 python -m qbs.agent "Why is the momentum book holding names the Finviz screen rejects?"
@@ -931,6 +933,46 @@ python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
 
 Or use the dashboard's **🤖 Analyst** tab, which hands the agent the frames the app has
 already loaded instead of re-reading the cache.
+
+### Where the key comes from
+
+`qbs.agent` reads a `.env` at the repository root on import, so the CLI, the dashboard
+and a notebook all pick it up with nothing further to do. `.env` is gitignored;
+`.env.example` is the tracked template.
+
+```
+GOOGLE_API_KEY=...          # GEMINI_API_KEY works too — Google's docs use both
+QBS_GEMINI_MODEL=gemini-2.5-flash    # optional
+TAVILY_API_KEY=...                   # optional, better search than the default
+```
+
+**A real environment variable always wins**, so `GOOGLE_API_KEY=... python -m qbs.agent
+...` overrides the file for one run. `--check` says which source supplied each key,
+by name:
+
+```
+$ python -m qbs.agent --check
+.env:            loaded .env; set QBS_GEMINI_MODEL; kept the shell's GOOGLE_API_KEY
+keys set:        GOOGLE_API_KEY, QBS_GEMINI_MODEL
+google key:      found
+model:           gemini-2.5-flash
+search backends: duckduckgo
+analyst:         ready
+```
+
+Nothing ever prints a value — `--check`, the dashboard caption and the load summary
+carry key *names* and the file path only. The loader warns if `.env` is readable by
+anyone but you, and points out an unrecognised key name, since a typo'd
+`GOOGEL_API_KEY` otherwise presents as "the key is not set" while sitting in the file.
+
+The syntax is deliberately small: `KEY=value`, one per line, `export` prefix ignored,
+surrounding quotes stripped, `#` starting a comment only at the beginning of a line
+(so a key containing `#` survives). No `$VAR` interpolation, no multi-line values —
+export those from your shell instead. A malformed line is reported rather than
+skipped, and the other lines still load.
+
+Streamlit will not re-import a package it has already loaded, so **restart the
+dashboard** after creating `.env`; a rerun alone will not pick the key up.
 
 ### What it can look at
 

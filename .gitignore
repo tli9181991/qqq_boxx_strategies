@@ -47,3 +47,6 @@ data/universe/us_volumes.csv
 # file is a picture of ONE day's ratios with no history in it, so a committed
 # copy would age into a set of numbers that look current and are not.
 data/fundamentals/
+
+# API keys for the LLM analyst. `.env.example` is the tracked template.
+.env

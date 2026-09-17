@@ -859,9 +859,11 @@ with tab_analyst:
     st.subheader("Ask the analyst")
 
     from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
+    from qbs.agent.env import load_env
     from qbs.agent.evidence import Book
     from qbs.agent.news import available_backends
 
+    env_load = load_env()
     blocker = check_requirements()
     backends = available_backends()
 
@@ -888,9 +890,17 @@ with tab_analyst:
         st.markdown(
             "```bash\n"
             "pip install -r requirements-agent.txt\n"
-            "export GOOGLE_API_KEY=...   # https://aistudio.google.com/apikey\n"
+            "cp .env.example .env && chmod 600 .env   # then paste your key in\n"
             "python -m qbs.agent --check\n"
             "```")
+        st.caption(
+            "Streamlit does not re-import a package that is already loaded, "
+            "so **restart the app** after creating `.env` — a rerun alone "
+            "will not pick the key up."
+        )
+    # Key names and where they came from. Never a value: this renders in a
+    # browser and lands in screenshots.
+    st.caption(f"🔑 `.env`: {env_load.summary()}")
 
     st.caption(
         "The analyst can read the current picks, any name's momentum profile, "
