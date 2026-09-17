@@ -51,4 +51,5 @@ client_secret*.json
 drive_token.json
 cookies.txt
 deploy/patreon/patreon.env
+deploy/windows/patreon.env
 deploy/patreon/config.json

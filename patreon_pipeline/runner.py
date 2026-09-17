@@ -31,12 +31,23 @@ log = logging.getLogger("patreon_pipeline")
 
 
 def setup_logging(verbose: bool, logfile: Optional[str] = None) -> None:
+    """Log to stderr, and optionally to a rotating file.
+
+    The file matters on Windows, where Task Scheduler keeps only a task's exit
+    code and nothing at all of its output -- there is no journald to fall back
+    on. Rotation is not optional either: these are long-running processes, and
+    an unbounded log on a mini-PC eventually becomes the disk-full incident.
+    """
+    from logging.handlers import RotatingFileHandler
+
     level = logging.DEBUG if verbose else logging.INFO
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if logfile:
         os.makedirs(os.path.dirname(os.path.abspath(logfile)) or ".",
                     exist_ok=True)
-        handlers.append(logging.FileHandler(logfile))
+        handlers.append(RotatingFileHandler(
+            logfile, maxBytes=5 * 1024 * 1024, backupCount=3,
+            encoding="utf-8"))
     logging.basicConfig(
         level=level,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",

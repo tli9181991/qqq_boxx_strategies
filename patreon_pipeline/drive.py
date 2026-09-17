@@ -87,7 +87,18 @@ def authorize(cfg: PipelineConfig, *, console: bool = False) -> str:
 
     with open(token_path, "w", encoding="utf-8") as fh:
         fh.write(creds.to_json())
-    os.chmod(token_path, 0o600)
+    try:
+        os.chmod(token_path, 0o600)
+    except OSError as exc:
+        log.debug("could not restrict permissions on %s: %s", token_path, exc)
+    if os.name == "nt":
+        # chmod on Windows only toggles the read-only bit -- it does not
+        # restrict other users. The token is a live credential, so say so
+        # rather than letting the call above imply a protection it did not
+        # provide. NTFS ACLs under LOCALAPPDATA are already per-user, which is
+        # why the default state directory lives there.
+        log.info("token saved under your user profile; on Windows its "
+                 "protection is the folder's ACL, not file permissions")
     log.info("saved Drive token to %s", token_path)
     return token_path
 

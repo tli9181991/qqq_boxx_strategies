@@ -322,6 +322,22 @@ def test_secrets_are_not_read_from_the_config_file():
     assert "hunter2" not in cfg.describe()
 
 
+def test_title_length_is_configurable_for_windows_path_limits():
+    """Windows caps a path at 260 chars unless long paths are on, and yt-dlp
+    fails *after* the download when the name crosses it."""
+    cfg = PipelineConfig(title_bytes=100)
+    cmd = download.build_command(cfg, "https://www.patreon.com/posts/1", "/tmp/j")
+    assert "%(title).100B [%(id)s].%(ext)s" in cmd
+
+    cfg = PipelineConfig(title_bytes=180)
+    cmd = download.build_command(cfg, "https://www.patreon.com/posts/1", "/tmp/j")
+    assert "%(title).180B [%(id)s].%(ext)s" in cmd
+
+
+def test_validate_rejects_unreadable_title_length():
+    assert any("title_bytes" in p for p in PipelineConfig(title_bytes=5).validate())
+
+
 def test_validate_rejects_uploading_nothing():
     cfg = PipelineConfig(upload_media=False, upload_transcript=False)
     assert any("upload nothing" in p for p in cfg.validate())

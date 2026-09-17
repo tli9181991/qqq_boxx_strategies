@@ -35,12 +35,39 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+IS_WINDOWS = sys.platform == "win32"
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_STATE_DIR = os.environ.get(
-    "PATREON_STATE_DIR", os.path.join(REPO_ROOT, "var", "patreon"))
+
+
+def _default_state_dir() -> str:
+    """Where state lives when nothing overrides it.
+
+    On Windows the repo may sit anywhere (often a synced folder), and a
+    Scheduled Task runs as a specific user, so LOCALAPPDATA is the right home
+    for a database, staging files and a 1.5 GB model cache. On Linux the
+    systemd units set PATREON_STATE_DIR to /var/lib/patreon and this default
+    only ever applies to a developer running from a clone.
+    """
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("PROGRAMDATA")
+        if base:
+            return os.path.join(base, "PatreonPipeline")
+    return os.path.join(REPO_ROOT, "var", "patreon")
+
+
+DEFAULT_STATE_DIR = os.environ.get("PATREON_STATE_DIR", _default_state_dir())
+
+# Bytes of post title kept in the output filename. Windows caps a path at 260
+# characters unless long-path support is switched on, and a staging directory
+# plus a 180-byte title plus " [id].ext" runs right up against that -- yt-dlp
+# then fails late, after the download. Linux has no such limit worth worrying
+# about.
+DEFAULT_TITLE_BYTES = 100 if IS_WINDOWS else 180
 
 
 def _env_str(key: str, default: str) -> str:
@@ -103,7 +130,10 @@ class PipelineConfig:
 
     # ---- patreon / yt-dlp ------------------------------------------------
     campaign_urls: List[str] = field(default_factory=list)
-    ytdlp_binary: str = "yt-dlp"
+    ytdlp_binary: str = "yt-dlp"     # "yt-dlp.exe" is found by this name too
+    ffmpeg_binary: str = "ffmpeg"
+    # See DEFAULT_TITLE_BYTES: this is a Windows path-length guard.
+    title_bytes: int = DEFAULT_TITLE_BYTES
     # One of these two supplies the patron session. `cookies_from_browser` is
     # the low-maintenance option on a box with a logged-in Firefox profile;
     # `cookies_file` is the exported-cookies fallback.
@@ -233,6 +263,8 @@ class PipelineConfig:
 
         cfg.campaign_urls = _env_list("PATREON_CAMPAIGN_URLS", cfg.campaign_urls)
         cfg.ytdlp_binary = _env_str("PATREON_YTDLP", cfg.ytdlp_binary)
+        cfg.ffmpeg_binary = _env_str("PATREON_FFMPEG", cfg.ffmpeg_binary)
+        cfg.title_bytes = _env_int("PATREON_TITLE_BYTES", cfg.title_bytes)
         cfg.cookies_from_browser = _env_str(
             "PATREON_COOKIES_FROM_BROWSER", cfg.cookies_from_browser)
         cfg.cookies_file = _env_str("PATREON_COOKIES_FILE", cfg.cookies_file)
@@ -297,6 +329,8 @@ class PipelineConfig:
             problems.append(
                 "upload_media is off but transcribe is off too: nothing would "
                 "be produced")
+        if self.title_bytes < 20:
+            problems.append("title_bytes below 20 makes filenames unreadable")
         if self.whisper_device == "cpu" and self.whisper_compute_type == "float16":
             problems.append(
                 "whisper_compute_type float16 is not supported on CPU; use int8")

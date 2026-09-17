@@ -8,6 +8,12 @@ Unrelated to the trading strategy. It lives here because it runs on the same
 mini-PC under the same systemd conventions, and a second repo for ~1,500 lines
 would cost more than it saves.
 
+**On Windows?** The pipeline itself is portable; only the deployment layer is
+Linux-specific. See [`PATREON_PIPELINE_WINDOWS.md`](PATREON_PIPELINE_WINDOWS.md)
+for Scheduled Tasks in place of systemd, and the handful of Windows behaviours
+(sleep, the 260-character path limit, DPAPI-encrypted Chrome cookies) worth
+knowing before you start.
+
 ## How it fits together
 
 ```

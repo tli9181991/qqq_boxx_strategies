@@ -258,6 +258,7 @@ def transcribe(cfg: PipelineConfig, media_path: str,
             os.close(fd)
             log.info("extracting audio from %s", os.path.basename(media_path))
             audio = extract_audio(media_path, tmp_wav,
+                                  ffmpeg=cfg.ffmpeg_binary,
                                   timeout=cfg.transcribe_timeout)
 
         prompt = build_initial_prompt(cfg.whisper_vocabulary)
@@ -280,7 +281,14 @@ def transcribe(cfg: PipelineConfig, media_path: str,
                     for s in raw_segments]
     finally:
         if tmp_wav and os.path.exists(tmp_wav):
-            os.remove(tmp_wav)
+            try:
+                os.remove(tmp_wav)
+            except OSError as exc:
+                # On Windows an antivirus scanner can still hold the handle for
+                # a moment after ffmpeg exits. A stray wav is not worth failing
+                # a finished transcription over; the staging directory is
+                # deleted wholesale later anyway.
+                log.debug("could not remove %s: %s", tmp_wav, exc)
 
     if not segments:
         raise TranscribeError("no speech detected")

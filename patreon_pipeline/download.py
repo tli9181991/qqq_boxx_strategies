@@ -134,7 +134,7 @@ def build_command(cfg: PipelineConfig, url: str, dest_dir: str) -> List[str]:
         "--sleep-interval", str(cfg.sleep_interval),
         "--max-sleep-interval", str(cfg.max_sleep_interval),
         "--paths", dest_dir,
-        "-o", "%(title).180B [%(id)s].%(ext)s",
+        "-o", f"%(title).{int(cfg.title_bytes)}B [%(id)s].%(ext)s",
     ]
     if cfg.audio_only:
         cmd += ["-f", "bestaudio/best", "-x",
