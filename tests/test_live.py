@@ -299,10 +299,16 @@ def test_live_signal_matches_the_backtest_final_weights():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]   # the dd-stop benchmark
 
-    # The backtest path.
+    # The backtest path -- every overlay the live path applies, in order, or
+    # this stops testing parity and starts testing that they differ.
+    from qbs.strategies import drawdown_stop
+
     mom = cross_sectional_momentum(uni, px["BOXX"], cfg.momentum)
     vt = book_vol_target(mom, frame, cfg.book_vol, lag=cfg.execution_lag)
+    vt = drawdown_stop(vt, frame, cfg.dd_stop, lag=cfg.execution_lag,
+                       benchmark=frame[cfg.dd_stop_benchmark])
     expected = vt.weights.iloc[-1]
 
     # The live path.
@@ -322,6 +328,7 @@ def test_live_signal_reports_the_scalar_and_holdings():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]   # the dd-stop benchmark
 
     book = compute_targets(cfg, frame, requested=list(uni.columns),
                            max_staleness_days=10_000, min_coverage=0.5,
@@ -780,6 +787,7 @@ def _book_with_selection():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]   # the dd-stop benchmark
     return compute_targets(cfg, frame, requested=list(uni.columns),
                            max_staleness_days=10_000, min_coverage=0.5,
                            now=frame.index[-1]), cfg
@@ -806,6 +814,7 @@ def test_selection_ranks_are_the_strategy_own_ranks():
 
     frame = uni.copy()
     frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]   # the dd-stop benchmark
     book = compute_targets(cfg, frame, requested=list(uni.columns),
                            max_staleness_days=10_000, min_coverage=0.5, now=asof)
     for r in book.selection:
@@ -976,6 +985,7 @@ def test_the_target_book_carries_its_universe():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
 
     book = compute_targets(cfg, frame, requested=list(uni.columns),
                            now=frame.index[-1])
@@ -1099,6 +1109,7 @@ def _excluded_book(exclude):
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
     # `now` pinned to the data's own last bar. Left to the wall clock, the
     # staleness guard starts failing these tests five business days after
     # synthetic_prices() ends -- a date that is fixed while today is not.
@@ -1536,6 +1547,7 @@ def test_the_book_carries_the_days_ranking():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
 
     book = compute_targets(cfg, frame, requested=list(uni.columns),
                            max_staleness_days=10_000, min_coverage=0.5,
@@ -1636,7 +1648,9 @@ def test_the_live_book_reports_the_breaker_state():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
 
+    cfg.dd_stop = DrawdownStopParams(enabled=False)
     off = compute_targets(cfg, frame, requested=list(uni.columns),
                           max_staleness_days=10_000, min_coverage=0.5,
                           now=frame.index[-1])
@@ -1669,6 +1683,7 @@ def test_the_benchmark_leg_fails_loudly_when_its_series_is_absent():
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
     frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    # The benchmark is deliberately absent -- that is what this test is for.
 
     with pytest.raises(SignalError, match="extra_tickers"):
         compute_targets(cfg, frame, requested=list(uni.columns),
@@ -1685,9 +1700,11 @@ def test_a_disabled_stop_does_not_demand_a_benchmark():
     """
     from dataclasses import replace as _replace
 
+    from qbs.config import DrawdownStopParams
+
     cfg = Config()
     assert cfg.dd_stop.qqq_drawdown == pytest.approx(0.15)
-    assert cfg.dd_stop.enabled is False
+    cfg.dd_stop = DrawdownStopParams(enabled=False)
 
     cfg.momentum = _replace(cfg.momentum, min_history=200, absolute_filter=False)
     px = synthetic_prices()

@@ -259,10 +259,11 @@ class DrawdownStopParams:
     agreeing, and because it costs nothing when it never binds. Set it to 0.0
     to drop it and with it the live dependency on a benchmark series.
 
-    Off by default. One thing this cannot do is help on a 6-year sample with
-    five episodes -- that is what the evidence rests on, and it is thin.
+    Enabled. The evidence is five episodes over six years, one of them outside
+    the window the live book has ever seen, so this is a deliberate choice made
+    on thin data rather than a conclusion the sample forced.
     """
-    enabled: bool = False
+    enabled: bool = True
     exit_drawdown: float = 0.13   # book this far below its own high -> cash
     qqq_drawdown: float = 0.15    # same, on the benchmark. 0.0 = off
     cooldown_days: int = 5        # sessions to stay out after the flag clears

@@ -2159,12 +2159,13 @@ def _dd_fixture():
     return cfg, frame, vt, px
 
 
-def test_the_stop_is_inert_until_enabled():
-    """Off by default: adding the overlay must not change a single weight."""
+def test_the_stop_is_inert_when_disabled():
+    """Disabled, the overlay must not change a single weight."""
     from qbs.strategies import drawdown_stop
     cfg, frame, vt, _ = _dd_fixture()
 
-    out = drawdown_stop(vt, frame, DrawdownStopParams(), lag=cfg.execution_lag)
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False),
+                        lag=cfg.execution_lag)
 
     pd.testing.assert_frame_equal(out.weights, vt.weights)
 
