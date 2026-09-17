@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from .config import FinvizScreenParams
+from .config import FinvizScreenParams, MomentumParams
 
 
 @dataclass
@@ -355,6 +355,27 @@ MOMENTUM_HORIZONS = (("1 week", 5), ("1 month", 21), ("3 months", 63),
                      ("6 months", 126), ("12 months", 252))
 
 
+def momentum_label(p: Optional[MomentumParams] = None) -> str:
+    """The book's own lookback, as the "6-1" style shorthand.
+
+    Callers append the word "momentum" where it reads well, so the bare form
+    also works inside a sentence.
+
+    Derived, never written out. The ranker's lookback is a config value that
+    has already moved once (12-1 to 6-1); a literal here would leave this
+    table calling a 6-1 number "12-1 momentum", which is the exact failure
+    this package keeps finding in its own logs.
+    """
+    p = p or MomentumParams()
+    return f"{p.lookback_months:g}-{p.skip_months:g}"
+
+
+def _momentum_window(p: Optional[MomentumParams] = None) -> tuple:
+    """`(lookback, skip)` in trading days, matching `cross_sectional_momentum`."""
+    p = p or MomentumParams()
+    return int(round(p.lookback_months * 21)), int(round(p.skip_months * 21))
+
+
 def momentum_profile(
     closes: pd.DataFrame,
     ticker: str,
@@ -363,6 +384,7 @@ def momentum_profile(
     safe: Optional[pd.Series] = None,
     ema_spans: Sequence[int] = (10, 20, 50, 200),
     screen: Optional[FinvizScreenParams] = None,
+    momentum: Optional[MomentumParams] = None,
 ) -> Dict[str, pd.DataFrame]:
     """The numbers behind a price chart: returns, rank, location, and gates.
 
@@ -381,7 +403,7 @@ def momentum_profile(
     `screen` and `p`, never written out again, so retuning the strategy
     retunes the table with it.
 
-    Two honest gaps. The 12-1 hurdle is measured against `safe` (BOXX) when
+    Two honest gaps. The momentum hurdle is measured against `safe` (BOXX) when
     supplied and against zero when not -- a weaker test, and the row says
     which was used. And the two legs that need share volume (the screen's
     average-volume filter, the leader rule's turnover) are omitted rather
@@ -415,12 +437,15 @@ def momentum_profile(
                      "Rank": _percentile(universe_ret, ticker),
                      "Universe median": universe_ret.median()})
 
-    # 12-1: the momentum book's own score, skipping the most recent month.
-    mom_12_1 = np.nan
-    if len(px) > 252:
-        u = px.iloc[-1 - 21] / px.iloc[-1 - 252] - 1.0
-        mom_12_1 = u.get(ticker, np.nan)
-        rows.append({"Horizon": "12-1 momentum", "Return": mom_12_1,
+    # The momentum book's own score: the return from `lookback` ago to `skip`
+    # ago, on the window the ranker is configured with rather than a literal.
+    look, skip = _momentum_window(momentum)
+    mom_label = momentum_label(momentum)
+    mom_score = np.nan
+    if len(px) > look:
+        u = px.iloc[-1 - skip] / px.iloc[-1 - look] - 1.0
+        mom_score = u.get(ticker, np.nan)
+        rows.append({"Horizon": f"{mom_label} momentum", "Return": mom_score,
                      "Rank": _percentile(u, ticker),
                      "Universe median": u.median()})
     returns = pd.DataFrame(rows)
@@ -470,17 +495,21 @@ def momentum_profile(
     sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
     sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
 
+    # The hurdle is measured over the SAME window as the score. Comparing a
+    # 6-1 stock return against a 12-1 cash return would be a different test
+    # from the one `absolute_filter` applies.
     hurdle, hurdle_label = 0.0, "zero (no safe asset supplied)"
     if safe is not None:
         sf = safe.reindex(px.index).ffill()
-        if len(sf) > 252 and pd.notna(sf.iloc[-1 - 21]) and pd.notna(sf.iloc[-1 - 252]):
-            hurdle = float(sf.iloc[-1 - 21] / sf.iloc[-1 - 252] - 1.0)
-            hurdle_label = f"BOXX 12-1 ({hurdle:+.1%})"
+        if len(sf) > look and pd.notna(sf.iloc[-1 - skip]) and pd.notna(sf.iloc[-1 - look]):
+            hurdle = float(sf.iloc[-1 - skip] / sf.iloc[-1 - look] - 1.0)
+            hurdle_label = f"BOXX over the same window ({hurdle:+.1%})"
 
     rows = [
-        {"Strategy": "Momentum book", "Rule": f"12-1 beats {hurdle_label}",
-         "Value": mom_12_1, "Fmt": "pct",
-         "Pass": bool(mom_12_1 > hurdle) if pd.notna(mom_12_1) else None},
+        {"Strategy": "Momentum book",
+         "Rule": f"{mom_label} momentum beats {hurdle_label}",
+         "Value": mom_score, "Fmt": "pct",
+         "Pass": bool(mom_score > hurdle) if pd.notna(mom_score) else None},
         # `>=`, matching `priced` in `finviz_momentum_screen` -- a name sitting
         # exactly on the threshold passes the screen, so it passes here too.
         {"Strategy": "Finviz screen",

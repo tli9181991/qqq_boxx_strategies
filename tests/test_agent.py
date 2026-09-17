@@ -517,6 +517,25 @@ def test_analyse_without_a_key_returns_an_answer_not_an_exception(monkeypatch):
     assert answer.tool_calls == []
 
 
+def test_the_prompt_names_the_lookback_the_ranker_actually_uses():
+    """A prompt that hard-codes 12-1 teaches the model a fact about this lab
+    that stopped being true in a diff it cannot see."""
+    from qbs.agent.analyst import SYSTEM_PROMPT, system_prompt
+    from qbs.breadth import momentum_label
+    from qbs.config import MomentumParams
+
+    assert f"Nasdaq-100 {momentum_label()}" in SYSTEM_PROMPT
+    assert "{momentum}" not in SYSTEM_PROMPT, "the template must be rendered"
+    twelve = system_prompt(MomentumParams(lookback_months=12))
+    assert "Nasdaq-100 12-1" in twelve
+
+
+def test_picks_report_names_the_configured_lookback():
+    from qbs.breadth import momentum_label
+
+    assert f"momentum ({momentum_label()})" in ev.picks_report(_book())
+
+
 def test_system_prompt_keeps_its_guardrails():
     """These lines are the difference between a research note and a confident
     fabrication. A reword that drops one should fail here."""

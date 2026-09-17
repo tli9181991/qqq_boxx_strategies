@@ -23,7 +23,8 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from ..breadth import BreadthParams, atr_class, daily_breadth, ma_class, momentum_profile
+from ..breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
+                       momentum_label, momentum_profile)
 from ..config import Config, FinvizScreenParams, MomentumParams, SAFE_ASSET
 from ..data import load_prices, sessions_behind
 from ..screens import finviz_momentum_screen
@@ -115,18 +116,25 @@ def picks_report(book: Book, n_hold: int = 6) -> str:
     picks = current_picks(book, n_hold=n_hold)
     mom, fin = set(picks["momentum"]), set(picks["finviz"])
     both = sorted(mom & fin)
+    # The lookback is named from the config, never written out -- it has
+    # already moved from 12-1 to 6-1 once, and a report that keeps saying
+    # 12-1 while the ranker scores 6-1 is the failure this whole layer is
+    # meant to prevent.
+    label = momentum_label(MomentumParams(n_hold=n_hold))
     lines = [f"CURRENT PICKS — {book.header()}", ""]
-    lines.append(f"Top-{n_hold} NDX momentum (12-1): "
+    left = [f"Top-{n_hold} NDX momentum ({label}):", f"Top-{n_hold} Finviz screen:"]
+    width = max(len(x) for x in left)
+    lines.append(f"{left[0].ljust(width)}  "
                  + (", ".join(picks["momentum"]) or "cash"))
-    lines.append(f"Top-{n_hold} Finviz screen:        "
+    lines.append(f"{left[1].ljust(width)}  "
                  + (", ".join(picks["finviz"]) or "cash"))
     lines.append("")
     lines.append(f"Held by both: {', '.join(both) if both else 'none'} "
                  f"({len(both)} of {n_hold})")
     lines.append(
-        "The two screens select on different things -- one on relative 12-1 "
-        "rank, the other on proximity to the 52-week high -- so low overlap "
-        "is the normal state, not a bug or a data problem.")
+        f"The two screens select on different things -- one on relative "
+        f"{label} rank, the other on proximity to the 52-week high -- so low "
+        f"overlap is the normal state, not a bug or a data problem.")
     return "\n".join(lines)
 
 
@@ -144,7 +152,8 @@ def name_report(book: Book, ticker: str, n_hold: int = 6) -> str:
                 + (f"Nearest by prefix: {', '.join(near)}." if near else ""))
 
     prof = momentum_profile(book.universe, ticker, safe=book.safe,
-                            screen=FinvizScreenParams(n_hold=n_hold))
+                            screen=FinvizScreenParams(n_hold=n_hold),
+                            momentum=MomentumParams(n_hold=n_hold))
     if prof["returns"].empty:
         return f"{ticker} has too little history in the cache to profile."
 

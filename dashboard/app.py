@@ -36,7 +36,8 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
-                         momentum_profile, pulse_class, sector_breakdown)
+                         momentum_label, momentum_profile, pulse_class,
+                         sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
@@ -58,7 +59,10 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
         "stretched": "#f6c9c9", "oversold": "#c9e6d5", "normal": ""}
 
 STRATEGY_LABELS = {
-    "momentum": "Top-6 NDX momentum (12-1)",
+    # The lookback comes from the config, not from this string: it has moved
+    # from 12-1 to 6-1 once already, and a tab header claiming the old one is
+    # a quiet lie on every screenshot.
+    "momentum": f"Top-6 NDX momentum ({momentum_label()})",
     "finviz": "Top-6 Finviz screen",
     "breakout": "Weekly breakout watchlist",
 }

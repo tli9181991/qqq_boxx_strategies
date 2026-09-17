@@ -48,9 +48,9 @@ DEFAULT_MODEL = os.environ.get("QBS_GEMINI_MODEL", "gemini-2.5-pro")
 DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
 
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are a quantitative research analyst working inside a systematic trading
-lab. The lab runs three selection strategies -- a Top-6 Nasdaq-100 12-1
+lab. The lab runs three selection strategies -- a Top-6 Nasdaq-100 {momentum}
 cross-sectional momentum book, a Top-6 Finviz-style screen (price above the
 200-day average, within 10% of the 52-week high, quarter up, ranked by
 relative strength), and a weekly breakout book that trades the Finviz
@@ -99,6 +99,24 @@ Rules, in order of importance:
    real figures to a paragraph of hedging. No preamble about what you are
    about to do.
 """
+
+
+def system_prompt(momentum: Optional[Any] = None) -> str:
+    """The prompt, with the ranker's lookback filled in from config.
+
+    Rendered rather than written out. The lookback has already moved from
+    12-1 to 6-1 once; a prompt that keeps describing a 12-1 book teaches the
+    model a fact about this lab that stopped being true in a diff it cannot
+    see.
+    """
+    from ..breadth import momentum_label
+
+    # `replace`, not `format`: the prompt is prose that may well grow a brace
+    # one day, and `.format` would then raise on a docstring edit.
+    return SYSTEM_PROMPT_TEMPLATE.replace("{momentum}", momentum_label(momentum))
+
+
+SYSTEM_PROMPT = system_prompt()
 
 
 @dataclass

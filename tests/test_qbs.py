@@ -2036,16 +2036,65 @@ def test_momentum_profile_ranks_within_the_universe():
     assert win["Rank"].between(1, 99).all()
 
 
-def test_momentum_profile_uses_12_1_not_12_0():
-    """The momentum book scores 12-1, skipping the most recent month. The row
-    must differ from the 12-month row, or it is measuring the wrong thing."""
-    from qbs.breadth import momentum_profile
+def test_momentum_profile_skips_the_most_recent_month():
+    """The book's score skips the most recent month. The row must differ from
+    the plain trailing return, or it is measuring the wrong thing."""
+    from qbs.breadth import momentum_label, momentum_profile
+    from qbs.config import MomentumParams
 
+    p = MomentumParams(lookback_months=12, skip_months=1)
     px = _profile_universe().copy()
     # A spike confined to the last month: 12-0 sees it, 12-1 must not.
     px.iloc[-15:, px.columns.get_loc("MID")] *= 3.0
-    r = momentum_profile(px, "MID")["returns"].set_index("Horizon")
-    assert r.loc["12 months", "Return"] > r.loc["12-1 momentum", "Return"]
+    r = momentum_profile(px, "MID", momentum=p)["returns"].set_index("Horizon")
+    row = f"{momentum_label(p)} momentum"
+    assert r.loc["12 months", "Return"] > r.loc[row, "Return"]
+
+
+def test_momentum_profile_scores_the_window_the_ranker_is_configured_with():
+    """The lookback has already moved from 12-1 to 6-1 once. A profile that
+    keeps reporting 12-1 would label a number the book does not use with the
+    name of the rule it claims to be explaining."""
+    from qbs.breadth import momentum_label, momentum_profile
+    from qbs.config import MomentumParams
+
+    px = _profile_universe()
+    six = MomentumParams(lookback_months=6, skip_months=1)
+    twelve = MomentumParams(lookback_months=12, skip_months=1)
+
+    assert momentum_label(six) == "6-1" and momentum_label(twelve) == "12-1"
+    r6 = momentum_profile(px, "WIN", momentum=six)["returns"].set_index("Horizon")
+    r12 = momentum_profile(px, "WIN", momentum=twelve)["returns"].set_index("Horizon")
+    assert "6-1 momentum" in r6.index and "12-1 momentum" not in r6.index
+    assert "12-1 momentum" in r12.index
+    # Different windows over a trending name are different numbers; equal
+    # values would mean the parameter is being ignored.
+    assert r6.loc["6-1 momentum", "Return"] != r12.loc["12-1 momentum", "Return"]
+
+    g6 = momentum_profile(px, "WIN", momentum=six)["gates"]
+    assert any(r.startswith("6-1 momentum beats") for r in g6["Rule"])
+
+
+def test_the_momentum_hurdle_uses_the_same_window_as_the_score():
+    """Comparing a 6-1 stock return against a 12-1 cash return would be a
+    different test from the one `absolute_filter` applies."""
+    from qbs.breadth import momentum_profile
+    from qbs.config import MomentumParams
+
+    px = _profile_universe()
+    idx = px.index
+    # Cash compounding steadily: a 12-month hurdle is far above a 6-month one,
+    # so a window mix-up changes the number the rule prints.
+    safe = pd.Series(np.linspace(100.0, 200.0, len(idx)), index=idx)
+
+    def hurdle(months):
+        gates = momentum_profile(
+            px, "MID", safe=safe,
+            momentum=MomentumParams(lookback_months=months))["gates"]
+        rule = [r for r in gates["Rule"] if "beats" in r][0]
+        return float(rule.split("(")[1].split("%")[0])
+
+    assert hurdle(6) < hurdle(12), "a longer window must show a bigger hurdle"
 
 
 def test_momentum_profile_gates_explain_a_rejection():
@@ -2110,7 +2159,7 @@ def test_momentum_profile_gates_follow_the_screen_parameters():
 
 
 def test_momentum_profile_hurdle_uses_the_safe_asset_when_given():
-    from qbs.breadth import momentum_profile
+    from qbs.breadth import momentum_label, momentum_profile
 
     px = _profile_universe()
     idx = px.index
@@ -2119,8 +2168,9 @@ def test_momentum_profile_hurdle_uses_the_safe_asset_when_given():
     without = momentum_profile(px, "MID")["gates"].set_index("Rule")
     with_safe = momentum_profile(px, "MID", safe=safe)["gates"].set_index("Rule")
 
-    rules_without = [r for r in without.index if r.startswith("12-1 beats")]
-    rules_with = [r for r in with_safe.index if r.startswith("12-1 beats")]
+    prefix = f"{momentum_label()} momentum beats"
+    rules_without = [r for r in without.index if r.startswith(prefix)]
+    rules_with = [r for r in with_safe.index if r.startswith(prefix)]
     assert "zero" in rules_without[0], "no safe asset -> the weaker test, and it says so"
     assert "BOXX" in rules_with[0], "the hurdle used must be named"
 

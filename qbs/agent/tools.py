@@ -65,23 +65,28 @@ def build_tools(
     """
     tool = _require_langchain()
     book = book if book is not None else ev.load_book(offline=True)
+    # Descriptions below deliberately do not name the lookback. It is a config
+    # value that has moved once already, and a docstring is the one place a
+    # change like that cannot reach -- so the horizon is stated by the tool's
+    # OUTPUT, which is derived, rather than by its description, which is not.
 
     @tool
     def current_picks() -> str:
         """What each selection strategy holds on the latest cached bar.
 
         Use this first for any question about what to buy, hold or watch
-        today. Covers the Top-6 NDX 6-1 momentum book and the Top-6 Finviz
-        screen, and reports how many names the two agree on.
+        today. Covers the Nasdaq-100 cross-sectional momentum book and the
+        Finviz screen, and reports how many names the two agree on. The
+        output names the lookback the ranker is actually configured with.
         """
         return ev.picks_report(book, n_hold=n_hold)
 
     @tool
     def name_momentum(ticker: str) -> str:
-        """Full momentum profile for one ticker: returns at 1w/1m/3m/6m/12m
-        and 12-1, each with its percentile rank in the universe, where price
-        sits against every moving average, and which strategy gate passes or
-        fails.
+        """Full momentum profile for one ticker: trailing returns at
+        1w/1m/3m/6m/12m plus the book's own momentum score, each with its
+        percentile rank in the universe, where price sits against every
+        moving average, and which strategy gate passes or fails.
 
         This is the tool that answers "why is this name not in the book?".
         """
