@@ -1515,3 +1515,103 @@ def test_the_band_is_validated():
 def test_the_band_is_settable_from_the_environment(monkeypatch):
     monkeypatch.setenv("QBS_REBALANCE_DRIFT", "0.4")
     assert LiveConfig.from_env().rebalance_drift == pytest.approx(0.4)
+
+
+# --------------------------------------------------------------------------
+# The daily CSV logs
+# --------------------------------------------------------------------------
+
+def test_the_book_carries_the_days_ranking():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+
+    book = compute_targets(cfg, frame, requested=list(uni.columns),
+                           max_staleness_days=10_000, min_coverage=0.5,
+                           now=frame.index[-1], record_ranks=8)
+
+    assert len(book.ranking) == 8
+    assert [r["rank"] for r in book.ranking] == list(range(1, 9))
+    # The ranking must be the one the strategy chose from, so every held name
+    # inside the recorded depth is marked, and the marks match the book.
+    marked = {r["symbol"] for r in book.ranking if r["held"]}
+    assert marked <= set(book.raw_holdings)
+    assert all(r["score"] >= s["score"]
+               for r, s in zip(book.ranking, book.ranking[1:]))
+
+
+def test_recording_ranks_is_off_unless_asked():
+    from qbs.strategies import cross_sectional_momentum
+
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+
+    sig = cross_sectional_momentum(uni, px[cfg.momentum.safe_asset], cfg.momentum)
+    assert sig.rank_log is None, "the backtest pays for a log it never reads"
+
+
+def test_the_ranking_log_appends_one_day_at_a_time(tmp_path):
+    path = str(tmp_path / "ranking_log.csv")
+    rows = [dict(symbol="MU", rank=1, score=5.69, held=True),
+            dict(symbol="KLAC", rank=7, score=1.80, held=False)]
+
+    assert st.append_ranking_csv(path, "2026-09-16", rows) == 2
+    assert st.append_ranking_csv(path, "2026-09-17", rows) == 2
+
+    import csv as _csv
+    got = list(_csv.DictReader(open(path)))
+    assert len(got) == 4
+    assert got[0]["asof"] == "2026-09-16" and got[0]["symbol"] == "MU"
+    assert got[0]["held"] == "yes" and got[1]["held"] == ""
+
+
+def test_relogging_the_same_day_is_a_no_op(tmp_path):
+    """Preflight runs twice a day and a failed phase gets re-run."""
+    path = str(tmp_path / "ranking_log.csv")
+    rows = [dict(symbol="MU", rank=1, score=5.69, held=True)]
+
+    st.append_ranking_csv(path, "2026-09-16", rows)
+    assert st.append_ranking_csv(path, "2026-09-16", rows) == 0
+
+    import csv as _csv
+    assert len(list(_csv.DictReader(open(path)))) == 1
+
+
+def test_the_trade_log_csv_mirrors_the_table(db, tmp_path):
+    from qbs.live.orders import Order
+
+    out = str(tmp_path / "trade_log.csv")
+    store.log_orders(db, "2026-09-16", "trade", [Order("MU", "BUY", 6, 924.41)],
+                     {"MU": "Submitted"}, dry_run=False)
+    assert store.export_trade_csv(db, out) == 1
+
+    import csv as _csv
+    row = next(iter(_csv.DictReader(open(out))))
+    assert row["symbol"] == "MU" and row["action"] == "BUY"
+    assert row["dry_run"] == "0"
+
+    # Rewritten, not appended: a second export must not double the rows.
+    assert store.export_trade_csv(db, out) == 1
+    assert len(list(_csv.DictReader(open(out)))) == 1
+
+
+def test_an_empty_trade_log_still_gets_its_header(db, tmp_path):
+    out = str(tmp_path / "trade_log.csv")
+    assert store.export_trade_csv(db, out) == 0
+    assert "session_date" in open(out).readline()
+
+
+def test_a_csv_log_failure_never_fails_the_phase(tmp_path, monkeypatch):
+    """The orders are already sent and recorded; a full disk must not undo that."""
+    from qbs.live import runner
+
+    live = LiveConfig(state_dir=str(tmp_path))
+    monkeypatch.setattr(runner.store, "export_trade_csv",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    runner._write_csv_logs(live)          # must not raise

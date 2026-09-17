@@ -101,6 +101,10 @@ class LiveConfig:
     # for. 1.0 disables rebalancing altogether -- only entries and exits trade,
     # and the book then holds whatever it holds through a vol event.
     rebalance_drift: float = 0.25
+    # How many of each day's ranked names to write to ranking_log.csv. The
+    # book holds 6 and exits past 10, so 25 shows the names queued behind
+    # them -- enough to see a rotation coming rather than only arriving.
+    ranking_log_top: int = 25
 
     # ---- safety guards ---------------------------------------------------
     max_order_notional: float = 40_000.0   # per single order
@@ -219,6 +223,16 @@ class LiveConfig:
         return os.path.join(self.state_dir, "strategy_trades.csv")
 
     @property
+    def ranking_csv_path(self) -> str:
+        """One row per ranked name per day, appended. A history, not a snapshot."""
+        return os.path.join(self.state_dir, "ranking_log.csv")
+
+    @property
+    def trade_csv_path(self) -> str:
+        """Every trading event, rewritten from the database on each run."""
+        return os.path.join(self.state_dir, "trade_log.csv")
+
+    @property
     def book_csv_path(self) -> str:
         """A readable snapshot of the strategy's book. A report, not a record."""
         return os.path.join(self.state_dir, "strategy_book.csv")
@@ -270,6 +284,7 @@ class LiveConfig:
         cfg.position_source = os.environ.get("QBS_POSITION_SOURCE",
                                              cfg.position_source)
         cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
+        cfg.ranking_log_top = _env_int("QBS_RANKING_TOP", cfg.ranking_log_top)
         cfg.sheets_id = os.environ.get("QBS_SHEETS_ID", cfg.sheets_id)
         cfg.sheets_key_file = os.environ.get("QBS_SHEETS_KEY", cfg.sheets_key_file)
         cfg.__post_init__()

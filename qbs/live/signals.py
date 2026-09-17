@@ -57,6 +57,7 @@ class TargetBook:
     universe_size: int = 0
     diagnostics: Dict[str, float] = field(default_factory=dict)
     selection: List[Dict] = field(default_factory=list)     # entry/exit/hold, with rank
+    ranking: List[Dict] = field(default_factory=list)       # the whole day's ranking
 
     @property
     def risk_weight(self) -> float:
@@ -241,6 +242,7 @@ def compute_targets(
     min_coverage: float = 0.85,
     now: Optional[pd.Timestamp] = None,
     exclude: Optional[List[str]] = None,
+    record_ranks: int = 25,
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -287,7 +289,8 @@ def compute_targets(
             f"history the ranker needs{' after exclusions' if dropped else ''}; "
             f"cannot fill {cfg.momentum.n_hold} slots")
 
-    mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum)
+    mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum,
+                                   record_ranks=record_ranks)
 
     combined = uni.copy()
     combined[safe] = prices[safe]
@@ -300,6 +303,10 @@ def compute_targets(
     vdiag = vt.diagnostics.loc[asof]
     held = list((mom.holdings_log or {}).get(asof, []))
     selection = _selection_rows(mom, asof, held)
+    ranking = [
+        dict(symbol=t, rank=r, score=sc, held=t in held)
+        for t, r, sc in (mom.rank_log or {}).get(asof, [])
+    ]
 
     universe = tradeable
 
@@ -325,6 +332,7 @@ def compute_targets(
         universe_size=uni.shape[1],
         diagnostics={k: v for k, v in diag.items()},
         selection=selection,
+        ranking=ranking,
     )
 
     total = sum(book.weights.values())

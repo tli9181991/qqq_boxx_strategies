@@ -414,6 +414,31 @@ An excluded name the strategy already holds is **sold** on the next run: it has
 no target, and excluded names deliberately stay tradeable so the position can
 be closed rather than stranded.
 
+### The CSV logs in `var/`
+
+Four files, so the run log can be read with `cat` and no tooling:
+
+| file | what | how it is written |
+|---|---|---|
+| `ranking_log.csv` | the top 25 of each day's ranking, with rank, score and whether it is held | appended, one block per date |
+| `trade_log.csv` | every trading event — the same rows `report` prints | rewritten from the database each run |
+| `strategy_book.csv` | today's book: strategy shares beside the account's and yours | rewritten each run |
+| `strategy_trades.csv` | the position ledger, when `position_source=ledger` | appended from IB's fills |
+
+`ranking_log.csv` is the only one that accumulates history, because it has to:
+what the strategy saw on a past date cannot be recovered from today's prices
+once the ranking has moved on. It is keyed on the date, so the twice-daily
+preflight and any re-run after a failure cannot duplicate a day. `QBS_RANKING_TOP`
+sets the depth (default 25 — the book holds 6 and exits past 10, so 25 shows
+the names queued behind them and a rotation becomes visible before it happens).
+
+The others are views of the database and rebuild themselves, which is what
+stops them drifting from what they claim to show.
+
+None of them can fail a phase. They are written after the orders are already
+sent and recorded, so a full disk or a read-only mount logs a warning and the
+session still succeeds.
+
 ### `var/strategy_book.csv`
 
 Every preflight and trade writes a snapshot of the strategy's own book beside

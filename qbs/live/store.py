@@ -23,9 +23,11 @@ changes what you can see, never what gets traded.
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -384,6 +386,37 @@ def to_frame(path: str, table: str):
         raise ValueError(f"unknown table {table!r}; expected one of {sorted(allowed)}")
     with connect(path) as conn:
         return pd.read_sql_query(f"SELECT * FROM {table}", conn)
+
+
+def export_trade_csv(db_path: str, out_path: str) -> int:
+    """Write every trading event to CSV, so the log can be read without a tool.
+
+    Rewritten whole from the database on each call rather than appended to.
+    The database is the record; this is a view of it, and a view that rebuilds
+    itself cannot drift from what it is meant to show -- which an appended file
+    would the first time a phase was re-run, or a row corrected.
+    """
+    rows = _rows(db_path, "SELECT * FROM trade_events ORDER BY id")
+    cols = (list(rows[0].keys()) if rows else
+            ["id", "ts_utc", "session_date", "phase", "event", "symbol", "action",
+             "quantity", "price", "notional", "order_id", "status", "reason",
+             "dry_run"])
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out_path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: ("" if r.get(c) is None else r.get(c)) for c in cols})
+        os.replace(tmp, out_path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    log.info("exported %d trade event(s) to %s", len(rows), out_path)
+    return len(rows)
 
 
 def summary(path: str) -> Dict[str, int]:

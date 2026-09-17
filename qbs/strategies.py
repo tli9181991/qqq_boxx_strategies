@@ -38,6 +38,7 @@ class StrategySignals:
     holdings_log: Optional[Dict] = None       # momentum: date -> list of tickers
     momentum: Optional[pd.DataFrame] = None   # momentum: the ranking scores
     held_ranks: Optional[Dict] = None         # momentum: date -> {ticker: rank}
+    rank_log: Optional[Dict] = None           # momentum: date -> [(ticker, rank, score)]
 
     def exposure(self, asset: str) -> pd.Series:
         if asset not in self.weights.columns:
@@ -330,6 +331,7 @@ def cross_sectional_momentum(
     safe_prices: pd.Series,
     params: Optional[MomentumParams] = None,
     eligible: Optional[pd.DataFrame] = None,
+    record_ranks: int = 0,
     name: str = "momentum",
 ) -> StrategySignals:
     """Rank the universe by 12-1 momentum, hold the top N, exit on a band.
@@ -343,6 +345,10 @@ def cross_sectional_momentum(
                       Pass `universe.membership_mask(...)` with point-in-time
                       data to remove survivorship bias; None means every column
                       is rankable on every date, which is the biased case.
+    record_ranks    : keep the top N of each day's ranking in `rank_log`, so
+                      the log can show what the strategy saw and not only what
+                      it did. Off by default: it is a per-date dict of the
+                      widest object here, and the backtest has no use for it.
 
     The momentum measure
     --------------------
@@ -405,6 +411,7 @@ def cross_sectional_momentum(
     events: List[Dict] = []
     holdings_log: Dict[pd.Timestamp, List[str]] = {}
     held_ranks: Dict[pd.Timestamp, Dict[str, float]] = {}
+    rank_log: Dict[pd.Timestamp, List[tuple]] = {}
     n_cash_slots: Dict[pd.Timestamp, int] = {}
 
     for dt in px.index:
@@ -455,6 +462,13 @@ def cross_sectional_momentum(
             # eligibility and absolute-momentum filters, and a copy of that
             # logic is precisely what drifts.
             held_ranks[dt] = {t: float(rank.get(t, np.nan)) for t in held}
+            if record_ranks:
+                # Captured inside the loop, after eligibility and the absolute
+                # filter, so the log is the ranking the strategy actually chose
+                # from. Rebuilding it afterwards would need a second copy of
+                # those filters, and a second copy is the thing that drifts.
+                rank_log[dt] = [(t, int(rank[t]), float(order[t]))
+                                for t in order.index[:record_ranks]]
 
         holdings_log[dt] = list(held)
         n_cash_slots[dt] = p.n_hold - len(held)
@@ -490,6 +504,7 @@ def cross_sectional_momentum(
     sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
     sig.holdings_log = holdings_log
     sig.held_ranks = held_ranks
+    sig.rank_log = rank_log or None
     sig.momentum = mom
     return sig
 
@@ -615,6 +630,7 @@ def vix_circuit_breaker(
     sig.holding = regime
     sig.holdings_log = base.holdings_log
     sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
     sig.momentum = base.momentum
     return sig
 
@@ -726,6 +742,7 @@ def book_vol_target(
     sig.holding = base.holding
     sig.holdings_log = base.holdings_log
     sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
     sig.momentum = base.momentum
     return sig
 
