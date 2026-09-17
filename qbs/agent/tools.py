@@ -71,7 +71,7 @@ def build_tools(
         """What each selection strategy holds on the latest cached bar.
 
         Use this first for any question about what to buy, hold or watch
-        today. Covers the Top-6 NDX 12-1 momentum book and the Top-6 Finviz
+        today. Covers the Top-6 NDX 6-1 momentum book and the Top-6 Finviz
         screen, and reports how many names the two agree on.
         """
         return ev.picks_report(book, n_hold=n_hold)

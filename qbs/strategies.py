@@ -334,7 +334,7 @@ def cross_sectional_momentum(
     record_ranks: int = 0,
     name: str = "momentum",
 ) -> StrategySignals:
-    """Rank the universe by 12-1 momentum, hold the top N, exit on a band.
+    """Rank the universe by 6-1 momentum, hold the top N, exit on a band.
 
     Parameters
     ----------
@@ -352,8 +352,9 @@ def cross_sectional_momentum(
 
     The momentum measure
     --------------------
-    Return from `lookback_months` ago to `skip_months` ago -- the standard
-    "12-1" construction. The most recent month is skipped because short-horizon
+    Return from `lookback_months` ago to `skip_months` ago. The literature's
+    standard is "12-1"; this book runs 6-1, which weights the recent half of
+    that window more heavily. The most recent month is skipped because short-horizon
     returns *reverse* rather than persist; including them mixes two effects
     with opposite signs and blunts both.
 
@@ -452,7 +453,12 @@ def cross_sectional_momentum(
                     keep.append(t)
                     events.append(dict(
                         date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
-                        reason=f"rank {rank[t]:.0f}, 12-1 mom {order[t]:+.1%}",
+                        # The label names the actual lookback, so changing the
+                        # parameter cannot leave the log claiming 12-1 while
+                        # the ranker scores something else.
+                        reason=(f"rank {rank[t]:.0f}, "
+                                f"{p.lookback_months:g}-{p.skip_months:g} mom "
+                                f"{order[t]:+.1%}"),
                         rank=float(rank[t]),
                         score=float(order[t]),
                     ))

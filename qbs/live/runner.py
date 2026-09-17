@@ -565,7 +565,7 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     sel = store.selection_history(live.db_path, limit=40)
     if sel:
         print("STOCK SELECTION")
-        print(f"  {'date':<12}{'symbol':<8}{'event':<7}{'rank':>6}{'12-1 mom':>11}"
+        print(f"  {'date':<12}{'symbol':<8}{'event':<7}{'rank':>6}{'momentum':>11}"
               f"  reason")
         for r in sel:
             rank = "" if r["rank"] is None else f"{r['rank']:.0f}"

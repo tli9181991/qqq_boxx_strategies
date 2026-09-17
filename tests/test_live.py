@@ -21,6 +21,8 @@ import tempfile
 
 import numpy as np
 import pandas as pd
+
+from dataclasses import replace
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1088,6 +1090,11 @@ def test_a_negative_baseline_is_rejected(tmp_path):
 def _excluded_book(exclude):
     cfg = Config()
     cfg.momentum.min_history = 200
+    # The absolute filter is off here on purpose. It is not what these tests
+    # are about, and with it on the candidate pool depends on how many
+    # synthetic names happen to beat BOXX over the configured lookback -- so
+    # the tests would break on a lookback change rather than on a real one.
+    cfg.momentum = replace(cfg.momentum, absolute_filter=False)
     px = synthetic_prices()
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
@@ -1524,6 +1531,7 @@ def test_the_band_is_settable_from_the_environment(monkeypatch):
 def test_the_book_carries_the_days_ranking():
     cfg = Config()
     cfg.momentum.min_history = 200
+    cfg.momentum = replace(cfg.momentum, absolute_filter=False)
     px = synthetic_prices()
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()

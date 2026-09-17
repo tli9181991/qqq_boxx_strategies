@@ -106,8 +106,8 @@ class MomentumParams:
     top `n_hold`, but do not sell until the name has fallen past `exit_rank`.
     Setting exit_rank == n_hold disables the band and gives the naive version.
     """
-    lookback_months: int = 12
-    skip_months: int = 1          # 12-1 momentum: skip the most recent month
+    lookback_months: int = 6
+    skip_months: int = 1          # 6-1 momentum: skip the most recent month
     n_hold: int = 6
     exit_rank: int = 10           # hysteresis band; == n_hold means no band
     rebalance: str = "daily"      # "daily" | "ME" (month end) | "W-FRI"

@@ -6,7 +6,7 @@ that shows you where every signal fired.
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
 - **GEM (Global Equities Momentum)** — Antonacci dual momentum across QQQ / VEU / BOXX
 - **Volatility-targeting overlay** — scales QQQ exposure so forecast vol sits near target
-- **Top-6 Nasdaq-100 momentum** — cross-sectional 12-1 momentum with a hysteresis band
+- **Top-6 Nasdaq-100 momentum** — cross-sectional 6-1 momentum with a hysteresis band
 - **Top-6 + VIX circuit breaker** — the same book, switched off entirely when VIX spikes
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
 - **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
@@ -181,7 +181,7 @@ Cross-sectional momentum: rank the whole index, hold the strongest names.
 
 | | Rule |
 |---|---|
-| Score | **12-1 momentum** — return from 12 months ago to 1 month ago |
+| Score | **6-1 momentum** — return from 6 months ago to 1 month ago |
 | Hold | the top `n_hold` (6), equal weight per *slot* |
 | Exit | only once a name falls past `exit_rank` (10) — the hysteresis band |
 | Filter | a name must also beat BOXX's own 12-1 return, else that slot goes to cash |

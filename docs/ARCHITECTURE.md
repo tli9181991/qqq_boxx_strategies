@@ -259,7 +259,7 @@ Passing `base_weights` turns it into an overlay on another strategy.
 
 ### 4. `cross_sectional_momentum` — the stock selection
 
-Rank the universe by 12-1 momentum, hold the top `n_hold`, exit only once a name
+Rank the universe by 6-1 momentum, hold the top `n_hold`, exit only once a name
 falls past `exit_rank`. Three decisions worth understanding:
 
 **The band.** Without it a name slipping from rank 6 to 7 is sold and bought back
@@ -747,7 +747,7 @@ The run log: a SQLite database of what the strategy decided, traded and held.
 | Table | Shape | One row per |
 |---|---|---|
 | `trade_events` | **append-only** | thing that happened — submissions, fills, cancellations, guard trips, skips |
-| `selection_events` | upsert | (date, symbol, event): `entry` / `exit` / `hold` with rank and 12-1 momentum |
+| `selection_events` | upsert | (date, symbol, event): `entry` / `exit` / `hold` with rank and 6-1 momentum |
 | `position_closes` | upsert | (date, symbol): shares, close price, market value, unrealised P&L, target vs actual weight |
 | `portfolio_nav` | upsert | date: book value, NetLiquidation, cash, risk weight, the vol scalar |
 | `signal_runs` | upsert | (date, phase): what the signal said, kept for preflight *and* trade |
