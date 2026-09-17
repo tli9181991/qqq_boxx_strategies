@@ -71,6 +71,7 @@ free of magic constants. One frozen dataclass per strategy:
 | `GEMParams` | dual-momentum lookback, the risk sleeves, rebalance frequency |
 | `VolTargetParams` | single-asset vol targeting |
 | `MomentumParams` | 12-1 lookback, `n_hold`, the hysteresis band, weighting |
+| `DrawdownStopParams` | the drawdown circuit breaker: threshold, benchmark leg, cooldown |
 | `VixBreakerParams` | the circuit breaker's state machine thresholds |
 | `BookVolTargetParams` | book-level vol targeting (the drawdown control) |
 | `Config` | holds one of each, plus window and cost assumptions |

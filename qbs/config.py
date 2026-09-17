@@ -228,6 +228,56 @@ class VixBreakerParams:
 
 
 @dataclass
+class DrawdownStopParams:
+    """A circuit breaker on the book's own drawdown.
+
+    The overlay of last resort: when the book is far enough below its own high,
+    hold nothing but the safe asset for a few sessions, then resume. It sits on
+    top of a finished strategy and changes only the exposure, never the picks.
+
+    Why the *book's* drawdown and not the market's or a position's. A market
+    trigger misses the failure this book is most prone to -- in June 2026 QQQ
+    fell 11% while the book fell 16%, because six correlated semiconductors
+    moved together in an index that did not. A position trigger fires on
+    ordinary noise: a 13% fall in a stock running at 50% vol is a routine week,
+    and stopping it swaps one volatile name for another mid-decline. Measured
+    over 2020-2026 both made drawdown *worse*; only the book-level measure
+    improved it, from -33.9% to -17.6% with Calmar 0.81 -> 1.31.
+
+    Why a fixed cooldown rather than a recovery signal. Every "confirm the
+    recovery" rule tested was worse, and the conditions that flicker were much
+    worse: re-entering when VIX returned to its average produced 87 episodes
+    against this rule's 5, and turned Calmar 1.31 into 0.34. The red flag is
+    already a lagging condition, so a lagging green flag stacks delay on delay
+    and sells the decline while missing the rebound.
+
+    `qqq_drawdown` is a second, redundant trigger. Over 2020-2026 the OR fires
+    on exactly the same five episodes as the book leg alone and for the same
+    27% of sessions, because by the time QQQ is 15% below its high this book is
+    already past 13% (Calmar 1.30 against 1.31 -- inside the noise). It is kept
+    because a market-wide guard is worth having on the day the two stop
+    agreeing, and because it costs nothing when it never binds. Set it to 0.0
+    to drop it and with it the live dependency on a benchmark series.
+
+    Off by default. One thing this cannot do is help on a 6-year sample with
+    five episodes -- that is what the evidence rests on, and it is thin.
+    """
+    enabled: bool = False
+    exit_drawdown: float = 0.13   # book this far below its own high -> cash
+    qqq_drawdown: float = 0.15    # same, on the benchmark. 0.0 = off
+    cooldown_days: int = 5        # sessions to stay out after the flag clears
+    safe_asset: str = SAFE_ASSET
+
+    def __post_init__(self):
+        if not 0.0 < self.exit_drawdown < 1.0:
+            raise ValueError("exit_drawdown must be in (0, 1)")
+        if not 0.0 <= self.qqq_drawdown < 1.0:
+            raise ValueError("qqq_drawdown must be in [0, 1); 0 disables it")
+        if self.cooldown_days < 0:
+            raise ValueError("cooldown_days must not be negative")
+
+
+@dataclass
 class BookVolTargetParams:
     """Volatility targeting applied to a WHOLE book, on its own realised vol.
 
@@ -373,6 +423,8 @@ class Config:
     weekly_book: WeeklyBookParams = field(default_factory=WeeklyBookParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
+    dd_stop: DrawdownStopParams = field(default_factory=DrawdownStopParams)
+    dd_stop_benchmark: str = RISK_ASSET   # the series dd_stop.qqq_drawdown reads
 
     def to_dict(self) -> Dict:
         return asdict(self)

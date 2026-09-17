@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    BookVolTargetParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
+    BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
     SAFE_ASSET, TRADING_DAYS, VixBreakerParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
@@ -762,3 +762,80 @@ def buy_and_hold(prices: pd.DataFrame, asset: str) -> StrategySignals:
     weights[asset] = 1.0
     return StrategySignals(f"bh_{asset.lower()}", weights,
                            pd.DataFrame({"close": prices[asset]}), _empty_events())
+
+
+# ==========================================================================
+# 6. Drawdown circuit breaker
+# ==========================================================================
+
+def drawdown_stop(
+    base: StrategySignals,
+    prices: pd.DataFrame,
+    params: Optional[DrawdownStopParams] = None,
+    lag: int = EXECUTION_LAG,
+    benchmark: Optional[pd.Series] = None,
+    name: str = "dd_stop",
+) -> StrategySignals:
+    """Hold nothing but the safe asset while the book is far below its high.
+
+    Laid over a finished strategy: it scales exposure to zero and back, and
+    never touches which names were picked. `base` is normally the vol-targeted
+    book, so the two risk controls compose -- the overlay scales continuously
+    with realised vol, this one switches off entirely in a drawdown.
+
+    The drawdown is measured on the *undisturbed* book -- what `base` would
+    have earned had it never been stopped. That keeps the trigger a pure
+    function of prices: were it measured on the stopped equity curve, the gate
+    would feed its own input, the book would hold its drawdown frozen while
+    parked in cash, and the flag could never clear.
+
+    `lag` must match the engine's, because the book return being measured is
+    `weights.shift(lag) * returns` -- the same quantity the engine computes.
+    Getting it wrong would measure a drawdown the book never had.
+    """
+    p = params or DrawdownStopParams()
+    w = base.weights.copy()
+    safe = p.safe_asset
+    if safe not in w.columns:
+        raise ValueError(f"the safe asset {safe!r} is not in the weights")
+    risk_cols = [c for c in w.columns if c != safe]
+
+    rets = prices.reindex(columns=w.columns).ffill().pct_change().fillna(0.0)
+    book_ret = (w.shift(lag) * rets).sum(axis=1)
+    equity = (1.0 + book_ret).cumprod()
+    dd = (equity / equity.cummax() - 1.0).fillna(0.0)
+
+    flag = dd < -p.exit_drawdown
+    if p.qqq_drawdown and benchmark is not None:
+        b = benchmark.reindex(w.index).ffill()
+        flag = flag | ((b / b.cummax() - 1.0).fillna(0.0) < -p.qqq_drawdown)
+
+    # Stay out for `cooldown_days` sessions after the flag last held. A rolling
+    # max is the whole state machine: no recovery signal, deliberately.
+    span = max(int(p.cooldown_days), 1)
+    blocked = flag.rolling(span, min_periods=1).max().astype(bool)
+
+    if p.enabled:
+        w.loc[blocked, risk_cols] = 0.0
+        w.loc[blocked, safe] = 1.0
+
+    # Added to the base's diagnostics, not substituted for them: this is an
+    # overlay, and the scalar underneath it is still what sized the book.
+    diagnostics = pd.DataFrame({
+        "book_equity": equity,
+        "book_drawdown": dd,
+        "dd_flag": flag.astype(float),
+        "blocked": blocked.astype(float),
+    })
+    if base.diagnostics is not None and not base.diagnostics.empty:
+        keep = [c for c in base.diagnostics.columns if c not in diagnostics.columns]
+        diagnostics = base.diagnostics[keep].join(diagnostics, how="outer")
+
+    sig = StrategySignals(name, w, diagnostics, base.events,
+                          params={**(base.params or {}), **p.__dict__})
+    sig.holding = base.holding
+    sig.holdings_log = base.holdings_log
+    sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
+    sig.momentum = base.momentum
+    return sig

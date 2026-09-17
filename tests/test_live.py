@@ -1623,3 +1623,80 @@ def test_a_csv_log_failure_never_fails_the_phase(tmp_path, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
 
     runner._write_csv_logs(live)          # must not raise
+
+
+def test_the_live_book_reports_the_breaker_state():
+    """The live path must surface the stop, enabled or not."""
+    from dataclasses import replace as _replace
+    from qbs.config import DrawdownStopParams
+
+    cfg = Config()
+    cfg.momentum = _replace(cfg.momentum, min_history=200, absolute_filter=False)
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+
+    off = compute_targets(cfg, frame, requested=list(uni.columns),
+                          max_staleness_days=10_000, min_coverage=0.5,
+                          now=frame.index[-1])
+    assert off.halted is False
+    assert off.book_drawdown <= 0.0         # a drawdown is never positive
+
+    # qqq_drawdown off: this test is about the book leg, and the fixture
+    # has no benchmark series.
+    cfg.dd_stop = DrawdownStopParams(enabled=True, exit_drawdown=0.001,
+                                     qqq_drawdown=0.0)
+    on = compute_targets(cfg, frame, requested=list(uni.columns),
+                         max_staleness_days=10_000, min_coverage=0.5,
+                         now=frame.index[-1])
+    assert on.halted is True
+    assert on.weights.get(cfg.momentum.safe_asset, 0.0) == pytest.approx(1.0)
+    assert not [t for t, w in on.weights.items()
+                if t != cfg.momentum.safe_asset and w > 1e-9]
+
+
+def test_the_benchmark_leg_fails_loudly_when_its_series_is_absent():
+    """Silently skipping it would leave the log claiming a guard that is off."""
+    from dataclasses import replace as _replace
+    from qbs.config import DrawdownStopParams
+    from qbs.live.signals import SignalError
+
+    cfg = Config()
+    cfg.momentum = _replace(cfg.momentum, min_history=200, absolute_filter=False)
+    cfg.dd_stop = DrawdownStopParams(enabled=True, qqq_drawdown=0.15)
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+
+    with pytest.raises(SignalError, match="extra_tickers"):
+        compute_targets(cfg, frame, requested=list(uni.columns),
+                        max_staleness_days=10_000, min_coverage=0.5,
+                        now=frame.index[-1])
+
+
+def test_a_disabled_stop_does_not_demand_a_benchmark():
+    """qqq_drawdown is configured on by default, the stop is not.
+
+    The benchmark is only downloaded and required when the stop is actually
+    acting -- otherwise every live run would fail on a series the strategy has
+    no other use for.
+    """
+    from dataclasses import replace as _replace
+
+    cfg = Config()
+    assert cfg.dd_stop.qqq_drawdown == pytest.approx(0.15)
+    assert cfg.dd_stop.enabled is False
+
+    cfg.momentum = _replace(cfg.momentum, min_history=200, absolute_filter=False)
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    assert cfg.dd_stop_benchmark not in frame.columns
+
+    book = compute_targets(cfg, frame, requested=list(uni.columns),
+                           max_staleness_days=10_000, min_coverage=0.5,
+                           now=frame.index[-1])
+    assert book.halted is False
