@@ -16,7 +16,7 @@ from .engine import BacktestResult, run_backtest
 from .metrics import format_summary, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
-    StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
+    StrategySignals, book_vol_target, buy_and_hold, connors_rsi2, drawdown_stop,
     cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
 )
 from .universe import (
@@ -171,9 +171,17 @@ def run(
         # breaker this reacts to the book's own risk, which is why it also
         # cuts the drawdowns that happen while the index stays calm.
         if with_book_vt:
-            signals["momentum_vt"] = book_vol_target(
+            vt_sig = book_vol_target(
                 mom_sig, combined, cfg.book_vol, lag=cfg.execution_lag,
                 name="momentum_vt")
+            # The circuit breaker is applied here too, not only in the live
+            # path, or the backtest would stop describing the book that trades.
+            # It is inert unless `cfg.dd_stop.enabled`.
+            bench = (prices[cfg.dd_stop_benchmark]
+                     if cfg.dd_stop_benchmark in prices.columns else None)
+            signals["momentum_vt"] = drawdown_stop(
+                vt_sig, combined, cfg.dd_stop, lag=cfg.execution_lag,
+                benchmark=bench, name="momentum_vt")
 
         # ---- the Finviz screen, ranking the SAME universe ----------------
         # Same names, same slots, same engine, same costs, so the only thing

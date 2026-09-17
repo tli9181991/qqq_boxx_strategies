@@ -12,12 +12,15 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dataclasses import replace
+
 from qbs.config import (
-    BookVolTargetParams, Config, FinvizScreenParams, GEMParams, MomentumParams,
-    RSI2Params, VixBreakerParams, VolTargetParams,
+    BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams, GEMParams,
+    MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -25,8 +28,9 @@ from qbs.indicators import drawdown, sma, wilder_rsi
 from qbs.metrics import summarise
 from qbs.pipeline import build_signals, run, sweep_band, sweep_target_vol, sweep_vix
 from qbs.strategies import (
-    book_vol_target, buy_and_hold, connors_rsi2, cross_sectional_momentum, gem,
-    vix_circuit_breaker, vol_target_overlay,
+    StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
+    cross_sectional_momentum, drawdown_stop, gem, vix_circuit_breaker,
+    vol_target_overlay,
 )
 from qbs.universe import membership_mask, synthetic_universe
 
@@ -2136,3 +2140,131 @@ def test_momentum_profile_trend_rows_are_present():
                 "Distance from 50-day EMA", "Annualised volatility"):
         assert row in tr.index
     assert tr.loc["Off 52-week high", "Value"] >= -1e-9, "a high is never below price"
+
+
+# --------------------------------------------------------------------------
+# The drawdown circuit breaker
+# --------------------------------------------------------------------------
+
+def _dd_fixture():
+    from qbs.strategies import cross_sectional_momentum, book_vol_target
+    cfg = Config()
+    cfg.momentum = replace(cfg.momentum, min_history=200)
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    mom = cross_sectional_momentum(uni, px[cfg.momentum.safe_asset], cfg.momentum)
+    vt = book_vol_target(mom, frame, cfg.book_vol, lag=cfg.execution_lag)
+    return cfg, frame, vt, px
+
+
+def test_the_stop_is_inert_when_disabled():
+    """Disabled, the overlay must not change a single weight."""
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False),
+                        lag=cfg.execution_lag)
+
+    pd.testing.assert_frame_equal(out.weights, vt.weights)
+
+
+def test_a_deep_drawdown_moves_the_whole_book_to_the_safe_asset():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+    safe = cfg.momentum.safe_asset
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+    blocked = out.diagnostics["blocked"].astype(bool)
+    assert blocked.any(), "a 2% threshold should fire on this fixture"
+
+    risk = [c for c in out.weights.columns if c != safe]
+    assert (out.weights.loc[blocked, risk].abs().to_numpy() == 0).all()
+    assert np.allclose(out.weights.loc[blocked, safe], 1.0)
+    # And the untouched days are exactly the base book.
+    pd.testing.assert_frame_equal(out.weights.loc[~blocked], vt.weights.loc[~blocked])
+
+
+def test_the_stop_never_changes_which_names_were_picked():
+    """It is an exposure overlay. Selection is not its business."""
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+
+    assert out.holdings_log == vt.holdings_log
+    assert out.held_ranks == vt.held_ranks
+
+
+def test_the_cooldown_holds_the_book_out_after_the_flag_clears():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    short = drawdown_stop(vt, frame, DrawdownStopParams(
+        enabled=True, exit_drawdown=0.02, cooldown_days=1), lag=cfg.execution_lag)
+    long_ = drawdown_stop(vt, frame, DrawdownStopParams(
+        enabled=True, exit_drawdown=0.02, cooldown_days=20), lag=cfg.execution_lag)
+
+    assert long_.diagnostics["blocked"].sum() > short.diagnostics["blocked"].sum()
+    # The flag itself is a property of the book, not of the cooldown.
+    pd.testing.assert_series_equal(short.diagnostics["dd_flag"],
+                                   long_.diagnostics["dd_flag"])
+
+
+def test_the_drawdown_is_measured_on_the_undisturbed_book():
+    """Gate on the stopped equity curve and the flag could never clear.
+
+    Parked in cash the book stops moving, so its drawdown would freeze at the
+    level that triggered the stop and the breaker would latch on for ever.
+    """
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.05),
+                        lag=cfg.execution_lag)
+    off = drawdown_stop(vt, frame, DrawdownStopParams(exit_drawdown=0.05),
+                        lag=cfg.execution_lag)
+
+    # Same diagnostics whether or not the stop acted -- that is what makes the
+    # trigger a pure function of prices rather than of its own output.
+    pd.testing.assert_series_equal(out.diagnostics["book_drawdown"],
+                                   off.diagnostics["book_drawdown"])
+
+    # And it releases: measured on the stopped curve the book would freeze at
+    # the triggering drawdown and the flag could never clear again, so the
+    # breaker must be observed switching back off at least once.
+    blocked = out.diagnostics["blocked"].astype(bool)
+    assert blocked.any(), "the fixture never triggered; the test proves nothing"
+    released = (blocked.astype(int).diff() == -1).sum()
+    assert released > 0, "the breaker latched on and never released"
+
+
+def test_the_benchmark_leg_only_acts_when_configured():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, px = _dd_fixture()
+    bench = px[cfg.momentum.safe_asset] * 0 + np.linspace(100, 40, len(px))  # -60%
+
+    # Explicitly off -- the configured default is 0.15, so "without" has to say so.
+    without = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.0),
+                            lag=cfg.execution_lag, benchmark=bench)
+    with_ = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.10),
+                          lag=cfg.execution_lag, benchmark=bench)
+
+    assert with_.diagnostics["blocked"].sum() > without.diagnostics["blocked"].sum()
+    # No benchmark passed -> the leg is silently skipped, not an error.
+    none = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.10),
+                         lag=cfg.execution_lag, benchmark=None)   # leg skipped
+    pd.testing.assert_frame_equal(none.weights, without.weights)
+
+
+def test_a_missing_safe_asset_is_rejected():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+    trimmed = vt.weights.drop(columns=[cfg.momentum.safe_asset])
+    bad = StrategySignals("x", trimmed)
+
+    with pytest.raises(ValueError, match="safe asset"):
+        drawdown_stop(bad, frame, DrawdownStopParams(enabled=True))

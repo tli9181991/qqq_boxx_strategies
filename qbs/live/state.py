@@ -218,3 +218,45 @@ def write_book_csv(path: str,
             os.unlink(tmp)
         raise
     log.info("wrote the strategy book to %s (%d rows)", path, len(rows))
+
+
+# --------------------------------------------------------------------------
+# Daily CSV logs, so the run log can be read without running `report`
+# --------------------------------------------------------------------------
+
+RANKING_CSV_COLUMNS = ["asof", "rank", "symbol", "score", "held"]
+
+
+def append_ranking_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> int:
+    """Append one day's ranking. Returns rows written; 0 if the date is present.
+
+    Appended rather than rewritten, because unlike the book snapshot this is a
+    history: what the strategy saw on each past date cannot be recovered from
+    today's prices once the ranking has moved on. Keyed on the date so the
+    phases that run twice a day, and a re-run after a failure, cannot duplicate
+    it -- the ranking for a given close is the same however often it is asked.
+    """
+    if not rows:
+        return 0
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            if any(r.get("asof") == asof for r in csv.DictReader(f)):
+                log.info("ranking for %s already logged in %s", asof, path)
+                return 0
+
+    fresh = not os.path.exists(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RANKING_CSV_COLUMNS)
+        if fresh:
+            w.writeheader()
+        for r in rows:
+            w.writerow({
+                "asof": asof,
+                "rank": r.get("rank", ""),
+                "symbol": r.get("symbol", ""),
+                "score": f"{float(r['score']):.6f}" if r.get("score") is not None else "",
+                "held": "yes" if r.get("held") else "",
+            })
+    log.info("logged %d ranking row(s) for %s to %s", len(rows), asof, path)
+    return len(rows)

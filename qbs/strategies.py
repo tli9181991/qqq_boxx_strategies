@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    BookVolTargetParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
+    BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
     SAFE_ASSET, TRADING_DAYS, VixBreakerParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
@@ -38,6 +38,7 @@ class StrategySignals:
     holdings_log: Optional[Dict] = None       # momentum: date -> list of tickers
     momentum: Optional[pd.DataFrame] = None   # momentum: the ranking scores
     held_ranks: Optional[Dict] = None         # momentum: date -> {ticker: rank}
+    rank_log: Optional[Dict] = None           # momentum: date -> [(ticker, rank, score)]
 
     def exposure(self, asset: str) -> pd.Series:
         if asset not in self.weights.columns:
@@ -330,9 +331,10 @@ def cross_sectional_momentum(
     safe_prices: pd.Series,
     params: Optional[MomentumParams] = None,
     eligible: Optional[pd.DataFrame] = None,
+    record_ranks: int = 0,
     name: str = "momentum",
 ) -> StrategySignals:
-    """Rank the universe by 12-1 momentum, hold the top N, exit on a band.
+    """Rank the universe by 6-1 momentum, hold the top N, exit on a band.
 
     Parameters
     ----------
@@ -343,11 +345,16 @@ def cross_sectional_momentum(
                       Pass `universe.membership_mask(...)` with point-in-time
                       data to remove survivorship bias; None means every column
                       is rankable on every date, which is the biased case.
+    record_ranks    : keep the top N of each day's ranking in `rank_log`, so
+                      the log can show what the strategy saw and not only what
+                      it did. Off by default: it is a per-date dict of the
+                      widest object here, and the backtest has no use for it.
 
     The momentum measure
     --------------------
-    Return from `lookback_months` ago to `skip_months` ago -- the standard
-    "12-1" construction. The most recent month is skipped because short-horizon
+    Return from `lookback_months` ago to `skip_months` ago. The literature's
+    standard is "12-1"; this book runs 6-1, which weights the recent half of
+    that window more heavily. The most recent month is skipped because short-horizon
     returns *reverse* rather than persist; including them mixes two effects
     with opposite signs and blunts both.
 
@@ -405,6 +412,7 @@ def cross_sectional_momentum(
     events: List[Dict] = []
     holdings_log: Dict[pd.Timestamp, List[str]] = {}
     held_ranks: Dict[pd.Timestamp, Dict[str, float]] = {}
+    rank_log: Dict[pd.Timestamp, List[tuple]] = {}
     n_cash_slots: Dict[pd.Timestamp, int] = {}
 
     for dt in px.index:
@@ -445,7 +453,12 @@ def cross_sectional_momentum(
                     keep.append(t)
                     events.append(dict(
                         date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
-                        reason=f"rank {rank[t]:.0f}, 12-1 mom {order[t]:+.1%}",
+                        # The label names the actual lookback, so changing the
+                        # parameter cannot leave the log claiming 12-1 while
+                        # the ranker scores something else.
+                        reason=(f"rank {rank[t]:.0f}, "
+                                f"{p.lookback_months:g}-{p.skip_months:g} mom "
+                                f"{order[t]:+.1%}"),
                         rank=float(rank[t]),
                         score=float(order[t]),
                     ))
@@ -455,6 +468,13 @@ def cross_sectional_momentum(
             # eligibility and absolute-momentum filters, and a copy of that
             # logic is precisely what drifts.
             held_ranks[dt] = {t: float(rank.get(t, np.nan)) for t in held}
+            if record_ranks:
+                # Captured inside the loop, after eligibility and the absolute
+                # filter, so the log is the ranking the strategy actually chose
+                # from. Rebuilding it afterwards would need a second copy of
+                # those filters, and a second copy is the thing that drifts.
+                rank_log[dt] = [(t, int(rank[t]), float(order[t]))
+                                for t in order.index[:record_ranks]]
 
         holdings_log[dt] = list(held)
         n_cash_slots[dt] = p.n_hold - len(held)
@@ -490,6 +510,7 @@ def cross_sectional_momentum(
     sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
     sig.holdings_log = holdings_log
     sig.held_ranks = held_ranks
+    sig.rank_log = rank_log or None
     sig.momentum = mom
     return sig
 
@@ -615,6 +636,7 @@ def vix_circuit_breaker(
     sig.holding = regime
     sig.holdings_log = base.holdings_log
     sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
     sig.momentum = base.momentum
     return sig
 
@@ -726,6 +748,7 @@ def book_vol_target(
     sig.holding = base.holding
     sig.holdings_log = base.holdings_log
     sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
     sig.momentum = base.momentum
     return sig
 
@@ -739,3 +762,80 @@ def buy_and_hold(prices: pd.DataFrame, asset: str) -> StrategySignals:
     weights[asset] = 1.0
     return StrategySignals(f"bh_{asset.lower()}", weights,
                            pd.DataFrame({"close": prices[asset]}), _empty_events())
+
+
+# ==========================================================================
+# 6. Drawdown circuit breaker
+# ==========================================================================
+
+def drawdown_stop(
+    base: StrategySignals,
+    prices: pd.DataFrame,
+    params: Optional[DrawdownStopParams] = None,
+    lag: int = EXECUTION_LAG,
+    benchmark: Optional[pd.Series] = None,
+    name: str = "dd_stop",
+) -> StrategySignals:
+    """Hold nothing but the safe asset while the book is far below its high.
+
+    Laid over a finished strategy: it scales exposure to zero and back, and
+    never touches which names were picked. `base` is normally the vol-targeted
+    book, so the two risk controls compose -- the overlay scales continuously
+    with realised vol, this one switches off entirely in a drawdown.
+
+    The drawdown is measured on the *undisturbed* book -- what `base` would
+    have earned had it never been stopped. That keeps the trigger a pure
+    function of prices: were it measured on the stopped equity curve, the gate
+    would feed its own input, the book would hold its drawdown frozen while
+    parked in cash, and the flag could never clear.
+
+    `lag` must match the engine's, because the book return being measured is
+    `weights.shift(lag) * returns` -- the same quantity the engine computes.
+    Getting it wrong would measure a drawdown the book never had.
+    """
+    p = params or DrawdownStopParams()
+    w = base.weights.copy()
+    safe = p.safe_asset
+    if safe not in w.columns:
+        raise ValueError(f"the safe asset {safe!r} is not in the weights")
+    risk_cols = [c for c in w.columns if c != safe]
+
+    rets = prices.reindex(columns=w.columns).ffill().pct_change().fillna(0.0)
+    book_ret = (w.shift(lag) * rets).sum(axis=1)
+    equity = (1.0 + book_ret).cumprod()
+    dd = (equity / equity.cummax() - 1.0).fillna(0.0)
+
+    flag = dd < -p.exit_drawdown
+    if p.qqq_drawdown and benchmark is not None:
+        b = benchmark.reindex(w.index).ffill()
+        flag = flag | ((b / b.cummax() - 1.0).fillna(0.0) < -p.qqq_drawdown)
+
+    # Stay out for `cooldown_days` sessions after the flag last held. A rolling
+    # max is the whole state machine: no recovery signal, deliberately.
+    span = max(int(p.cooldown_days), 1)
+    blocked = flag.rolling(span, min_periods=1).max().astype(bool)
+
+    if p.enabled:
+        w.loc[blocked, risk_cols] = 0.0
+        w.loc[blocked, safe] = 1.0
+
+    # Added to the base's diagnostics, not substituted for them: this is an
+    # overlay, and the scalar underneath it is still what sized the book.
+    diagnostics = pd.DataFrame({
+        "book_equity": equity,
+        "book_drawdown": dd,
+        "dd_flag": flag.astype(float),
+        "blocked": blocked.astype(float),
+    })
+    if base.diagnostics is not None and not base.diagnostics.empty:
+        keep = [c for c in base.diagnostics.columns if c not in diagnostics.columns]
+        diagnostics = base.diagnostics[keep].join(diagnostics, how="outer")
+
+    sig = StrategySignals(name, w, diagnostics, base.events,
+                          params={**(base.params or {}), **p.__dict__})
+    sig.holding = base.holding
+    sig.holdings_log = base.holdings_log
+    sig.held_ranks = base.held_ranks
+    sig.rank_log = base.rank_log
+    sig.momentum = base.momentum
+    return sig

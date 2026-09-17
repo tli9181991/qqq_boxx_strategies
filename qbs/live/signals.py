@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import Config, SAFE_ASSET
-from ..strategies import book_vol_target, cross_sectional_momentum
+from ..strategies import book_vol_target, cross_sectional_momentum, drawdown_stop
 from ..data import load_prices
 from ..universe import load_universe, load_universe_prices
 
@@ -46,6 +46,8 @@ class TargetBook:
     prices: Dict[str, float]           # ticker -> the price the weight was computed on
     scalar: float                      # the vol-target scalar actually applied
     book_vol: float                    # the book's own realised vol estimate
+    halted: bool = False               # the drawdown breaker is holding the book flat
+    book_drawdown: float = 0.0         # the book's own drawdown, acted on or not
     raw_holdings: List[str] = field(default_factory=list)   # the 6 names before scaling
     # Every name the strategy is entitled to trade: the rankable universe plus
     # the safe asset. `weights` carries only today's non-zero targets, so it
@@ -57,6 +59,7 @@ class TargetBook:
     universe_size: int = 0
     diagnostics: Dict[str, float] = field(default_factory=dict)
     selection: List[Dict] = field(default_factory=list)     # entry/exit/hold, with rank
+    ranking: List[Dict] = field(default_factory=list)       # the whole day's ranking
 
     @property
     def risk_weight(self) -> float:
@@ -101,10 +104,24 @@ def load_live_prices(
     uni = load_universe_prices(wanted, start=cfg.download_start, end=None,
                                refresh=refresh, verbose=False)
 
-    core = load_prices([safe], start=cfg.download_start, end=None,
+    # The benchmark is not an index constituent, so it comes down the
+    # per-ticker path beside the safe asset. Routed through the universe cache
+    # it would be dropped without a word, exactly as BOXX once was.
+    per_ticker = [safe]
+    bench = cfg.dd_stop_benchmark
+    if cfg.dd_stop.enabled and cfg.dd_stop.qqq_drawdown and bench not in per_ticker:
+        per_ticker.append(bench)
+
+    core = load_prices(per_ticker, start=cfg.download_start, end=None,
                        refresh=refresh, offline=offline)
     if safe not in core.columns or core[safe].dropna().empty:
         raise SignalError(f"could not load any prices for the safe asset {safe}")
+    if len(per_ticker) > 1 and (bench not in core.columns
+                                or core[bench].dropna().empty):
+        raise SignalError(
+            f"the drawdown stop needs {bench} but no prices came back for it. "
+            "Set dd_stop.qqq_drawdown to 0 to drop the benchmark leg -- it is "
+            "redundant against the book's own drawdown.")
 
     px = uni.copy()
     px.index = pd.to_datetime(px.index)
@@ -112,7 +129,8 @@ def load_live_prices(
     # Union the calendars, then forward-fill: a name that did not print on a
     # day the rest of the market did must not truncate the whole frame.
     px = px.reindex(px.index.union(core.index)).ffill()
-    px[safe] = core[safe].reindex(px.index).ffill()
+    for t in per_ticker:
+        px[t] = core[t].reindex(px.index).ffill()
     return px.sort_index()
 
 
@@ -241,6 +259,7 @@ def compute_targets(
     min_coverage: float = 0.85,
     now: Optional[pd.Timestamp] = None,
     exclude: Optional[List[str]] = None,
+    record_ranks: int = 25,
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -287,19 +306,41 @@ def compute_targets(
             f"history the ranker needs{' after exclusions' if dropped else ''}; "
             f"cannot fill {cfg.momentum.n_hold} slots")
 
-    mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum)
+    mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum,
+                                   record_ranks=record_ranks)
 
     combined = uni.copy()
     combined[safe] = prices[safe]
     vt = book_vol_target(mom, combined, cfg.book_vol, lag=cfg.execution_lag)
+
+    # The drawdown breaker, off unless configured on. It reads the book's own
+    # equity over the whole history, which this path already recomputes every
+    # run -- so it needs no stored state and a missed session cannot desync it.
+    wants_bench = cfg.dd_stop.enabled and bool(cfg.dd_stop.qqq_drawdown)
+    bench = (prices[cfg.dd_stop_benchmark]
+             if wants_bench and cfg.dd_stop_benchmark in prices.columns else None)
+    if wants_bench and bench is None:
+        raise SignalError(
+            f"dd_stop.qqq_drawdown is set but {cfg.dd_stop_benchmark!r} is not in the "
+            "price frame. Add it to extra_tickers, or set qqq_drawdown to 0 -- it was "
+            "measured redundant against the book's own drawdown.")
+    vt = drawdown_stop(vt, combined, cfg.dd_stop, lag=cfg.execution_lag,
+                       benchmark=bench)
 
     asof = vt.weights.index[-1]
     row = vt.weights.loc[asof]
     weights = {t: float(w) for t, w in row.items() if abs(float(w)) > 1e-9}
 
     vdiag = vt.diagnostics.loc[asof]
+    halted = bool(vt.diagnostics.get("blocked", pd.Series(dtype=float)).get(asof, 0.0))
+    book_dd = float(vt.diagnostics.get("book_drawdown", pd.Series(dtype=float))
+                    .get(asof, 0.0))
     held = list((mom.holdings_log or {}).get(asof, []))
     selection = _selection_rows(mom, asof, held)
+    ranking = [
+        dict(symbol=t, rank=r, score=sc, held=t in held)
+        for t, r, sc in (mom.rank_log or {}).get(asof, [])
+    ]
 
     universe = tradeable
 
@@ -318,6 +359,8 @@ def compute_targets(
         weights=weights,
         prices=px_map,
         scalar=float(vdiag["scalar"]),
+        halted=halted,
+        book_drawdown=book_dd,
         book_vol=float(vdiag["book_vol"]) if not pd.isna(vdiag["book_vol"]) else float("nan"),
         raw_holdings=held,
         universe=universe,
@@ -325,6 +368,7 @@ def compute_targets(
         universe_size=uni.shape[1],
         diagnostics={k: v for k, v in diag.items()},
         selection=selection,
+        ranking=ranking,
     )
 
     total = sum(book.weights.values())
