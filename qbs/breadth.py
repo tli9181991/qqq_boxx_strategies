@@ -80,6 +80,12 @@ class BreadthParams:
     # a calm tape look like a falling one.
     up4_bands: Tuple[float, float, float] = (50.0, 100.0, 300.0)
     dn4_bands: Tuple[float, float, float] = (50.0, 100.0, 200.0)
+
+    # The "% above the 20-day" column is a two-state read of the CURRENT tape,
+    # so only the most recent sessions are shaded. Colouring the whole history
+    # turns a regime indicator into wallpaper -- the eye stops seeing it.
+    ma_fast_recent: int = 10          # sessions shaded, newest first
+    ma_fast_green: float = 20.0       # above this is light green, at or below red
     ma_extreme_low_fast: float = 10.0
     ma_extreme_low_slow: float = 20.0
     ma_extreme_high_fast: float = 90.0
@@ -461,6 +467,21 @@ def pulse_cell(value: float, which: str, p: Optional[BreadthParams] = None) -> s
     idx = sum(value > edge for edge in bands)      # 0..3
     order = PULSE_CELLS if which == "up" else tuple(reversed(PULSE_CELLS))
     return order[idx]
+
+
+def ma_fast_cell(value: float, rank: int,
+                 p: Optional[BreadthParams] = None) -> str:
+    """Two-state shading for the %-above-20-day column, recent rows only.
+
+    `rank` is how far back the row is, 0 for the newest session. Rows beyond
+    `ma_fast_recent` come back "none" and stay uncoloured, which is the point:
+    this column answers "what is the tape doing NOW", and a shaded year of it
+    is wallpaper.
+    """
+    p = p or BreadthParams()
+    if pd.isna(value) or rank >= p.ma_fast_recent:
+        return "none"
+    return "light_green" if value > p.ma_fast_green else "light_red"
 
 
 def atr_class(value: float, p: Optional[BreadthParams] = None) -> str:

@@ -38,8 +38,8 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
-                         momentum_label, momentum_profile, pulse_cell,
-                         pulse_class, sector_breakdown)
+                         ma_fast_cell, momentum_label, momentum_profile,
+                         pulse_cell, pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
@@ -856,9 +856,14 @@ with tab_market:
             which = "up" if name.startswith("Up") else "down"
             return [f"background-color: {PULSE_CELL[pulse_cell(v, which)]}"
                     for v in col]
-        if name in ("% > 20D", "% > 50D"):
-            which_ma = "fast" if "20" in name else "slow"
-            return [f"background-color: {CELL[ma_class(v, which_ma)]}" for v in col]
+        if name == "% > 20D":
+            # `enumerate` over the column, not the index: `disp` is built
+            # newest-first, so position 0 IS the latest session. Reading the
+            # date instead would break the moment the sort order changed.
+            return [f"background-color: {PULSE_CELL[ma_fast_cell(v, i)]}"
+                    for i, v in enumerate(col)]
+        if name == "% > 50D":
+            return [f"background-color: {CELL[ma_class(v, 'slow')]}" for v in col]
         if name == "QQQ ATR":
             return [f"background-color: {CELL[atr_class(v)]}" for v in col]
         return ["" for _ in col]
@@ -879,7 +884,10 @@ with tab_market:
         f"≤{_u[2]:.0f} · dark green above. "
         f"Dn 4%: dark green ≤{_d[0]:.0f} · light green ≤{_d[1]:.0f} · light "
         f"red ≤{_d[2]:.0f} · dark red above. "
-        "Moving-average columns shade red below 10/20% and green above 90/80% · "
+        f"**% > 20D** is shaded on the **last {_bp.ma_fast_recent} sessions "
+        f"only** — green above {_bp.ma_fast_green:.0f}%, red at or below. It "
+        "reads the tape now, and a shaded year of it is wallpaper. "
+        "% > 50D keeps the full-history scale: red below 20%, green above 80%. "
         "ATR shades red beyond ±5. The bar chart above keeps the plain "
         "up-is-green convention, since a signed bar already shows direction."
     )

@@ -1698,6 +1698,41 @@ def test_the_4pc_colour_bands_match_their_edges():
         assert pulse_cell(value, "down") == want, f"down 4% at {value}"
 
 
+def test_the_20day_column_shades_only_recent_sessions():
+    """It answers "what is the tape doing NOW". Shading the whole history
+    turns a regime indicator into wallpaper and the eye stops seeing it."""
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    p = BreadthParams()
+    assert ma_fast_cell(55.0, 0) == "light_green"
+    assert ma_fast_cell(55.0, p.ma_fast_recent - 1) == "light_green"
+    assert ma_fast_cell(55.0, p.ma_fast_recent) == "none", "11th row back is bare"
+    assert ma_fast_cell(55.0, 200) == "none"
+
+
+def test_the_20day_column_is_two_state_around_its_threshold():
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    p = BreadthParams()
+    assert p.ma_fast_green == 20.0
+    assert ma_fast_cell(20.1, 0) == "light_green"
+    assert ma_fast_cell(20.0, 0) == "light_red", "at the threshold is not above it"
+    assert ma_fast_cell(0.0, 0) == "light_red"
+    assert ma_fast_cell(float("nan"), 0) == "none"
+    # Only ever the light shades -- the dark pair belongs to the 4% columns.
+    shades = {ma_fast_cell(v, 0) for v in (0.0, 20.0, 20.1, 99.0)}
+    assert shades == {"light_red", "light_green"}
+
+
+def test_the_20day_shading_follows_its_parameters():
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    strict = BreadthParams(ma_fast_recent=3, ma_fast_green=60.0)
+    assert ma_fast_cell(55.0, 0, strict) == "light_red", "55 is below a 60 bar"
+    assert ma_fast_cell(55.0, 3, strict) == "none", "only 3 rows shaded"
+    assert ma_fast_cell(55.0, 3) == "light_green", "the default still shades 10"
+
+
 def test_green_is_bullish_in_both_4pc_columns():
     """The two run in opposite directions: a big up count is bullish, a big
     down count is not. Getting that reversal backwards is the easy mistake and
