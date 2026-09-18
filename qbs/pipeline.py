@@ -239,9 +239,14 @@ def sweep_volume(
     from .breadth import volume_eligibility
     from .universe import load_universe_volumes
 
-    uni = lab.universe
-    if uni is None:
+    # `lab.universe` is the frame as it arrived: unreindexed and not yet pruned
+    # by min_history, so it carries columns the engine never priced. Taking it
+    # from `combined` is the same idiom sweep_band uses, and the reason this is
+    # not a matter of taste -- a weight on a column the return frame lacks is a
+    # KeyError deep inside run_backtest.
+    if lab.combined is None:
         return pd.DataFrame()
+    uni = lab.combined.drop(columns=[SAFE_ASSET])
     vols = load_universe_volumes(list(uni.columns))
     if vols is None or vols.empty:
         return pd.DataFrame()

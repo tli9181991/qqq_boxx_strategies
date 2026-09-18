@@ -2574,3 +2574,51 @@ def test_missing_volumes_read_as_none_rather_than_failing(tmp_path):
     from qbs.universe import load_universe_volumes
 
     assert load_universe_volumes(cache_dir=str(tmp_path)) is None
+
+
+def test_sweep_volume_scores_the_book_it_can_actually_price(tmp_path, monkeypatch):
+    """`lab.universe` carries columns the engine never priced.
+
+    It is the frame as it arrived -- not reindexed, not pruned by min_history --
+    so building weights from it puts a position on a ticker the return frame
+    lacks, and run_backtest raises a KeyError from deep inside. The sweep must
+    take its universe from `combined`, as the other sweeps do.
+    """
+    from qbs import pipeline
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01")
+    # A column with almost no history: pruned out of `combined`, still present
+    # in `universe`. This is exactly the shape that broke it.
+    uni["SPARSE"] = np.nan
+    uni.iloc[-5:, uni.columns.get_loc("SPARSE")] = 100.0
+
+    lab = run(cfg=Config(), prices=px, universe_prices=uni.reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    assert "SPARSE" in lab.universe.columns
+    assert "SPARSE" not in lab.combined.columns, "the fixture no longer bites"
+
+    vols = pd.DataFrame(1e6, index=lab.combined.index,
+                        columns=lab.combined.drop(columns=[SAFE_ASSET]).columns)
+    monkeypatch.setattr(pipeline, "load_universe_volumes", lambda *a, **k: vols,
+                        raising=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: vols)
+
+    out = sweep_volume(lab, min_ratios=(0.0, 1.0))
+
+    assert not out.empty
+    assert list(out["min_ratio"]) == [0.0, 1.0]
+
+
+def test_sweep_volume_says_nothing_rather_than_zero_without_a_cache(monkeypatch):
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    lab = run(cfg=Config(), prices=px,
+              universe_prices=synthetic_universe(n=20, start="2023-06-01")
+              .reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: None)
+
+    assert sweep_volume(lab).empty, "a missing cache must not read as a result"
