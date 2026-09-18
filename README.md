@@ -9,8 +9,8 @@ that shows you where every signal fired.
 - **Top-6 Nasdaq-100 momentum** — cross-sectional 6-1 momentum with a hysteresis band
 - **Top-6 + VIX circuit breaker** — the same book, switched off entirely when VIX spikes
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
-- **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
-  can be held against the momentum book on identical assumptions
+- **Top-20 high momentum screen** — an absolute bar (over $5, over 300k shares a day,
+  up more than 28% on the quarter), then ranked by relative strength
 
 Plus one strategy that does not fit the daily model and runs on its own:
 
@@ -274,27 +274,45 @@ gap in one name: it responds to sustained volatility, not to jumps.
 against VIX so you can see the episodes an index signal misses. The dial is expected
 to be *boring* — a kink would mean the overlay is doing more than rescaling.
 
-### 7. Top-6 Finviz screen
+### 7. Top-20 high momentum screen
 
-`finviz_filter_with_daily_summary.ipynb` answers "what would I buy today". This rolls
-it forward to every historical date so it can be held against the momentum book.
+Started as a roll-forward of `finviz_filter_with_daily_summary.ipynb`. It now applies
+the **same high-momentum definition** as the market-overview tab's leader group, so a
+name shown as a "momentum leader" there and a name held here are selected on one rule.
 
 | | Rule |
 |---|---|
-| Filter | price > $10, close > SMA(200), quarter return > 0, **within 10% of the 52-week high** |
+| Filter | close > **$5**, volume > **300k shares/day**, quarterly gain > **28%** |
 | Score | 1-year total return, bucketed into a 1–99 RS Rank |
 | Tie-break | smallest distance below the 52-week high |
-| Hold | the top 6, equal weight per slot |
-| Exit | the day a name stops passing or drops out of the top 6 — **no band** |
+| Hold | the top 20, equal weight per slot |
+| Exit | the day a name stops passing or drops out of the top 20 — **no band** |
 
-**What was reproduced and what could not be.** Every Finviz criterion in the notebook
-is derived from price or volume, which is what makes it rollable at all. Two are not
-applied: market cap over $300m needs fundamentals (non-binding on the Nasdaq-100), and
-average volume over 200k needs share volume — pass `volumes=` to enable it. Both
-omissions are *permissive*, so they flatter this strategy rather than the other way
-round. The notebook's quarterly-return gate is off by default because the notebook
-itself applies it only to the sector-breakdown table, not to the list it ranks
-(`min_quarter_return=0.28` switches it on, matching the momentum-leader rule).
+**It is a different kind of strategy from the momentum book**, not a variant of it. The
+momentum book ranks the whole universe and takes the top six whatever the market is
+doing, so it is always fully invested. This screen applies an *absolute* bar first, so
+in a weak tape it can return almost nobody and sit in cash. That is a feature of the
+design, and the reason the two rarely hold the same names.
+
+**The two Finviz-notebook filters are now off by default**: `above_sma` (200-day) and
+`within_52w_high_pct` (10%). Both still work if set. Turning `above_sma` back on is
+near-free — on the cached universe it changes the passing count by zero, because a name
+up 28% on the quarter is essentially always above its 200-day average. The proximity
+filter is the one that bites: it roughly halves the qualifying set and takes a full
+top-20 from 15% of sessions down to 3%.
+
+**`n_hold` is 20, and the universe decides whether that means anything.** On the
+~99-name Nasdaq-100 cache a median of **11** names clear the filter, so "top 20" is
+usually "everyone who qualified" — on the last cached bar, 6 names. For the ranking to
+be a real selection, run it over the broad US universe
+(`qbs.finviz.fetch_us_universe`), which is what the market tab already fetches.
+
+**What is not applied.** Market cap over $300m needs fundamentals (non-binding on the
+Nasdaq-100, permissive elsewhere). And `min_volume` **needs `volumes=`** — unlike the
+old average-volume filter, which was skipped silently when volume was missing, this one
+*raises*, because it is a leg of the definition and dropping a leg on the floor
+overstates the screen. The dashboard and the backtest both opt out of it explicitly
+and say so on screen, since the Nasdaq-100 cache carries closes only.
 
 **It is ranked against the Nasdaq-100, not against Finviz's own output.** That is
 deliberate. The notebook screens the whole US market and gets ~530 names; running the
@@ -312,8 +330,8 @@ Same universe, same six slots, same engine, same 1bp + 5bp costs, 2025-01-20 →
 | | CAGR | Vol | Sharpe | Max DD | Turnover | Cost drag |
 |---|---|---|---|---|---|---|
 | **Top-6 NDX momentum** (12-1, band 10) | **46.1%** | 49.0% | **0.94** | **−34.8%** | **5.7×** | 0.3% |
-| Top-6 Finviz screen (notebook rules) | 25.8% | 40.1% | 0.67 | −36.0% | 86.7× | 5.2% |
-| Top-6 Finviz screen, monthly rebalance | 43.3% | 45.9% | 0.93 | −39.9% | 12.7× | 0.8% |
+| Finviz screen, **as it was** (top 6, notebook rules) | 25.8% | 40.1% | 0.67 | −36.0% | 86.7× | 5.2% |
+| Finviz screen, **as it was**, monthly rebalance | 43.3% | 45.9% | 0.93 | −39.9% | 12.7× | 0.8% |
 | Buy & hold QQQ | 22.2% | 22.6% | 0.82 | −22.8% | 0.6× | 0.0% |
 
 **Roughly a third of the gap is churn, the rest is selection.** Gross of costs the
@@ -365,6 +383,13 @@ and its edge — if it has one — may live in the small and mid caps the Nasdaq
 not contain. Nothing above rules that out. What it does show is that the *selection
 rule*, applied to the same names as the momentum book, picks differently and, on this
 window, worse — and that the 52-week-high proximity filter is why.
+
+> **Everything in this section measures the screen as it was**: top 6, price > $10,
+> above the 200-day, within 10% of the 52-week high, quarter up. It now runs the
+> high-momentum definition instead, with the proximity filter **off** — which is the
+> very filter this section identifies as the cause. The findings are kept because they
+> are why the screen changed, not because they describe what it does now. **Re-run the
+> backtest before quoting any number above as current.**
 
 ---
 
@@ -663,8 +688,9 @@ qbs/
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
   strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
-  screens.py      filter-based screens: the trend template and the Finviz screen,
-                  both rolled forward from a notebook so they can be backtested
+  screens.py      filter-based screens: the trend template and the high-momentum
+                  screen, both rolled forward from a notebook so they can be
+                  backtested
   breakout.py     hourly resistance-breakout trading + the weekly six-slot book;
                   its own fill-level accounting, because weights cannot express a stop
   engine.py       one backtest function: lag, commission, slippage, equity curve
@@ -685,7 +711,7 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 149 tests: indicators, engine, momentum, circuit-breaker,
+tests/test_qbs.py 166 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
 tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
@@ -799,16 +825,16 @@ streamlit run dashboard/app.py
 
 Two tabs:
 
-- **Daily picks** — what each of the three selection strategies held on any chosen
-  day, the entries and exits that changed it, the momentum ∩ Finviz overlap, and a
+- **Daily picks** — what each of the two selection strategies held on any chosen day,
+  the entries and exits that changed it, how many names they hold in common, and a
   downloadable history table. A chart panel on the right plots any name with its
   10/20/50/200-day EMAs and the nearest support and resistance levels.
 
   The levels are re-derived **from history up to the selected date only** — the same
   causal rule `candidate_trades` uses, so the chart never draws a line the strategy
   could not have seen on that date. When a name has cleared everything overhead the
-  panel says so outright: that is the state 52% of Finviz picks are in, and it is the
-  reason a breakout entry has nothing to fire on.
+  panel says so outright — it is in price discovery, with nothing above it to break
+  through.
 
   **Below the plot, the same name in numbers:** trailing returns over 1w/1m/3m/6m/12m
   plus the book's own momentum score, each with its **percentile rank in the universe on
@@ -817,24 +843,25 @@ Two tabs:
   against each EMA, the SMA 200, its 52-week high and its own ATR.
 
   Last comes the row that ties the panel to the three above it: **every gate each
-  strategy actually applies, with the reading that decides it and a ✅/❌**. On the last
-  cached bar MU ranks 96 on the book's 6-1 score and is blocked *only* by "within 10% of
-  the 252-day high" at 17.6% off — which is the whole zero-overlap finding, per name, on
-  one screen.
+  strategy actually applies, with the reading that decides it and a ✅/❌** — and *only*
+  the gates that are switched on. A row for a filter nobody is running describes a
+  strategy that does not exist, and the table gives the reader no way to tell.
 
   Every threshold in that table is read off `FinvizScreenParams`, `MomentumParams` and
   `BreadthParams` rather than written out again, so retuning a strategy retunes its gate
   rows, labels and verdicts with it; turn the band floor on and its row appears, turn
-  "quarter up" off and its row goes, change the ranker's lookback and every row naming
-  it follows. **That last one is not hypothetical** — the book moved from 12-1 to 6-1,
+  "quarter up" on and its row appears, change the ranker's lookback and every row
+  naming it follows. **That last one is not hypothetical** — the book moved from 12-1 to 6-1,
   and a panel with the horizon written into it would now be labelling a number the
   strategy does not use with the name of the rule it claims to explain.
 
-  Two legs are deliberately missing: the screen's average-volume filter and the leader
-  rule's share volume both need volume data, which this panel does not carry, so clearing
-  every row shown is **necessary but not sufficient**. The momentum hurdle is BOXX over
-  the same window where a safe asset is supplied, and zero where it is not — the row
-  says which.
+  One leg is deliberately missing: the volume test (> 300k shares/day), which the
+  screen and the leader group both apply and which needs volume data this panel does
+  not carry — so clearing every row shown is **necessary but not sufficient**. The
+  screen and the leader group show the same rules because they *are* the same
+  definition, held in two places (`FinvizScreenParams`, `BreadthParams`) so either can
+  be retuned alone. The momentum hurdle is BOXX over the same window where a safe asset
+  is supplied, and zero where it is not — the row says which.
 
   Price is drawn as **candlesticks**, which need real Open/High/Low. The universe
   cache holds closes only, so the panel fetches daily OHLC for the *selected name*
@@ -980,7 +1007,7 @@ pip install -r requirements.txt -r requirements-agent.txt
 cp .env.example .env && chmod 600 .env       # paste your key into it
 python -m qbs.agent --check
 
-python -m qbs.agent "Why is the momentum book holding names the Finviz screen rejects?"
+python -m qbs.agent "Why is the momentum book holding names the screen rejects?"
 python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
 ```
 

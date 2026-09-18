@@ -76,8 +76,9 @@ def build_tools(
 
         Use this first for any question about what to buy, hold or watch
         today. Covers the Nasdaq-100 cross-sectional momentum book and the
-        Finviz screen, and reports how many names the two agree on. The
-        output names the lookback the ranker is actually configured with.
+        high-momentum screen, and reports how many names the two agree on.
+        The output names the lookback and the screen size actually configured,
+        and says when the screen returned fewer names than it ranks down to.
         """
         return ev.picks_report(book, n_hold=n_hold)
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -191,8 +191,14 @@ def run(
         # universe would be today's screener result applied to history --
         # i.e. names chosen for having gone up. See the README.
         if with_finviz:
+            # The universe here is closes-only, so the screen's volume leg is
+            # opted out EXPLICITLY rather than skipped: the screen raises on a
+            # leg it cannot apply, and this backtest is more permissive than
+            # the live definition as a result. `volume_filter_applied` on the
+            # returned signal records that.
+            screen = replace(cfg.finviz, min_volume=None)
             signals["finviz"] = finviz_momentum_screen(
-                uni, prices[SAFE_ASSET], cfg.finviz)
+                uni, prices[SAFE_ASSET], screen)
 
     # ---- backtest everything on identical assumptions -------------------
     results: Dict[str, BacktestResult] = {}

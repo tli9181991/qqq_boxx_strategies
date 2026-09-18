@@ -4,8 +4,10 @@
 
 Two tabs:
 
-* **Daily picks** -- what each of the three selection strategies held on each
-  day, with the entries and exits that changed it.
+* **Daily picks** -- what each of the two selection strategies held on each
+  day, with the entries and exits that changed it. The momentum book ranks the
+  universe and is always invested; the high-momentum screen applies an
+  absolute bar and can hold almost nothing.
 * **Market overview** -- the breadth monitor: 4% movers, percent holding the
   moving averages, index stretch in ATR units, and the momentum-leader group.
 
@@ -58,13 +60,12 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
         "high": "#ddefe4", "extreme_high": "#a9d7bd", "none": "",
         "stretched": "#f6c9c9", "oversold": "#c9e6d5", "normal": ""}
 
+# Both counts come from the config rather than the string, for the same reason
+# the lookback does: they have each moved once already, and a header claiming
+# the old value is a quiet lie on every screenshot.
 STRATEGY_LABELS = {
-    # The lookback comes from the config, not from this string: it has moved
-    # from 12-1 to 6-1 once already, and a tab header claiming the old one is
-    # a quiet lie on every screenshot.
-    "momentum": f"Top-6 NDX momentum ({momentum_label()})",
-    "finviz": "Top-6 Finviz screen",
-    "breakout": "Weekly breakout watchlist",
+    "momentum": f"Top-{Config().momentum.n_hold} NDX momentum ({momentum_label()})",
+    "finviz": f"Top-{FinvizScreenParams().n_hold} high momentum screen",
 }
 PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
                 "up": f"Up 4% < {BreadthParams().pulse_strong}",
@@ -137,16 +138,20 @@ def load_data(download_start: str, online: bool, force: bool, _token: int):
 
 @st.cache_data(show_spinner="Building selections…")
 def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
-                     exit_rank: int, n_watch: int) -> Dict[str, pd.DataFrame]:
+                     exit_rank: int, n_screen: int) -> Dict[str, pd.DataFrame]:
     """Daily holdings for each strategy, as date x (tickers, buys, sells)."""
-    from qbs.breakout import finviz_watchlists
     from qbs.config import MomentumParams
 
     out: Dict[str, pd.DataFrame] = {}
 
     mom = cross_sectional_momentum(
         _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
-    fin = finviz_momentum_screen(_uni, _safe, FinvizScreenParams(n_hold=n_hold))
+    # `min_volume=None` opts the screen's volume leg out EXPLICITLY, because
+    # this universe is closes-only and the screen raises rather than dropping
+    # a leg of the definition silently. The caption under the column says so;
+    # without volume the screen is more permissive than its own definition.
+    fin = finviz_momentum_screen(
+        _uni, _safe, FinvizScreenParams(n_hold=n_screen, min_volume=None))
 
     for key, sig in (("momentum", mom), ("finviz", fin)):
         ev = sig.events
@@ -162,17 +167,6 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
             })
         out[key] = pd.DataFrame(rows).set_index("date")
 
-    # The breakout strategy selects weekly, so its "daily" view is the
-    # watchlist standing for that week -- not a held book.
-    wl = finviz_watchlists(_uni, _safe, n_watch=n_watch)
-    rows, current = [], ""
-    for d in _uni.index:
-        if d in wl:
-            current = ", ".join(wl[d])
-        rows.append({"date": d, "holdings": current,
-                     "n": len(current.split(", ")) if current else 0,
-                     "buys": "", "sells": ""})
-    out["breakout"] = pd.DataFrame(rows).set_index("date")
     return out
 
 
@@ -317,7 +311,11 @@ download_start = st.sidebar.text_input("Data start", cfg.download_start)
 n_hold = st.sidebar.number_input("Names held (n_hold)", 1, 20, cfg.momentum.n_hold)
 exit_rank = st.sidebar.number_input("Exit rank (band)", int(n_hold), 50,
                                     max(cfg.momentum.exit_rank, int(n_hold)))
-n_watch = st.sidebar.number_input("Breakout watchlist size", 5, 50, 20)
+n_screen = st.sidebar.number_input(
+    "High-momentum screen size", 5, 100, FinvizScreenParams().n_hold,
+    help="How many names the high-momentum screen ranks down to. On the "
+         "Nasdaq-100 universe fewer than this usually qualify, so the column "
+         "shows everyone who passed.")
 
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
 # app force-refreshed on EVERY start -- re-downloading the whole universe
@@ -370,7 +368,8 @@ st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
-selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_watch))
+selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank),
+                              int(n_screen))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
 
 tab_picks, tab_market, tab_analyst = st.tabs(
@@ -384,7 +383,7 @@ tab_picks, tab_market, tab_analyst = st.tabs(
 with tab_picks:
     freshness_banner()
     st.subheader("Daily picks")
-    st.caption(f"Three selection strategies · universe {UNIVERSE_NOTE} · "
+    st.caption(f"{len(STRATEGY_LABELS)} selection strategies · universe {UNIVERSE_NOTE} · "
                f"data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 
     dates = [d for d in selections["momentum"].index
@@ -392,9 +391,9 @@ with tab_picks:
     asof = st.select_slider("Date", options=dates, value=dates[-1],
                             format_func=lambda d: f"{d:%Y-%m-%d}")
 
-    cols = st.columns([1, 1, 1, 2.6])
+    cols = st.columns([1, 1, 2.6])
     picks: Dict[str, set] = {}
-    for col, key in zip(cols[:3], ("momentum", "finviz", "breakout")):
+    for col, key in zip(cols[:2], ("momentum", "finviz")):
         frame = selections[key]
         row = frame.loc[asof] if asof in frame.index else None
         raw = row["holdings"] if row is not None and row["holdings"] else ""
@@ -402,15 +401,23 @@ with tab_picks:
         picks[key] = set(names)
         with col:
             st.markdown(f"**{STRATEGY_LABELS[key]}**")
-            st.metric("Watchlist size" if key == "breakout" else "Names held",
-                      len(names))
-            if key == "breakout":
-                st.caption("A watchlist, not a book — a name is only bought "
-                           "once a breakout confirms.")
+            st.metric("Names held", len(names))
+            if key == "finviz":
+                # Say it here rather than leaving someone to wonder why a
+                # "top-20" shows 6 names.
+                short = len(names) < int(n_screen)
+                st.caption(
+                    (f"{len(names)} of {int(n_screen)} slots — fewer names "
+                     "cleared the filter than the screen ranks down to. "
+                     if short else "")
+                    + "Filter: close > \$5 · quarterly gain > 28%. "
+                    "**The volume leg (> 300k shares/day) is not applied** — "
+                    "this universe carries closes only, so the screen is more "
+                    "permissive than its own definition.")
             if names:
                 st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
                              width="stretch",
-                             height=min(250, 38 + 35 * len(names)))
+                             height=min(420, 38 + 35 * len(names)))
             else:
                 st.info("Nothing held — fully in cash.")
             if row is not None and row["buys"]:
@@ -419,7 +426,7 @@ with tab_picks:
                 st.caption(f"🔴 Sold: {row['sells']}")
 
     # ---- right-hand panel: price, EMAs and the levels that matter ---------
-    with cols[3]:
+    with cols[2]:
         st.markdown("**Price & levels**")
         universe_names = list(uni.columns)
         picked = sorted(set().union(*picks.values()))
@@ -524,9 +531,9 @@ with tab_picks:
                 if not has_overhead:
                     st.warning(
                         "**No resistance overhead in this window.** The name has "
-                        "already cleared every level its chart shows, so a "
-                        "breakout entry has nothing to fire on. This is the state "
-                        "52% of Finviz picks are in — see the funnel notebook.",
+                        "already cleared every level its chart shows, so there "
+                        "is nothing above it to break through — it is in price "
+                        "discovery.",
                         icon="⚠️")
                 st.caption(
                     "Levels are re-derived from history **up to the selected date "
@@ -599,8 +606,9 @@ with tab_picks:
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(
-        f"**Momentum ∩ Finviz:** {', '.join(sorted(common)) if common else 'no overlap'} "
-        f"({len(common)}/{len(picks['momentum']) or '—'})"
+        f"**Held by both books:** "
+        f"{', '.join(sorted(common)) if common else 'no overlap'} "
+        f"({len(common)} of {len(picks['momentum']) or '—'} momentum names)"
     )
 
     st.divider()

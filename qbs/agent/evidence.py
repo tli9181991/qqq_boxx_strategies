@@ -92,12 +92,21 @@ def load_book(offline: bool = True, download_start: Optional[str] = None,
 # What the strategies hold right now
 # --------------------------------------------------------------------------
 
-def current_picks(book: Book, n_hold: int = 6) -> Dict[str, List[str]]:
-    """Each selection strategy's book on the last bar in the cache."""
+def current_picks(book: Book, n_hold: int = 6,
+                  n_screen: Optional[int] = None) -> Dict[str, List[str]]:
+    """Each selection strategy's book on the last bar in the cache.
+
+    `min_volume=None` opts the screen's volume leg out explicitly: this
+    universe is closes-only, and the screen raises rather than dropping a leg
+    of its own definition. The report says so, because without it the screen
+    is more permissive than the rule it claims to apply.
+    """
+    n_screen = FinvizScreenParams().n_hold if n_screen is None else n_screen
     mom = cross_sectional_momentum(book.universe, book.safe,
                                    MomentumParams(n_hold=n_hold))
-    fin = finviz_momentum_screen(book.universe, book.safe,
-                                 FinvizScreenParams(n_hold=n_hold))
+    fin = finviz_momentum_screen(
+        book.universe, book.safe,
+        FinvizScreenParams(n_hold=n_screen, min_volume=None))
     out = {}
     for key, sig in (("momentum", mom), ("finviz", fin)):
         log = sig.holdings_log
@@ -105,15 +114,17 @@ def current_picks(book: Book, n_hold: int = 6) -> Dict[str, List[str]]:
     return out
 
 
-def picks_report(book: Book, n_hold: int = 6) -> str:
+def picks_report(book: Book, n_hold: int = 6,
+                 n_screen: Optional[int] = None) -> str:
     """The current books, and how much they agree.
 
-    The overlap line is the point. These two screens were measured against
-    each other over the whole sample and mostly do not intersect, so a reader
-    comparing them needs the count in front of them, not the impression that
-    two momentum strategies must be picking the same names.
+    The overlap line is the point. These two were measured against each other
+    over the whole sample and mostly do not intersect, so a reader comparing
+    them needs the count in front of them, not the impression that two
+    momentum strategies must be picking the same names.
     """
-    picks = current_picks(book, n_hold=n_hold)
+    n_screen = FinvizScreenParams().n_hold if n_screen is None else n_screen
+    picks = current_picks(book, n_hold=n_hold, n_screen=n_screen)
     mom, fin = set(picks["momentum"]), set(picks["finviz"])
     both = sorted(mom & fin)
     # The lookback is named from the config, never written out -- it has
@@ -122,7 +133,8 @@ def picks_report(book: Book, n_hold: int = 6) -> str:
     # meant to prevent.
     label = momentum_label(MomentumParams(n_hold=n_hold))
     lines = [f"CURRENT PICKS — {book.header()}", ""]
-    left = [f"Top-{n_hold} NDX momentum ({label}):", f"Top-{n_hold} Finviz screen:"]
+    left = [f"Top-{n_hold} NDX momentum ({label}):",
+            f"Top-{n_screen} high momentum screen:"]
     width = max(len(x) for x in left)
     lines.append(f"{left[0].ljust(width)}  "
                  + (", ".join(picks["momentum"]) or "cash"))
@@ -131,10 +143,22 @@ def picks_report(book: Book, n_hold: int = 6) -> str:
     lines.append("")
     lines.append(f"Held by both: {', '.join(both) if both else 'none'} "
                  f"({len(both)} of {n_hold})")
+    if len(picks["finviz"]) < n_screen:
+        lines.append(
+            f"Only {len(picks['finviz'])} names cleared the screen's filter, so "
+            f"its {n_screen} slots are not full. That is normal on a "
+            f"{book.universe.shape[1]}-name universe -- the filter wants a 28% "
+            f"quarter, and a top-{n_screen} needs a broader universe to be a "
+            f"real selection rather than a list of everyone who qualified.")
     lines.append(
-        f"The two screens select on different things -- one on relative "
-        f"{label} rank, the other on proximity to the 52-week high -- so low "
-        f"overlap is the normal state, not a bug or a data problem.")
+        f"The two select on different things -- one on relative {label} rank "
+        f"against the whole universe, the other on an absolute bar (over $5, "
+        f"up more than 28% on the quarter) and then RS rank among whoever "
+        f"cleared it -- so low overlap is the normal state, not a bug.")
+    lines.append(
+        "The screen's volume leg (> 300k shares/day) is NOT applied here: this "
+        "universe carries closes only, which makes the screen more permissive "
+        "than its own definition.")
     return "\n".join(lines)
 
 
@@ -188,10 +212,12 @@ def name_report(book: Book, ticker: str, n_hold: int = 6) -> str:
     lines.append("Blocked by — " + ("; ".join(blocked) if blocked
                                     else "nothing; it clears every rule shown"))
     lines.append(
-        "Two gates are missing because this universe carries closes only: the "
-        "screen's average-volume filter and the leader rule's share-volume "
-        "leg. "
-        "Clearing every rule above is necessary, not sufficient.")
+        "One gate is missing because this universe carries closes only: the "
+        "volume leg (> 300k shares/day), which the screen and the leader rule "
+        "both apply. Clearing every rule above is necessary, not sufficient. "
+        "The screen and the leader group show the same rules because they are "
+        "the same definition, held in two places (FinvizScreenParams and "
+        "BreadthParams) so either can be retuned alone.")
     return "\n".join(lines)
 
 

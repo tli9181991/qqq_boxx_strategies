@@ -761,11 +761,38 @@ def _finviz_inputs(n=40):
     return uni, px["BOXX"]
 
 
+def _screen(**kw):
+    """Screen params for a closes-only fixture.
+
+    `min_volume` is ON in the real defaults and RAISES without volumes, on
+    purpose -- it is a leg of the high-momentum definition and skipping it
+    silently would overstate the screen. Tests that are not about volume opt
+    out here once instead of in twenty places.
+    """
+    kw.setdefault("min_volume", None)
+    return FinvizScreenParams(**kw)
+
+
+def _notebook_screen(**kw):
+    """The original Finviz-notebook filter set, which is no longer the default.
+
+    Kept as a fixture because those legs still work and several tests exist to
+    pin their behaviour; they just no longer describe what the screen does out
+    of the box.
+    """
+    for key, value in (("min_price", 10.0), ("above_sma", 200),
+                       ("within_52w_high_pct", 0.10),
+                       ("require_quarter_up", True),
+                       ("min_quarter_return", None)):
+        kw.setdefault(key, value)
+    return _screen(**kw)
+
+
 def test_finviz_weights_are_a_valid_long_only_book():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     assert np.allclose(sig.weights.sum(axis=1), 1.0)
     assert (sig.weights >= -1e-9).all().all()
     risk = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
@@ -778,7 +805,7 @@ def test_finviz_parks_in_the_safe_asset_when_nothing_passes():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=6, within_52w_high_pct=-1.0)
+    p = _screen(n_hold=6, within_52w_high_pct=-1.0)
     sig = finviz_momentum_screen(uni, safe, p)
     assert np.allclose(sig.weights["BOXX"], 1.0), "must be fully in cash"
     assert np.nanmax(sig.diagnostics["n_passing"].to_numpy()) == 0
@@ -790,7 +817,7 @@ def test_finviz_ranks_by_one_year_return_among_passing_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=6)
+    p = _screen(n_hold=6)
     sig = finviz_momentum_screen(uni, safe, p)
 
     perf = uni / uni.shift(p.rs_lookback) - 1.0
@@ -836,7 +863,7 @@ def test_finviz_caps_the_book_at_n_hold():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=4))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=4))
     assert sig.diagnostics["n_held"].max() <= 4
 
 
@@ -851,7 +878,7 @@ def test_finviz_has_no_look_ahead():
     after = tampered.index > cut
     tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
 
-    p = FinvizScreenParams(n_hold=6)
+    p = _screen(n_hold=6)
     a = finviz_momentum_screen(uni, safe, p).weights.loc[:cut]
     b = finviz_momentum_screen(tampered, safe, p).weights.loc[:cut]
     pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
@@ -863,7 +890,7 @@ def test_finviz_volume_filter_only_ever_removes_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=0)
+    p = _screen(n_hold=0)
     base = finviz_momentum_screen(uni, safe, p)
 
     # Half the universe trades under the threshold, half far above it.
@@ -878,6 +905,62 @@ def test_finviz_volume_filter_only_ever_removes_names():
         assert set(withv.holdings_log[dt]) <= set(base.holdings_log[dt])
 
 
+def test_the_screen_defaults_are_the_high_momentum_definition():
+    """The screen and the market tab's leader group must apply one rule. If
+    these drift apart, a name can be a "momentum leader" on one tab and fail
+    the screen on the other, with nothing on screen explaining why."""
+    from qbs.breadth import BreadthParams
+
+    screen, leader = FinvizScreenParams(), BreadthParams()
+    assert screen.min_price == leader.leader_min_price == 5.0
+    assert screen.min_volume == leader.leader_min_volume == 300_000.0
+    assert screen.min_quarter_return == leader.leader_min_quarter_return == 0.28
+    assert screen.quarter_lookback == leader.leader_quarter_days == 63
+    # And the notebook legs the definition does not include are off.
+    assert screen.above_sma == 0
+    assert screen.within_52w_high_pct is None
+    assert screen.n_hold == 20
+
+
+def test_the_screen_refuses_to_skip_its_volume_leg():
+    """`min_avg_volume` was skipped silently when volume was missing. This one
+    is a leg of the definition, so dropping it on the floor would overstate
+    the screen -- the caller has to opt out deliberately."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    try:
+        finviz_momentum_screen(uni, safe, FinvizScreenParams())
+    except ValueError as exc:
+        assert "min_volume" in str(exc) and "volumes" in str(exc)
+    else:
+        raise AssertionError("the default screen must raise without volumes")
+
+    # Opting out explicitly is fine and is what the dashboard does.
+    sig = finviz_momentum_screen(uni, safe, _screen())
+    assert sig.weights.notna().any().any()
+
+
+def test_the_breakout_watchlist_keeps_the_notebook_rules():
+    """The breakout strategy's entries assume names selected NEAR their highs
+    -- that is what `min_off_high_pct` turns into a band. The screen no longer
+    selects that way, so following its defaults would change every result in
+    that module without changing a line of it."""
+    from qbs.config import notebook_screen_params
+
+    nb = notebook_screen_params()
+    assert nb.within_52w_high_pct == 0.10, "the band the breakout needs"
+    assert nb.above_sma == 200 and nb.min_price == 10.0
+    assert nb.min_quarter_return is None
+    assert nb.min_volume is None, "closes-only fixtures must still run"
+
+    # And the watchlist builder defaults to it rather than to the screen's.
+    uni, safe = _finviz_inputs()
+    from qbs.breakout import finviz_watchlists
+    wl = finviz_watchlists(uni, safe, n_watch=10)
+    assert wl, "the notebook rules must still produce a watchlist"
+
+
 def test_finviz_min_dollar_volume_needs_volumes():
     """Silently ignoring a criterion the caller asked for would overstate the
     strategy, so an unusable parameter has to raise."""
@@ -886,7 +969,7 @@ def test_finviz_min_dollar_volume_needs_volumes():
     uni, safe = _finviz_inputs()
     try:
         finviz_momentum_screen(uni, safe,
-                               FinvizScreenParams(min_dollar_volume=5e6))
+                               _screen(min_dollar_volume=5e6))
     except ValueError:
         return
     raise AssertionError("min_dollar_volume without volumes must raise")
@@ -896,9 +979,9 @@ def test_finviz_quarter_up_gate_removes_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    on = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    on = finviz_momentum_screen(uni, safe, _screen(n_hold=0))
     off = finviz_momentum_screen(uni, safe,
-                                 FinvizScreenParams(n_hold=0, require_quarter_up=False))
+                                 _screen(n_hold=0, require_quarter_up=False))
     for dt in uni.index[::40]:
         assert set(on.holdings_log[dt]) <= set(off.holdings_log[dt])
 
@@ -909,8 +992,10 @@ def test_finviz_band_reduces_turnover():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    none = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=0))
-    band = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=15))
+    # n_hold pinned: the default is 20 and `exit_rank` must not be narrower
+    # than the book, so a 15-wide band needs a book smaller than 15.
+    none = finviz_momentum_screen(uni, safe, _screen(n_hold=6, exit_rank=0))
+    band = finviz_momentum_screen(uni, safe, _screen(n_hold=6, exit_rank=15))
     t_none = float(none.weights.diff().abs().sum(axis=1).sum())
     t_band = float(band.weights.diff().abs().sum(axis=1).sum())
     assert t_band < t_none, "a hysteresis band must reduce turnover"
@@ -918,7 +1003,7 @@ def test_finviz_band_reduces_turnover():
 
 def test_finviz_band_cannot_be_narrower_than_the_book():
     try:
-        FinvizScreenParams(n_hold=6, exit_rank=3)
+        _screen(n_hold=6, exit_rank=3)
     except ValueError:
         return
     raise AssertionError("exit_rank below n_hold must raise")
@@ -929,7 +1014,7 @@ def test_finviz_records_rank_and_score_like_the_momentum_book():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     assert {"rank", "score"} <= set(sig.events.columns)
     assert sig.held_ranks is not None
     buys = sig.events[sig.events["action"] == "buy"]
@@ -940,7 +1025,7 @@ def test_finviz_runs_through_the_shared_engine():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     book = uni.copy()
     book["BOXX"] = safe
     res = run_backtest(book, sig, start="2025-01-20")
@@ -955,8 +1040,11 @@ def test_finviz_monthly_rebalance_only_trades_at_month_ends():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    monthly = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="ME"))
-    daily = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="daily"))
+    # n_hold pinned well below the number that passes on this fixture, so the
+    # candidate pool can actually be wider than the book -- which is what the
+    # last assertion here is about. The default 20 exceeds the pool.
+    monthly = finviz_momentum_screen(uni, safe, _screen(n_hold=3, rebalance="ME"))
+    daily = finviz_momentum_screen(uni, safe, _screen(n_hold=3, rebalance="daily"))
 
     changed = monthly.weights.diff().abs().sum(axis=1) > 1e-12
     assert 0 < changed.sum() < (daily.weights.diff().abs().sum(axis=1) > 1e-12).sum()
@@ -1478,9 +1566,9 @@ def test_finviz_high_band_floor_excludes_names_at_their_high():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    ceiling = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    ceiling = finviz_momentum_screen(uni, safe, _screen(n_hold=0))
     band = finviz_momentum_screen(
-        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04,
+        uni, safe, _screen(n_hold=0, min_off_high_pct=0.04,
                                       within_52w_high_pct=0.20))
 
     high = uni.rolling(252, min_periods=252).max()
@@ -1494,7 +1582,7 @@ def test_finviz_high_band_floor_excludes_names_at_their_high():
 
     # A floor can only remove names that the bare ceiling admitted.
     strict = finviz_momentum_screen(
-        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04))
+        uni, safe, _screen(n_hold=0, min_off_high_pct=0.04))
     for dt in uni.index[::40]:
         assert set(strict.holdings_log[dt]) <= set(ceiling.holdings_log[dt])
 
@@ -1504,9 +1592,9 @@ def test_finviz_high_band_floor_defaults_to_the_notebook_rule():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    a = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    a = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     b = finviz_momentum_screen(uni, safe,
-                               FinvizScreenParams(n_hold=6, min_off_high_pct=0.0))
+                               _screen(n_hold=6, min_off_high_pct=0.0))
     pd.testing.assert_frame_equal(a.weights, b.weights)
 
 
@@ -2223,7 +2311,10 @@ def test_momentum_profile_gates_explain_a_rejection():
     path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
     px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
 
-    g = momentum_profile(px, "PULLBACK")["gates"].set_index("Rule")
+    # Both legs this test is about are OFF in the defaults now, so the
+    # rejection it pins only exists when they are switched on.
+    screen = _screen(within_52w_high_pct=0.10, above_sma=200)
+    g = momentum_profile(px, "PULLBACK", screen=screen)["gates"].set_index("Rule")
     proximity = "within 10% of 252-day high"
     # Truthiness, not identity: pandas stores these as numpy bools, and
     # `np.False_ is False` is False.
@@ -2246,29 +2337,37 @@ def test_momentum_profile_gates_follow_the_screen_parameters():
     path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
     px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
 
+    def gates(**kw):
+        return momentum_profile(
+            px, "PULLBACK", screen=_screen(**kw))["gates"].set_index("Rule")
+
+    # A leg that is switched OFF must have NO row. A row for a filter nobody
+    # is running describes a strategy that does not exist, and the reader has
+    # no way to tell that from the table.
+    default = gates()
+    assert not any("high" in r for r in default.index), \
+        "within_52w_high_pct is None by default -- no proximity row"
+    assert not any("SMA" in r for r in default.index), \
+        "above_sma is 0 by default -- no moving-average row"
+    assert not any("quarter up" in r for r in default.index)
+    assert any("quarterly gain over 28%" in r for r in default.index), \
+        "the leg that IS on must be reported, at its configured threshold"
+
     # 14% off the high fails a 10% ceiling and clears a 20% one.
-    tight = momentum_profile(px, "PULLBACK",
-                             screen=FinvizScreenParams())["gates"].set_index("Rule")
-    loose = momentum_profile(
-        px, "PULLBACK",
-        screen=FinvizScreenParams(within_52w_high_pct=0.20))["gates"].set_index("Rule")
+    tight = gates(within_52w_high_pct=0.10)
+    loose = gates(within_52w_high_pct=0.20)
     assert not tight.loc["within 10% of 252-day high", "Pass"]
     assert loose.loc["within 20% of 252-day high", "Pass"]
 
-    # A configured band floor adds its row; the default ceiling-only rule
-    # must not claim a floor the screen does not apply.
+    # A configured band floor adds its row; a ceiling-only rule must not claim
+    # a floor the screen does not apply.
     assert not any("off the high" in r for r in tight.index)
-    banded = momentum_profile(
-        px, "PULLBACK",
-        screen=FinvizScreenParams(min_off_high_pct=0.05))["gates"].set_index("Rule")
+    banded = gates(min_off_high_pct=0.05)
     assert banded.loc["at least 5% off the high", "Pass"], "14% off clears a 5% floor"
 
-    # The quarter-up row disappears when the screen stops requiring it.
-    assert any("quarter up" in r for r in tight.index)
-    off = momentum_profile(
-        px, "PULLBACK",
-        screen=FinvizScreenParams(require_quarter_up=False))["gates"].set_index("Rule")
-    assert not any("quarter up" in r for r in off.index)
+    # And the legs that can be switched back on appear when they are.
+    assert any("quarter up" in r for r in gates(require_quarter_up=True).index)
+    assert any("above SMA 200" in r for r in gates(above_sma=200).index)
 
 
 def test_momentum_profile_hurdle_uses_the_safe_asset_when_given():

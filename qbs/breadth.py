@@ -519,8 +519,10 @@ def momentum_profile(
     leader_qtr = _gain(p.leader_quarter_days)
     high_w = float(s.tail(screen.high_window).max()) if len(s) >= 2 else np.nan
     off_high = (high_w - last) / high_w if high_w else np.nan
-    sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
-    sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
+    sma_last = np.nan
+    if screen.above_sma:
+        sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
+        sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
 
     # The hurdle is measured over the SAME window as the score. Comparing a
     # 6-1 stock return against a 12-1 cash return would be a different test
@@ -537,38 +539,45 @@ def momentum_profile(
          "Rule": f"{mom_label} momentum beats {hurdle_label}",
          "Value": mom_score, "Fmt": "pct",
          "Pass": bool(mom_score > hurdle) if pd.notna(mom_score) else None},
-        # `>=`, matching `priced` in `finviz_momentum_screen` -- a name sitting
-        # exactly on the threshold passes the screen, so it passes here too.
-        {"Strategy": "Finviz screen",
-         "Rule": f"close at or above ${screen.min_price:,.0f}",
-         "Value": last, "Fmt": "price", "Pass": bool(last >= screen.min_price)},
-        {"Strategy": "Finviz screen", "Rule": f"above SMA {screen.above_sma}",
-         "Value": (last / sma_last - 1.0) if sma_last and pd.notna(sma_last) else np.nan,
-         "Fmt": "pct", "Pass": bool(last > sma_last) if pd.notna(sma_last) else None},
-        {"Strategy": "Finviz screen",
-         "Rule": f"within {screen.within_52w_high_pct:.0%} of "
-                 f"{screen.high_window}-day high",
-         "Value": off_high, "Fmt": "off",
-         "Pass": bool(off_high <= screen.within_52w_high_pct)
-         if pd.notna(off_high) else None},
+        # `>`, matching `priced` in `finviz_momentum_screen`.
+        {"Strategy": "Momentum screen",
+         "Rule": f"close over ${screen.min_price:,.0f}",
+         "Value": last, "Fmt": "price", "Pass": bool(last > screen.min_price)},
     ]
+    # Rows only for the legs the screen actually applies. A row for a filter
+    # that is switched off would report a strategy nobody is running, and the
+    # reader has no way to tell the difference from the table.
+    if screen.above_sma:
+        rows.append({
+            "Strategy": "Momentum screen", "Rule": f"above SMA {screen.above_sma}",
+            "Value": (last / sma_last - 1.0) if sma_last and pd.notna(sma_last) else np.nan,
+            "Fmt": "pct", "Pass": bool(last > sma_last) if pd.notna(sma_last) else None})
+    if screen.within_52w_high_pct is not None:
+        rows.append({
+            "Strategy": "Momentum screen",
+            "Rule": f"within {screen.within_52w_high_pct:.0%} of "
+                    f"{screen.high_window}-day high",
+            "Value": off_high, "Fmt": "off",
+            "Pass": bool(off_high <= screen.within_52w_high_pct)
+            if pd.notna(off_high) else None})
     if screen.min_off_high_pct:
         # The band floor, only when one is configured -- the notebook's rule is
         # a ceiling alone, and a row asserting a floor it does not apply would
         # be reporting a strategy nobody is running.
-        rows.append({"Strategy": "Finviz screen",
+        rows.append({"Strategy": "Momentum screen",
                      "Rule": f"at least {screen.min_off_high_pct:.0%} off the high",
                      "Value": off_high, "Fmt": "off",
                      "Pass": bool(off_high >= screen.min_off_high_pct)
                      if pd.notna(off_high) else None})
     if screen.require_quarter_up:
-        rows.append({"Strategy": "Finviz screen",
+        rows.append({"Strategy": "Momentum screen",
                      "Rule": f"quarter up ({screen.quarter_lookback}d)",
                      "Value": screen_qtr, "Fmt": "pct",
                      "Pass": bool(screen_qtr > 0) if pd.notna(screen_qtr) else None})
     if screen.min_quarter_return is not None:
-        rows.append({"Strategy": "Finviz screen",
-                     "Rule": f"quarterly gain over {screen.min_quarter_return:.0%}",
+        rows.append({"Strategy": "Momentum screen",
+                     "Rule": f"quarterly gain over {screen.min_quarter_return:.0%} "
+                             f"({screen.quarter_lookback}d)",
                      "Value": screen_qtr, "Fmt": "pct",
                      "Pass": bool(screen_qtr >= screen.min_quarter_return)
                      if pd.notna(screen_qtr) else None})
