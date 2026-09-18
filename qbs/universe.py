@@ -201,6 +201,7 @@ def load_universe_prices(
     tickers = sorted(set(tickers))
     os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, "universe_prices.csv")
+    vol_cache = os.path.join(cache_dir, "universe_volumes.csv")
 
     if os.path.exists(cache) and not refresh:
         px = pd.read_csv(cache, parse_dates=["Date"], index_col="Date")
@@ -213,7 +214,7 @@ def load_universe_prices(
 
     import yfinance as yf
 
-    frames, failed = [], []
+    frames, vframes, failed = [], [], []
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
         raw = yf.download(batch, start=start, end=end, auto_adjust=True,
@@ -226,6 +227,16 @@ def load_universe_prices(
         if isinstance(close, pd.Series):
             close = close.to_frame(batch[0])
         frames.append(close)
+        # Volume arrives in the same response, so caching it costs disk and no
+        # network. The ranking strategies ignore it; research that needs a
+        # liquidity or participation test would otherwise have to re-download
+        # the whole universe to get a column already in hand.
+        if "Volume" in (raw.columns.get_level_values(0)
+                        if isinstance(raw.columns, pd.MultiIndex) else raw.columns):
+            v = raw["Volume"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Volume"]]
+            if isinstance(v, pd.Series):
+                v = v.to_frame(batch[0])
+            vframes.append(v)
         failed.extend([t for t in batch if t not in close.columns
                        or close[t].notna().sum() == 0])
 
@@ -245,6 +256,12 @@ def load_universe_prices(
             print(f"[universe] no data for {len(set(failed))}: {sorted(set(failed))}")
 
     px.to_csv(cache)
+    if vframes:
+        vol = pd.concat(vframes, axis=1).sort_index()
+        vol = vol.loc[:, ~vol.columns.duplicated()]
+        vol.index = pd.to_datetime(vol.index).tz_localize(None).normalize()
+        vol.index.name = "Date"
+        vol.reindex(columns=px.columns).to_csv(vol_cache)
     return px
 
 
@@ -284,3 +301,26 @@ def synthetic_universe(
     prices = 100 * np.exp(np.cumsum(rets, axis=0))
     names = [f"SY{i:03d}" for i in range(n)]
     return pd.DataFrame(prices, index=idx, columns=names).rename_axis("Date")
+
+
+def load_universe_volumes(
+    tickers: Optional[Iterable[str]] = None,
+    cache_dir: str = UNIVERSE_DIR,
+) -> Optional[pd.DataFrame]:
+    """Share volumes for the universe, or None if they were never cached.
+
+    Written as a side effect of `load_universe_prices`, which gets them free in
+    the same yfinance response. Returns None rather than raising when the cache
+    predates that -- a missing volume column should degrade a liquidity test to
+    "not applied", never fail a price download that succeeded.
+    """
+    path = os.path.join(cache_dir, "universe_volumes.csv")
+    if not os.path.exists(path):
+        return None
+    vol = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+    if tickers is not None:
+        have = [t for t in tickers if t in vol.columns]
+        if not have:
+            return None
+        vol = vol[have]
+    return vol.sort_index()

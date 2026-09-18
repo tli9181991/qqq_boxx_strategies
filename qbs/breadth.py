@@ -195,6 +195,57 @@ def leader_eligibility(
     return mask
 
 
+def relative_volume(
+    volumes: pd.DataFrame,
+    fast: int = 5,
+    slow: int = 50,
+) -> pd.DataFrame:
+    """Recent share volume over its own longer average, per name.
+
+    The ratio, not a level. An absolute floor says nothing inside the
+    Nasdaq-100 -- every constituent trades millions of shares, so a 300k test
+    removes nobody but a half-day -- whereas a name's volume against its own
+    norm distinguishes a move the market is participating in from one it is
+    ignoring. Above 1.0 is busier than usual; below, quieter.
+    """
+    v = volumes.sort_index().astype(float)
+    return (v.rolling(fast, min_periods=max(fast // 2, 1)).mean()
+            / v.rolling(slow, min_periods=max(slow // 2, 1)).mean())
+
+
+def volume_eligibility(
+    volumes: pd.DataFrame,
+    min_ratio: float = 0.0,
+    max_ratio: float = 0.0,
+    min_shares: float = 0.0,
+    fast: int = 5,
+    slow: int = 50,
+    existing: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """A date x ticker mask for the ranker, from volume alone.
+
+    Any leg left at 0.0 is off, so the default is a mask that admits
+    everything -- a filter nobody configured must not quietly remove names.
+
+    `min_ratio` demands participation (volume running above its own average);
+    `max_ratio` is the opposite test, excluding a name whose move is happening
+    on unusually thin trade; `min_shares` is the absolute floor, kept for
+    completeness and near-useless on a large-cap index.
+    """
+    rel = relative_volume(volumes, fast=fast, slow=slow)
+    ok = pd.DataFrame(True, index=rel.index, columns=rel.columns)
+    if min_ratio:
+        ok &= rel > min_ratio
+    if max_ratio:
+        ok &= rel < max_ratio
+    if min_shares:
+        ok &= volumes.reindex_like(rel) > min_shares
+    ok = ok.fillna(False)
+    if existing is not None:
+        ok &= existing.reindex(index=ok.index, columns=ok.columns).fillna(False)
+    return ok
+
+
 def sector_breakdown(
     closes: pd.DataFrame,
     sector_map: Dict[str, str],

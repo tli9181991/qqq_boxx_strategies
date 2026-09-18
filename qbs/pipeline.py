@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -13,7 +13,7 @@ from .config import (
 )
 from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
 from .engine import BacktestResult, run_backtest
-from .metrics import format_summary, summary_table
+from .metrics import format_summary, summarise, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2, drawdown_stop,
@@ -215,6 +215,61 @@ def run(
 
     return Lab(prices=prices, signals=signals, results=results, rf=rf, config=cfg,
                universe=universe_prices, combined=combined, vix=vix)
+
+
+def sweep_volume(
+    lab,
+    min_ratios: Sequence[float] = (0.0, 0.8, 1.0, 1.2, 1.5),
+    max_ratios: Sequence[float] = (0.0,),
+    fast: int = 5,
+    slow: int = 50,
+) -> pd.DataFrame:
+    """Rebuild the momentum book under volume filters and score each.
+
+    Needs `universe_volumes.csv`, written alongside the closes by
+    `load_universe_prices`. Returns an empty frame when it is absent rather
+    than pretending a filter ran -- a cache from before volumes were kept is a
+    missing measurement, not a result.
+
+    The filter gates entry AND forces an exit, which is what an eligibility
+    mask does. That is the strict reading and the one worth measuring first:
+    on the leader screen it was the forced exits, not the screening, that did
+    the damage.
+    """
+    from .breadth import volume_eligibility
+    from .universe import load_universe_volumes
+
+    uni = lab.universe
+    if uni is None:
+        return pd.DataFrame()
+    vols = load_universe_volumes(list(uni.columns))
+    if vols is None or vols.empty:
+        return pd.DataFrame()
+    vols = vols.reindex(index=uni.index).ffill()
+
+    rows = []
+    for lo in min_ratios:
+        for hi in max_ratios:
+            gate = (None if not (lo or hi) else
+                    volume_eligibility(vols, min_ratio=lo, max_ratio=hi,
+                                       fast=fast, slow=slow))
+            mom = cross_sectional_momentum(uni, lab.prices[SAFE_ASSET],
+                                           lab.config.momentum, eligible=gate)
+            vt = book_vol_target(mom, lab.combined, lab.config.book_vol,
+                                 lag=lab.config.execution_lag)
+            sig = drawdown_stop(vt, lab.combined, lab.config.dd_stop,
+                                lag=lab.config.execution_lag,
+                                benchmark=lab.prices.get(lab.config.dd_stop_benchmark))
+            res = run_backtest(lab.combined, sig, lag=lab.config.execution_lag,
+                               cost_bps=lab.config.cost_bps,
+                               slippage_bps=lab.config.slippage_bps)
+            st = summarise(res, rf=lab.rf)
+            rows.append({"min_ratio": lo, "max_ratio": hi,
+                         "CAGR": st["CAGR"], "MaxDD": st["Max drawdown"],
+                         "Calmar": st["Calmar"],
+                         "Turnover": st["Ann. turnover"],
+                         "AvgRisk": st["Avg risk exposure"]})
+    return pd.DataFrame(rows)
 
 
 def sweep_band(

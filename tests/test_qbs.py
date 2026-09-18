@@ -2514,3 +2514,63 @@ def test_a_disabled_stop_never_reports_itself_as_blocking():
     # The condition itself is reported either way, so a dry run still shows it.
     pd.testing.assert_series_equal(off.diagnostics["dd_flag"], on.diagnostics["dd_flag"])
     pd.testing.assert_frame_equal(off.weights, vt.weights)
+
+
+# --------------------------------------------------------------------------
+# Volume filters on the ranker
+# --------------------------------------------------------------------------
+
+def _vol_fixture():
+    idx = pd.bdate_range("2024-01-01", periods=200)
+    return pd.DataFrame({
+        "SURGE": np.r_[np.full(195, 1e6), np.full(5, 4e6)],
+        "QUIET": np.r_[np.full(195, 1e6), np.full(5, 2e5)],
+        "FLAT":  np.full(200, 1e6),
+    }, index=idx)
+
+
+def test_relative_volume_is_a_ratio_to_the_names_own_norm():
+    from qbs.breadth import relative_volume
+
+    r = relative_volume(_vol_fixture()).iloc[-1]
+
+    assert r["SURGE"] > 2.5 and r["QUIET"] < 0.4
+    assert r["FLAT"] == pytest.approx(1.0)
+
+
+def test_an_unconfigured_volume_filter_admits_everything():
+    """A filter nobody asked for must never quietly remove a name."""
+    from qbs.breadth import volume_eligibility
+
+    assert volume_eligibility(_vol_fixture()).to_numpy().all()
+
+
+def test_each_volume_leg_selects_what_it_claims():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    assert [c for c in v if volume_eligibility(v, min_ratio=1.5)[c].iloc[-1]] == ["SURGE"]
+    assert [c for c in v if volume_eligibility(v, max_ratio=0.5)[c].iloc[-1]] == ["QUIET"]
+    # The absolute floor is the near-useless one on a large-cap index.
+    assert [c for c in v if volume_eligibility(v, min_shares=3e5)[c].iloc[-1]] \
+        == ["SURGE", "FLAT"]
+
+
+def test_volume_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    only_flat = pd.DataFrame(False, index=v.index, columns=v.columns)
+    only_flat["FLAT"] = True
+
+    out = volume_eligibility(v, min_shares=3e5, existing=only_flat)
+
+    assert not out["SURGE"].any(), "the existing mask was ignored"
+    assert out["FLAT"].iloc[-1]
+
+
+def test_missing_volumes_read_as_none_rather_than_failing(tmp_path):
+    """A cache written before volumes were kept must not break a price load."""
+    from qbs.universe import load_universe_volumes
+
+    assert load_universe_volumes(cache_dir=str(tmp_path)) is None
