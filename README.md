@@ -301,6 +301,13 @@ up 28% on the quarter is essentially always above its 200-day average. The proxi
 filter is the one that bites: it roughly halves the qualifying set and takes a full
 top-20 from 15% of sessions down to 3%.
 
+**Running it on Colab.** `notebooks/finviz_selection_colab.ipynb` clones the repo,
+downloads closes *and volumes* so all three legs apply, runs this same
+`finviz_momentum_screen`, and prints the ranked picks with the numbers that chose
+them plus a per-leg funnel. A flag at the top switches between the Nasdaq-100
+(under a minute) and the full US universe (several minutes, ~120 paginated Finviz
+requests). Runtime → Run all.
+
 **`n_hold` is 20, and the universe decides whether that means anything.** On the
 ~99-name Nasdaq-100 cache a median of **11** names clear the filter, so "top 20" is
 usually "everyone who qualified" — on the last cached bar, 6 names. For the ranking to
@@ -711,6 +718,9 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
+notebooks/momentum_ranker_colab.ipynb  today's ranking, on Colab
+notebooks/finviz_selection_colab.ipynb the high-momentum screen, on Colab,
+                  over the Nasdaq-100 or the whole US market
 tests/test_qbs.py 166 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
