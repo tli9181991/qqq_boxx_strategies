@@ -416,11 +416,12 @@ be closed rather than stranded.
 
 ### The CSV logs in `var/`
 
-Four files, so the run log can be read with `cat` and no tooling:
+Five files, so the run log can be read with `cat` and no tooling:
 
 | file | what | how it is written |
 |---|---|---|
 | `ranking_log.csv` | the top 25 of each day's ranking, with rank, score and whether it is held | appended, one block per date |
+| `shadow_log.csv` | what each candidate ranking rule *would* hold, and where it disagrees with the live book | appended, one block per date |
 | `trade_log.csv` | every trading event — the same rows `report` prints | rewritten from the database each run |
 | `strategy_book.csv` | today's book: strategy shares beside the account's and yours | rewritten each run |
 | `strategy_trades.csv` | the position ledger, when `position_source=ledger` | appended from IB's fills |
@@ -431,6 +432,20 @@ once the ranking has moved on. It is keyed on the date, so the twice-daily
 preflight and any re-run after a failure cannot duplicate a day. `QBS_RANKING_TOP`
 sets the depth (default 25 — the book holds 6 and exits past 10, so 25 shows
 the names queued behind them and a rotation becomes visible before it happens).
+
+`shadow_log.csv` accumulates for the same reason, and exists because six years
+of cached history cannot settle a question that has already been asked of it
+sixty times. A candidate ranking rule is scored beside the live book every day,
+holding nothing and sending no orders, so that in a year there are two return
+streams to compare out of sample. The `live_held` column marks the names the
+real book also holds, which makes the divergence a filter rather than a script.
+
+The candidate under observation is `z(6-1) + w * z(turn)`, where `turn` is the
+last month's return rate minus the prior quarter's — the "this name has only
+just turned up" tilt. `QBS_SHADOW_WEIGHTS` sets which `w` values are scored
+(default `0.5 1.25 2.0`); empty turns the log off. It is computed in `preflight`
+and `signal`, never in `trade`: it is a few seconds of arithmetic that cannot
+change an order, and the phase racing the MOC cutoff should not be carrying it.
 
 The others are views of the database and rebuild themselves, which is what
 stops them drifting from what they claim to show.

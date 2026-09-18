@@ -2622,3 +2622,106 @@ def test_sweep_volume_says_nothing_rather_than_zero_without_a_cache(monkeypatch)
     monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: None)
 
     assert sweep_volume(lab).empty, "a missing cache must not read as a result"
+
+
+# --------------------------------------------------------------------------
+# Shadow books
+# --------------------------------------------------------------------------
+
+def test_alternative_score_leaves_the_default_path_untouched():
+    """The live book must be bit-identical whether or not the feature exists."""
+    uni, safe = _mom_fixture()
+    p = MomentumParams(n_hold=6, exit_rank=8)
+    assert cross_sectional_momentum(uni, safe, p).weights.equals(
+        cross_sectional_momentum(uni, safe, p, score=None).weights)
+
+
+def test_alternative_score_changes_the_order_but_not_the_absolute_filter():
+    """Ranking on something else must still refuse names that lose to cash.
+
+    The filter is a statement about a name's own return. Reversing the ordering
+    is the strongest possible test: every name the default would rank last is
+    now first, and yet nothing failing the hurdle may be held.
+    """
+    from qbs.shadow import turn_score
+    uni, safe = _mom_fixture()
+    p = MomentumParams(n_hold=6, exit_rank=8, absolute_filter=True)
+    base = cross_sectional_momentum(uni, safe, p)
+    flipped = cross_sectional_momentum(uni, safe, p, score=-base.momentum)
+    assert not flipped.weights.equals(base.weights), "the score did not reach the ranking"
+
+    look, skip = int(round(p.lookback_months * 21)), int(round(p.skip_months * 21))
+    hurdle = safe.shift(skip) / safe.shift(look) - 1.0
+    for sig in (base, flipped):
+        risk = sig.weights.drop(columns=["BOXX"])
+        for dt in risk.index[-40:]:
+            if np.isnan(hurdle.loc[dt]):
+                continue
+            for t in risk.columns[risk.loc[dt] > 0]:
+                assert sig.momentum.loc[dt, t] > hurdle.loc[dt], \
+                    f"{dt} {t}: held a name that lost to the safe asset"
+
+    # And the tilt is a real reordering, not a no-op dressed up as one.
+    tilted = cross_sectional_momentum(uni, safe, p, score=turn_score(uni, 2.0, p))
+    assert not tilted.weights.equals(base.weights)
+
+
+def test_turn_score_compares_rates_not_window_lengths():
+    """A constant-growth name must not read as accelerating.
+
+    The 1-0 window is 21 days and the 3-1 window is 42. Subtracting the two
+    window returns directly measures the length difference far more than any
+    change in pace -- a name compounding at a steady 0.1%/day shows a 2%
+    'deceleration' that is pure arithmetic. Dividing each by its own length
+    removes it. This is the trap that has already produced one wrong answer in
+    this project's research, so it is pinned here.
+    """
+    idx = pd.bdate_range("2023-01-02", periods=300)
+    rates = [0.0005, 0.001, 0.0015, 0.002, 0.003]
+    steady = pd.DataFrame(
+        {f"S{i}": 100 * (1 + g) ** np.arange(300) for i, g in enumerate(rates)},
+        index=idx)
+    skip, quarter = 21, 63
+
+    recent = (steady / steady.shift(skip) - 1.0)
+    prior = (steady.shift(skip) / steady.shift(quarter) - 1.0)
+    raw = (recent - prior).iloc[quarter + 1:]                 # windows not normalised
+    rate = (recent / skip - prior / (quarter - skip)).iloc[quarter + 1:]
+
+    assert raw.abs().max().max() > 0.01, "the length artifact should be large"
+    # Scale-free, so the bound does not drift if the fixture's growth rates
+    # change: normalising kills the artifact by ~three orders of magnitude.
+    assert rate.abs().max().max() < raw.abs().max().max() / 500
+    assert raw.abs().mean().mean() > 500 * rate.abs().mean().mean()
+
+
+def test_shadow_books_are_scored_but_never_held():
+    from qbs.shadow import shadow_books
+    uni, safe = _mom_fixture()
+    p = MomentumParams(n_hold=6, exit_rank=8)
+    rows = shadow_books(uni, safe, p, weights=[0.0, 2.0])
+    assert {r["weight"] for r in rows} == {0.0, 2.0}
+    for w in (0.0, 2.0):
+        picks = [r for r in rows if r["weight"] == w]
+        assert len(picks) <= p.n_hold
+        assert len({r["symbol"] for r in picks}) == len(picks), "a name held twice"
+        assert all(1 <= r["rank"] <= p.exit_rank for r in picks)
+    # w=0 is plain momentum, so it must agree with the live book exactly.
+    live = cross_sectional_momentum(uni, safe, p)
+    dt = live.weights.index[-1]
+    assert {r["symbol"] for r in rows if r["weight"] == 0.0} == \
+        set(live.holdings_log[dt])
+
+
+def test_shadow_books_swallow_a_broken_candidate():
+    """A log must not be able to stop a run. A score full of NaN is the most
+    likely way a candidate breaks in production -- a name delisted mid-window."""
+    from qbs.shadow import shadow_books
+    import qbs.shadow as shadow_mod
+    uni, safe = _mom_fixture()
+    original = shadow_mod.turn_score
+    shadow_mod.turn_score = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        assert shadow_books(uni, safe, MomentumParams(), weights=[1.0]) == []
+    finally:
+        shadow_mod.turn_score = original

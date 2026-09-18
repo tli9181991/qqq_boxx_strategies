@@ -332,6 +332,7 @@ def cross_sectional_momentum(
     params: Optional[MomentumParams] = None,
     eligible: Optional[pd.DataFrame] = None,
     record_ranks: int = 0,
+    score: Optional[pd.DataFrame] = None,
     name: str = "momentum",
 ) -> StrategySignals:
     """Rank the universe by 6-1 momentum, hold the top N, exit on a band.
@@ -349,6 +350,14 @@ def cross_sectional_momentum(
                       the log can show what the strategy saw and not only what
                       it did. Off by default: it is a per-date dict of the
                       widest object here, and the backtest has no use for it.
+    score           : rank on this date x ticker frame instead of on 6-1
+                      momentum. Everything else is unchanged -- the band, the
+                      slot weighting, and in particular the absolute filter,
+                      which keeps testing *momentum* against the safe asset
+                      however the names are ordered. Exists so a shadow book
+                      can be scored by the one loop the live book uses, rather
+                      than by a second copy of it that would drift. None ranks
+                      on momentum and is bit-identical to not passing it.
 
     The momentum measure
     --------------------
@@ -386,9 +395,14 @@ def cross_sectional_momentum(
     mom = lagged / px.shift(look) - 1.0
     safe_mom = safe.shift(skip) / safe.shift(look) - 1.0
 
+    # Ranking on something other than momentum still needs momentum: the
+    # absolute filter is a statement about the name's own return, not about
+    # wherever it happens to sit in the ordering.
+    ranker = mom if score is None else score.reindex(index=px.index, columns=px.columns)
+
     # A name needs enough history before it can be ranked at all.
     history = px.notna().cumsum()
-    rankable = mom.notna() & (history >= p.min_history)
+    rankable = mom.notna() & ranker.notna() & (history >= p.min_history)
     if eligible is not None:
         rankable &= eligible.reindex(index=px.index, columns=px.columns).fillna(False)
 
@@ -417,14 +431,17 @@ def cross_sectional_momentum(
 
     for dt in px.index:
         if dt in rebal_set:
-            row = mom.loc[dt]
+            row = ranker.loc[dt]
             ok = rankable.loc[dt]
             cand = row[ok].dropna()
 
             if p.absolute_filter:
                 hurdle = safe_mom.loc[dt]
                 if not np.isnan(hurdle):
-                    cand = cand[cand > hurdle]
+                    # Filter on momentum, order by the score. With the default
+                    # score the two are the same series, so this is the same
+                    # comparison it has always been.
+                    cand = cand[mom.loc[dt].reindex(cand.index) > hurdle]
 
             # Rank 1 = strongest. Names failing the absolute filter are simply
             # absent, so they rank as infinitely bad and will be dropped.

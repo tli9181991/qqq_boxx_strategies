@@ -22,7 +22,7 @@ import logging
 import os
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -225,6 +225,47 @@ def write_book_csv(path: str,
 # --------------------------------------------------------------------------
 
 RANKING_CSV_COLUMNS = ["asof", "rank", "symbol", "score", "held"]
+SHADOW_CSV_COLUMNS = ["asof", "weight", "slot", "symbol", "rank", "live_held"]
+
+
+def append_shadow_csv(path: str, asof: str, rows: List[Dict[str, Any]],
+                      live_held: Optional[Sequence[str]] = None) -> int:
+    """Append one day's shadow books. Returns rows written; 0 if already there.
+
+    `live_held` marks which of the shadow's picks the real book also holds, so
+    the divergence between the two is readable without joining two files. The
+    whole point of the log is the difference; making it a column means a year
+    from now the comparison is a filter, not a script.
+
+    Keyed on the date like the ranking log, for the same reason: two phases a
+    day, plus re-runs after a failure, must not turn into duplicate rows.
+    """
+    if not rows:
+        return 0
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            if any(r.get("asof") == asof for r in csv.DictReader(f)):
+                log.info("shadow books for %s already logged in %s", asof, path)
+                return 0
+
+    held = {str(t).upper() for t in (live_held or ())}
+    fresh = not os.path.exists(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SHADOW_CSV_COLUMNS)
+        if fresh:
+            w.writeheader()
+        for r in rows:
+            rank = r.get("rank")
+            w.writerow({
+                "asof": asof,
+                "weight": r.get("weight", ""),
+                "slot": r.get("slot", ""),
+                "symbol": r.get("symbol", ""),
+                "rank": "" if rank is None or rank != rank else f"{float(rank):.0f}",
+                "live_held": "yes" if str(r.get("symbol", "")).upper() in held else "",
+            })
+    return len(rows)
 
 
 def append_ranking_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> int:

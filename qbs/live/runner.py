@@ -143,12 +143,18 @@ def _excluded_names(live: LiveConfig) -> List[str]:
 
 
 def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
-                      offline: bool = False):
+                      offline: bool = False, shadow: bool = False):
     """Download prices and compute the target book. Shared by preflight and trade.
 
     `offline` reads the CSV cache and skips the network entirely. It exists for
     debugging on the box -- the trade phase never uses it, because ranking on
     yesterday's cache would submit an order list the strategy did not ask for.
+
+    `shadow` also scores the candidate ranking rules for the log. Off for the
+    trade phase: it is several seconds of arithmetic that cannot change a
+    single order, and the one phase with a deadline should not be carrying it.
+    Preflight runs twice a day and writes the same dated row, so nothing is
+    lost by leaving it out of the run that is racing the MOC cutoff.
     """
     from qbs.universe import load_universe
 
@@ -167,6 +173,7 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         min_coverage=live.min_universe_coverage,
         exclude=_excluded_names(live),
         record_ranks=live.ranking_log_top,
+        shadow_weights=live.shadow_weights if shadow else (),
     )
     return px, book
 
@@ -182,6 +189,9 @@ def _write_csv_logs(live: LiveConfig, book=None) -> None:
         if book is not None and book.ranking:
             st.append_ranking_csv(live.ranking_csv_path,
                                   f"{book.asof:%Y-%m-%d}", book.ranking)
+        if book is not None and book.shadow:
+            st.append_shadow_csv(live.shadow_csv_path, f"{book.asof:%Y-%m-%d}",
+                                 book.shadow, live_held=book.raw_holdings)
         store.export_trade_csv(live.db_path, live.trade_csv_path)
     except Exception as exc:
         log.warning("could not refresh the CSV logs (%s: %s); the database is "
@@ -251,7 +261,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
 
     # 1. Data and signal.
     try:
-        _, book = _load_and_compute(cfg, live, refresh=True)
+        _, book = _load_and_compute(cfg, live, refresh=True, shadow=True)
     except Exception as exc:
         log.error("signal failed: %s: %s", type(exc).__name__, exc)
         st.record_run(live.state_path, "preflight", "error",
@@ -811,7 +821,7 @@ def main(argv=None) -> int:
 
     if args.phase == "signal":
         try:
-            _, book = _load_and_compute(cfg, live, refresh=not args.offline,
+            _, book = _load_and_compute(cfg, live, refresh=not args.offline, shadow=True,
                                         offline=args.offline)
         except Exception as exc:
             log.error("signal failed: %s: %s", type(exc).__name__, exc)

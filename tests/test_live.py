@@ -1717,3 +1717,73 @@ def test_a_disabled_stop_does_not_demand_a_benchmark():
                            max_staleness_days=10_000, min_coverage=0.5,
                            now=frame.index[-1])
     assert book.halted is False
+
+
+# --------------------------------------------------------------------------
+# The shadow log
+# --------------------------------------------------------------------------
+
+def test_the_shadow_log_marks_where_the_candidate_disagrees(tmp_path):
+    """The divergence is the whole product, so it is a column, not a join."""
+    path = str(tmp_path / "shadow_log.csv")
+    rows = [dict(weight=1.25, slot=1, symbol="MRVL", rank=1),
+            dict(weight=1.25, slot=2, symbol="QCOM", rank=6)]
+
+    assert st.append_shadow_csv(path, "2026-09-16", rows,
+                                live_held=["MRVL", "PANW"]) == 2
+
+    import csv as _csv
+    got = list(_csv.DictReader(open(path)))
+    assert [r["symbol"] for r in got] == ["MRVL", "QCOM"]
+    assert got[0]["live_held"] == "yes", "the live book holds MRVL too"
+    assert got[1]["live_held"] == "", "QCOM is where the candidate differs"
+    assert got[0]["weight"] == "1.25" and got[0]["rank"] == "1"
+
+
+def test_relogging_the_same_shadow_day_is_a_no_op(tmp_path):
+    path = str(tmp_path / "shadow_log.csv")
+    rows = [dict(weight=2.0, slot=1, symbol="MU", rank=1)]
+    st.append_shadow_csv(path, "2026-09-16", rows)
+    assert st.append_shadow_csv(path, "2026-09-16", rows) == 0
+
+    import csv as _csv
+    assert len(list(_csv.DictReader(open(path)))) == 1
+
+
+def test_the_shadow_book_cannot_reach_an_order():
+    """The guarantee the whole design rests on: it is logged, never traded.
+
+    An order list built from a book carrying shadow picks must be identical to
+    one built from the same book without them -- so a candidate rule cannot buy
+    anything however wrong it is.
+    """
+    from qbs.live.orders import build_orders
+    import dataclasses
+
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
+
+    plain = compute_targets(cfg, frame, requested=list(uni.columns),
+                            now=frame.index[-1], shadow_weights=())
+    shadowed = compute_targets(cfg, frame, requested=list(uni.columns),
+                               now=frame.index[-1], shadow_weights=(1.25, 2.0))
+
+    assert shadowed.shadow, "the fixture should produce shadow picks to begin with"
+    assert not plain.shadow
+    # Every field that decides an order is untouched by the candidate rules.
+    for f in ("weights", "prices", "scalar", "raw_holdings", "universe", "halted"):
+        assert getattr(plain, f) == getattr(shadowed, f), f
+
+    held = {t: 10 for t in plain.raw_holdings[:2]}
+    guards = (40_000.0, 1.60, 12)
+    a, ta = build_orders(plain.weights, plain.prices, held, 100_000.0, *guards,
+                         universe=plain.universe)
+    b, tb = build_orders(shadowed.weights, shadowed.prices, held, 100_000.0, *guards,
+                         universe=shadowed.universe)
+    assert [dataclasses.astuple(o) for o in a] == [dataclasses.astuple(o) for o in b]
+    assert ta == tb

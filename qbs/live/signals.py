@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -60,6 +60,9 @@ class TargetBook:
     diagnostics: Dict[str, float] = field(default_factory=dict)
     selection: List[Dict] = field(default_factory=list)     # entry/exit/hold, with rank
     ranking: List[Dict] = field(default_factory=list)       # the whole day's ranking
+    # What candidate ranking rules would be holding today. Logged, never
+    # traded: no order builder reads this, and nothing downstream of it can.
+    shadow: List[Dict] = field(default_factory=list)
 
     @property
     def risk_weight(self) -> float:
@@ -260,6 +263,7 @@ def compute_targets(
     now: Optional[pd.Timestamp] = None,
     exclude: Optional[List[str]] = None,
     record_ranks: int = 25,
+    shadow_weights: Sequence[float] = (),
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -356,6 +360,18 @@ def compute_targets(
         for t, r, sc in (mom.rank_log or {}).get(asof, [])
     ]
 
+    # Scored after the real book is decided, from the same pruned universe, and
+    # guarded: a candidate that cannot be scored costs a log line, never a run.
+    shadow: List[Dict] = []
+    if shadow_weights:
+        from ..shadow import shadow_books
+        try:
+            shadow = shadow_books(uni, prices[safe], cfg.momentum,
+                                  weights=list(shadow_weights), asof=asof)
+        except Exception as exc:          # noqa: BLE001
+            log.warning("shadow books could not be scored (%s: %s); the live book "
+                        "is unaffected", type(exc).__name__, exc)
+
     universe = tradeable
 
     last_px = prices.loc[asof]
@@ -383,6 +399,7 @@ def compute_targets(
         diagnostics={k: v for k, v in diag.items()},
         selection=selection,
         ranking=ranking,
+        shadow=shadow,
     )
 
     total = sum(book.weights.values())
