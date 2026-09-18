@@ -705,6 +705,74 @@ def test_the_agent_passes_arguments_through_to_the_tool():
     assert ticker in call["result"]
 
 
+def test_the_chat_replays_prior_turns():
+    """Without history "what about its fundamentals?" has nothing to refer to.
+    The whole transcript is re-sent on every message, so this pins that the
+    earlier turns actually reach the model."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="noted")]}
+
+    answer = analyst.analyse(
+        "and its fundamentals?", agent=Recorder(),
+        history=[{"role": "user", "content": "profile MU"},
+                 {"role": "assistant", "content": "MU ranks 96"}])
+    assert answer.text == "noted"
+    roles = [m["role"] for m in seen["messages"]]
+    texts = [m["content"] for m in seen["messages"]]
+    assert roles == ["user", "assistant", "user"]
+    assert texts[-1] == "and its fundamentals?", "the new question goes last"
+    assert "profile MU" in texts[0]
+
+
+def test_the_chat_history_is_capped():
+    """Every turn re-sends the transcript, so an unbounded history grows the
+    bill and the latency on every message and eventually overruns context."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="ok")]}
+
+    long_history = [{"role": "user", "content": f"q{i}"} for i in range(50)]
+    analyst.analyse("latest", agent=Recorder(), history=long_history,
+                    max_history=4)
+    assert len(seen["messages"]) == 5, "4 kept plus the new question"
+    assert seen["messages"][0]["content"] == "q46", "the OLDEST turns are dropped"
+
+
+def test_the_chat_drops_empty_turns():
+    """A blank message would otherwise reach the API as an empty user turn,
+    which some providers reject outright."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="ok")]}
+
+    analyst.analyse("real question", agent=Recorder(),
+                    history=[{"role": "user", "content": ""},
+                             {"role": "assistant", "content": "kept"}])
+    assert [m["content"] for m in seen["messages"]] == ["kept", "real question"]
+
+
 def test_final_text_handles_geminis_content_parts():
     """Gemini returns content as a list of blocks often enough that treating
     it as a string prints "[{'type': 'text', ...}]" to the user."""

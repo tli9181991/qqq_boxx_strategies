@@ -408,6 +408,209 @@ selections, SCREEN_VOLUME_APPLIED = build_selections(
     uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
 
+def names_on(key: str, when) -> list:
+    """The tickers a strategy held on a date, from the prebuilt selections.
+
+    Read from `selections` rather than from whatever the picks tab happened to
+    leave in a local: Streamlit runs the script top to bottom, so that would
+    work today and break the moment the tabs are reordered.
+    """
+    frame = selections.get(key)
+    if frame is None or when not in frame.index:
+        return []
+    raw = frame.loc[when, "holdings"]
+    return [t for t in str(raw).split(", ") if t]
+
+
+def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
+                default_ticker: Optional[str] = None):
+    """The price / levels / momentum panel, so two tabs can show one panel.
+
+    Extracted rather than copied: it is ~180 lines of chart, level and gate
+    logic, and a second copy would drift from the first the moment either is
+    touched. `key_prefix` namespaces the Streamlit widget keys, which must be
+    unique across the whole app even when the widgets are identical.
+
+    `options` is the ticker list for the combo box, already in the order the
+    caller wants it -- this function does not decide what is interesting.
+    """
+    st.markdown("**Price & levels**")
+    if not options:
+        st.info("No name to chart.")
+        return None
+    index = options.index(default_ticker) if default_ticker in options else 0
+    c1, c2, c3 = st.columns([2, 1, 1])
+    ticker = c1.selectbox(
+        "Ticker", options, index=index, key=f"{key_prefix}_ticker",
+        help="Today's picks come first, then the rest of the universe.")
+    months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
+                          format_func=lambda m: f"{m}m", key=f"{key_prefix}_win")
+    n_lvl = c3.number_input("Levels", 0, 30, 8, key=f"{key_prefix}_levels",
+                            help="Nearest N support/resistance levels "
+                                 "to the last price. 0 hides them.")
+    frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
+    if frames is None:
+        st.info(f"No price history for {ticker} up to this date.")
+    else:
+        price, ema_long, lvl, last, n_levels, has_overhead = frames
+
+        # Candles need real Open/High/Low. When they cannot be had the
+        # chart falls back to a close line and says so, rather than
+        # drawing a wickless body per bar off the close series -- that
+        # would assert a session high and low that never happened.
+        ohlc = ohlc_for(ticker, download_start, bool(online),
+                        st.session_state["refresh_token"])
+        bars = None
+        if ohlc is not None and not ohlc.empty:
+            win = ohlc.loc[:asof].tail(int(months * 21))
+            if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
+                bars = win.reset_index()
+                bars.columns = [str(c).lower() for c in bars.columns]
+
+        yscale = alt.Scale(zero=False, nice=True)
+        if bars is not None:
+            body_colour = alt.condition(
+                "datum.open <= datum.close",
+                alt.value(CANDLE_UP), alt.value(CANDLE_DN))
+            cbase = alt.Chart(bars).encode(
+                x=alt.X("date:T", title=None), color=body_colour,
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("open:Q", format=".2f"),
+                         alt.Tooltip("high:Q", format=".2f"),
+                         alt.Tooltip("low:Q", format=".2f"),
+                         alt.Tooltip("close:Q", format=".2f")])
+            wick = cbase.mark_rule(size=1).encode(
+                y=alt.Y("low:Q", title=None, scale=yscale),
+                y2=alt.Y2("high:Q"))
+            body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
+                y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
+            line = wick + body
+        else:
+            line = alt.Chart(price).mark_line(
+                color="#0b0b0b", size=1.7).encode(
+                x=alt.X("date:T", title=None),
+                y=alt.Y("close:Q", title=None, scale=yscale),
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("close:Q", title="Close", format=".2f")])
+        emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
+            x="date:T",
+            y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
+            color=alt.Color("ema:N", title=None, scale=alt.Scale(
+                domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
+                legend=alt.Legend(orient="top", direction="horizontal")),
+            tooltip=[alt.Tooltip("ema:N", title="Line"),
+                     alt.Tooltip("value:Q", title="Value", format=".2f")])
+        layers = [line, emas]
+        if not lvl.empty:
+            rules = alt.Chart(lvl).mark_rule(
+                strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
+                y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
+                color=alt.Color("kind:N", title=None, scale=alt.Scale(
+                    domain=["Resistance", "Support"],
+                    range=["#d03b3b", "#0ca30c"]),
+                    legend=alt.Legend(orient="top", direction="horizontal")),
+                tooltip=[alt.Tooltip("kind:N", title="Level"),
+                         alt.Tooltip("level:Q", title="Price", format=".2f")])
+            layers.append(rules)
+        st.altair_chart(
+            alt.layer(*layers).resolve_scale(color="independent")
+            .properties(height=430), use_container_width=True)
+        if bars is None:
+            st.caption(
+                "📉 Close line, not candles — no Open/High/Low for "
+                f"**{ticker}**. The universe cache holds closes only; "
+                "switch **Source** to Online so the panel can fetch "
+                "real OHLC for the selected name. Candles are never "
+                "drawn from closes, because a wickless body would "
+                "assert a high and low that never happened."
+            )
+
+        above = [f"EMA {n}" for n in EMA_SPANS
+                 if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
+                 and last > ema_long[ema_long["ema"] == f"EMA {n}"]["value"].iloc[-1]]
+        st.caption(
+            f"**{ticker}** {last:,.2f} · above "
+            f"{', '.join(above) if above else 'none'} · "
+            f"showing {len(lvl)} of {n_levels} levels in view"
+        )
+        if not has_overhead:
+            st.warning(
+                "**No resistance overhead in this window.** The name has "
+                "already cleared every level its chart shows, so there "
+                "is nothing above it to break through — it is in price "
+                "discovery.",
+                icon="⚠️")
+        st.caption(
+            "Levels are re-derived from history **up to the selected date "
+            "only** — the same causal rule the breakout strategy uses, so "
+            "the chart never shows a level the strategy could not have seen."
+        )
+
+        # ---- the numbers behind the picture -----------------------
+        # Same params the picks table above was screened with, so the
+        # gate rows report the screen actually running, not a default.
+        prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
+                                screen=FinvizScreenParams(n_hold=int(n_hold)))
+        if not prof["returns"].empty:
+            st.markdown("###### Momentum")
+            ret = prof["returns"].copy()
+            st.dataframe(
+                ret.style.format({"Return": "{:+.1%}",
+                                  "Universe median": "{:+.1%}",
+                                  "Rank": "{:.0f}"}, na_rep="—")
+                .background_gradient(subset=["Rank"], cmap="RdYlGn",
+                                     vmin=1, vmax=99),
+                hide_index=True, width="stretch",
+                height=45 + 35 * len(ret))
+            st.caption(
+                "**Rank is a percentile within this universe on this date**, "
+                "1–99. A twelve-month return means nothing on its own — the "
+                "question a momentum strategy asks is relative, so the number "
+                "only counts next to what every other candidate did. "
+                "*Universe median* is that comparison in one column."
+            )
+
+            tr = prof["trend"].copy()
+            tr["Value"] = [
+                ("—" if pd.isna(v) else
+                 f"{v:+.2f} ATR" if u == "ATR" else f"{v:+.1%}")
+                for v, u in zip(tr["Value"], tr["Unit"])]
+            st.dataframe(tr[["Measure", "Value"]], hide_index=True,
+                         width="stretch", height=45 + 35 * len(tr))
+
+            st.markdown("###### Which strategies would take it, and why")
+            g = prof["gates"].copy()
+            # `off` is a distance below the high, so it never carries
+            # a "+" -- 17.6% there means 17.6% WORSE than the high.
+            g["Reading"] = [
+                ("—" if pd.isna(v) else
+                 f"${v:,.2f}" if f == "price" else
+                 f"{v:.1%} off high" if f == "off" else f"{v:+.1%}")
+                for v, f in zip(g["Value"], g["Fmt"])]
+            g["✓"] = ["—" if x is None else ("✅" if x else "❌")
+                      for x in g["Pass"]]
+            st.dataframe(g[["Strategy", "Rule", "Reading", "✓"]],
+                         hide_index=True, width="stretch",
+                         height=45 + 35 * len(g))
+            failed = g[g["Pass"] == False]          # noqa: E712
+            if not failed.empty:
+                note = ("Blocked by: "
+                        + "; ".join(f"**{r.Strategy}** — {r.Rule} "
+                                    f"({r.Reading})"
+                                    for r in failed.itertuples()) + ".")
+                # Only claim the overlap finding when it is the
+                # proximity rule doing the blocking -- that is the
+                # specific disagreement it describes.
+                if any("high" in r.Rule and r.Strategy == "Finviz screen"
+                       for r in failed.itertuples()):
+                    note += (" This is the per-name version of the overlap "
+                             "finding: a name can rank at the very top on "
+                             "momentum and still fail the proximity test, "
+                             "which is why the two screens rarely agree.")
+                st.caption(md(note))
+    return st.session_state.get(f"{key_prefix}_ticker")
+
+
 tab_picks, tab_market, tab_analyst = st.tabs(
     ["📋 Daily picks", "📊 Market overview", "🤖 Analyst"])
 
@@ -469,182 +672,10 @@ with tab_picks:
 
     # ---- right-hand panel: price, EMAs and the levels that matter ---------
     with cols[2]:
-        st.markdown("**Price & levels**")
         universe_names = list(uni.columns)
         picked = sorted(set().union(*picks.values()))
         options = picked + [t for t in universe_names if t not in picked]
-        if not options:
-            st.info("No name to chart.")
-        else:
-            c1, c2, c3 = st.columns([2, 1, 1])
-            ticker = c1.selectbox(
-                "Ticker", options, index=0, key="chart_ticker",
-                help="Today's picks come first, then the rest of the universe.")
-            months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
-                                  format_func=lambda m: f"{m}m", key="chart_win")
-            n_lvl = c3.number_input("Levels", 0, 30, 8, key="chart_levels",
-                                    help="Nearest N support/resistance levels "
-                                         "to the last price. 0 hides them.")
-            frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
-            if frames is None:
-                st.info(f"No price history for {ticker} up to this date.")
-            else:
-                price, ema_long, lvl, last, n_levels, has_overhead = frames
-
-                # Candles need real Open/High/Low. When they cannot be had the
-                # chart falls back to a close line and says so, rather than
-                # drawing a wickless body per bar off the close series -- that
-                # would assert a session high and low that never happened.
-                ohlc = ohlc_for(ticker, download_start, bool(online),
-                                st.session_state["refresh_token"])
-                bars = None
-                if ohlc is not None and not ohlc.empty:
-                    win = ohlc.loc[:asof].tail(int(months * 21))
-                    if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
-                        bars = win.reset_index()
-                        bars.columns = [str(c).lower() for c in bars.columns]
-
-                yscale = alt.Scale(zero=False, nice=True)
-                if bars is not None:
-                    body_colour = alt.condition(
-                        "datum.open <= datum.close",
-                        alt.value(CANDLE_UP), alt.value(CANDLE_DN))
-                    cbase = alt.Chart(bars).encode(
-                        x=alt.X("date:T", title=None), color=body_colour,
-                        tooltip=[alt.Tooltip("date:T", title="Date"),
-                                 alt.Tooltip("open:Q", format=".2f"),
-                                 alt.Tooltip("high:Q", format=".2f"),
-                                 alt.Tooltip("low:Q", format=".2f"),
-                                 alt.Tooltip("close:Q", format=".2f")])
-                    wick = cbase.mark_rule(size=1).encode(
-                        y=alt.Y("low:Q", title=None, scale=yscale),
-                        y2=alt.Y2("high:Q"))
-                    body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
-                        y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
-                    line = wick + body
-                else:
-                    line = alt.Chart(price).mark_line(
-                        color="#0b0b0b", size=1.7).encode(
-                        x=alt.X("date:T", title=None),
-                        y=alt.Y("close:Q", title=None, scale=yscale),
-                        tooltip=[alt.Tooltip("date:T", title="Date"),
-                                 alt.Tooltip("close:Q", title="Close", format=".2f")])
-                emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
-                    x="date:T",
-                    y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
-                    color=alt.Color("ema:N", title=None, scale=alt.Scale(
-                        domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
-                        legend=alt.Legend(orient="top", direction="horizontal")),
-                    tooltip=[alt.Tooltip("ema:N", title="Line"),
-                             alt.Tooltip("value:Q", title="Value", format=".2f")])
-                layers = [line, emas]
-                if not lvl.empty:
-                    rules = alt.Chart(lvl).mark_rule(
-                        strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
-                        y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
-                        color=alt.Color("kind:N", title=None, scale=alt.Scale(
-                            domain=["Resistance", "Support"],
-                            range=["#d03b3b", "#0ca30c"]),
-                            legend=alt.Legend(orient="top", direction="horizontal")),
-                        tooltip=[alt.Tooltip("kind:N", title="Level"),
-                                 alt.Tooltip("level:Q", title="Price", format=".2f")])
-                    layers.append(rules)
-                st.altair_chart(
-                    alt.layer(*layers).resolve_scale(color="independent")
-                    .properties(height=430), use_container_width=True)
-                if bars is None:
-                    st.caption(
-                        "📉 Close line, not candles — no Open/High/Low for "
-                        f"**{ticker}**. The universe cache holds closes only; "
-                        "switch **Source** to Online so the panel can fetch "
-                        "real OHLC for the selected name. Candles are never "
-                        "drawn from closes, because a wickless body would "
-                        "assert a high and low that never happened."
-                    )
-
-                above = [f"EMA {n}" for n in EMA_SPANS
-                         if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
-                         and last > ema_long[ema_long["ema"] == f"EMA {n}"]["value"].iloc[-1]]
-                st.caption(
-                    f"**{ticker}** {last:,.2f} · above "
-                    f"{', '.join(above) if above else 'none'} · "
-                    f"showing {len(lvl)} of {n_levels} levels in view"
-                )
-                if not has_overhead:
-                    st.warning(
-                        "**No resistance overhead in this window.** The name has "
-                        "already cleared every level its chart shows, so there "
-                        "is nothing above it to break through — it is in price "
-                        "discovery.",
-                        icon="⚠️")
-                st.caption(
-                    "Levels are re-derived from history **up to the selected date "
-                    "only** — the same causal rule the breakout strategy uses, so "
-                    "the chart never shows a level the strategy could not have seen."
-                )
-
-                # ---- the numbers behind the picture -----------------------
-                # Same params the picks table above was screened with, so the
-                # gate rows report the screen actually running, not a default.
-                prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
-                                        screen=FinvizScreenParams(n_hold=int(n_hold)))
-                if not prof["returns"].empty:
-                    st.markdown("###### Momentum")
-                    ret = prof["returns"].copy()
-                    st.dataframe(
-                        ret.style.format({"Return": "{:+.1%}",
-                                          "Universe median": "{:+.1%}",
-                                          "Rank": "{:.0f}"}, na_rep="—")
-                        .background_gradient(subset=["Rank"], cmap="RdYlGn",
-                                             vmin=1, vmax=99),
-                        hide_index=True, width="stretch",
-                        height=45 + 35 * len(ret))
-                    st.caption(
-                        "**Rank is a percentile within this universe on this date**, "
-                        "1–99. A twelve-month return means nothing on its own — the "
-                        "question a momentum strategy asks is relative, so the number "
-                        "only counts next to what every other candidate did. "
-                        "*Universe median* is that comparison in one column."
-                    )
-
-                    tr = prof["trend"].copy()
-                    tr["Value"] = [
-                        ("—" if pd.isna(v) else
-                         f"{v:+.2f} ATR" if u == "ATR" else f"{v:+.1%}")
-                        for v, u in zip(tr["Value"], tr["Unit"])]
-                    st.dataframe(tr[["Measure", "Value"]], hide_index=True,
-                                 width="stretch", height=45 + 35 * len(tr))
-
-                    st.markdown("###### Which strategies would take it, and why")
-                    g = prof["gates"].copy()
-                    # `off` is a distance below the high, so it never carries
-                    # a "+" -- 17.6% there means 17.6% WORSE than the high.
-                    g["Reading"] = [
-                        ("—" if pd.isna(v) else
-                         f"${v:,.2f}" if f == "price" else
-                         f"{v:.1%} off high" if f == "off" else f"{v:+.1%}")
-                        for v, f in zip(g["Value"], g["Fmt"])]
-                    g["✓"] = ["—" if x is None else ("✅" if x else "❌")
-                              for x in g["Pass"]]
-                    st.dataframe(g[["Strategy", "Rule", "Reading", "✓"]],
-                                 hide_index=True, width="stretch",
-                                 height=45 + 35 * len(g))
-                    failed = g[g["Pass"] == False]          # noqa: E712
-                    if not failed.empty:
-                        note = ("Blocked by: "
-                                + "; ".join(f"**{r.Strategy}** — {r.Rule} "
-                                            f"({r.Reading})"
-                                            for r in failed.itertuples()) + ".")
-                        # Only claim the overlap finding when it is the
-                        # proximity rule doing the blocking -- that is the
-                        # specific disagreement it describes.
-                        if any("high" in r.Rule and r.Strategy == "Finviz screen"
-                               for r in failed.itertuples()):
-                            note += (" This is the per-name version of the overlap "
-                                     "finding: a name can rank at the very top on "
-                                     "momentum and still fail the proximity test, "
-                                     "which is why the two screens rarely agree.")
-                        st.caption(md(note))
+        price_panel(uni, px, asof, options, int(n_hold), "picks")
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(
@@ -961,6 +992,12 @@ with tab_analyst:
     freshness_banner()
     st.subheader("Ask the analyst")
 
+    # The picks tab's date slider drives this tab too -- two sliders for one
+    # date is a way to have the chart and the chat disagree about "today".
+    asof_analyst = asof
+    screen_names = names_on("finviz", asof_analyst)
+    momentum_names = names_on("momentum", asof_analyst)
+
     from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
     from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
     from qbs.agent.evidence import Book
@@ -1039,56 +1076,99 @@ with tab_analyst:
         "under each answer so you can check the figures against their source."
     )
 
-    EXAMPLES = [
-        "Why is the momentum book holding names the Finviz screen rejects?",
-        "Profile the top momentum pick and say what would take it out of the book.",
-        "Is the market broad or narrow right now, and what does that imply "
-        "for a breakout strategy?",
-        "Pull fundamentals and recent news for the strongest pick, and say "
-        "where they disagree with the price signal.",
-    ]
-    picked = st.selectbox("Start from an example, or write your own", 
-                          ["— write my own —"] + EXAMPLES)
-    default_q = "" if picked.startswith("—") else picked
-    question = st.text_area("Question", value=default_q, height=90,
-                            placeholder="Ask about the picks, a name, breadth, "
-                                        "or the backtest results…")
+    a_cols = st.columns([1.35, 1])
 
-    ask = st.button("Analyse", type="primary", disabled=bool(blocker) or not question.strip())
+    # ---- left: the same panel the picks tab shows ------------------------
+    with a_cols[0]:
+        # High-momentum names first, then the momentum book, then everyone
+        # else. Whatever the screen currently holds is what you are most
+        # likely to want to look at while asking about it.
+        hi = [t for t in screen_names if t in uni.columns]
+        mom = [t for t in momentum_names if t in uni.columns and t not in hi]
+        rest = [t for t in uni.columns if t not in hi and t not in mom]
+        a_options = hi + mom + rest
+        st.caption(
+            f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''} first, "
+            f"then {len(mom)} from the momentum book, then the rest of the "
+            f"{len(a_options)}-name universe.")
+        chart_ticker = price_panel(uni, px, asof_analyst, a_options,
+                                   int(n_hold), "analyst")
 
-    if ask:
-        # The agent gets the frames this app already loaded rather than
-        # re-reading the cache: a three-tool answer would otherwise spend a
-        # minute rebuilding a universe that is sitting in memory.
-        book = Book(universe=uni, prices=px, cfg=cfg, note=UNIVERSE_NOTE)
-        with st.spinner(f"Asking {model_name}…"):
-            answer = analyse(
-                question.strip(), model=model_name.strip() or None,
-                book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
-                offline_fundamentals=not live_fundamentals)
+    # ---- right: the chat -------------------------------------------------
+    with a_cols[1]:
+        st.markdown("**Finance assistant**")
+        st.session_state.setdefault("chat", [])
 
-        if answer.disabled:
-            st.info(f"**The analyst is switched off.** {answer.text}", icon="⏸️")
-        elif answer.error:
-            st.error(f"**The analyst could not answer.** {answer.text}", icon="🚫")
-        else:
-            st.markdown(answer.text)
+        if st.session_state["chat"]:
+            if st.button("Clear conversation", key="chat_clear"):
+                st.session_state["chat"] = []
+                st.rerun()
 
-        if answer.tool_calls:
-            st.markdown("---")
-            st.markdown(f"###### Evidence — {len(answer.tool_calls)} tool "
-                        f"call{'s' if len(answer.tool_calls) != 1 else ''}")
-            for i, call in enumerate(answer.tool_calls, 1):
-                args = ", ".join(f"{k}={v!r}" for k, v in call["args"].items())
-                with st.expander(f"{i}. `{call['name']}({args})`"):
-                    st.code(call["result"] or "(no output)", language="text")
-            st.caption(
-                "Every number in the answer above should appear in one of "
-                "these. One that does not is a fabrication, and worth telling "
-                "the model about in a follow-up.")
-        elif ask and not answer.error:
-            st.warning(
-                "The analyst answered without calling a single tool, which "
-                "means nothing in that answer is sourced from your data. "
-                "Treat it as opinion and ask again more specifically.",
-                icon="⚠️")
+        # A fixed-height box so the chart beside it does not jump every time a
+        # message lands, and so the input stays where the eye expects it.
+        with st.container(height=520, border=True):
+            if not st.session_state["chat"]:
+                st.caption(
+                    "Ask about the name on the left, the current books, "
+                    "breadth, or the backtest. Follow-ups work — the "
+                    "conversation is sent with each message, so "
+                    "\u201cwhat about its fundamentals?\u201d knows what "
+                    "\u201cit\u201d is.")
+            for turn in st.session_state["chat"]:
+                with st.chat_message(turn["role"]):
+                    st.markdown(turn["content"])
+                    for i, call in enumerate(turn.get("tool_calls", []), 1):
+                        args = ", ".join(f"{k}={v!r}"
+                                         for k, v in call["args"].items())
+                        with st.expander(f"{i}. `{call['name']}({args})`"):
+                            st.code(call["result"] or "(no output)",
+                                    language="text")
+
+        prompt = st.chat_input(
+            f"Ask about {chart_ticker}…" if chart_ticker else "Ask the analyst…",
+            key="chat_in", disabled=bool(blocker))
+        if blocker:
+            st.caption("💬 The chat needs the analyst configured — see above.")
+
+        if prompt:
+            # The agent gets the frames this app already loaded rather than
+            # re-reading the cache: a three-tool answer would otherwise spend a
+            # minute rebuilding a universe that is sitting in memory.
+            book = Book(universe=uni, prices=px, cfg=cfg, note=UNIVERSE_NOTE)
+            # The selected ticker rides along as context, so "is it extended?"
+            # means the name on screen rather than whatever was mentioned last.
+            asked = (f"[the chart on screen is showing {chart_ticker}] {prompt}"
+                     if chart_ticker else prompt)
+            history = [{"role": t["role"], "content": t["content"]}
+                       for t in st.session_state["chat"]]
+            st.session_state["chat"].append({"role": "user", "content": prompt})
+
+            with st.spinner(f"Asking {model_name}…"):
+                answer = analyse(
+                    asked, model=model_name.strip() or None, history=history,
+                    book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
+                    offline_fundamentals=not live_fundamentals)
+
+            if answer.disabled:
+                text = f"⏸️ **Switched off.** {answer.text}"
+            elif answer.error:
+                text = f"🚫 **Could not answer.** {answer.text}"
+            elif not answer.tool_calls:
+                # Say it in the transcript, not in a banner that the next
+                # message scrolls away from the answer it is about.
+                text = (answer.text + "\n\n---\n⚠️ *Answered without calling a "
+                        "tool, so nothing above is sourced from your data. "
+                        "Treat it as opinion.*")
+            else:
+                text = answer.text
+            st.session_state["chat"].append(
+                {"role": "assistant", "content": text,
+                 "tool_calls": answer.tool_calls})
+            st.rerun()
+
+        st.caption(
+            "Every number should appear in one of the tool calls folded under "
+            "the answer. One that does not is a fabrication. Only the last 20 "
+            "turns are re-sent, and tool output is never replayed — the model "
+            "calls the tool again when it needs the numbers twice."
+        )

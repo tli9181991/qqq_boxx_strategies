@@ -1038,8 +1038,25 @@ python -m qbs.agent "Why is the momentum book holding names the screen rejects?"
 python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
 ```
 
-Or use the dashboard's **🤖 Analyst** tab, which hands the agent the frames the app has
-already loaded instead of re-reading the cache.
+Or use the dashboard's **🤖 Analyst** tab: the same price/levels/momentum panel the
+picks tab shows on the left, and a **chat** on the right. The combo box lists the
+high-momentum names first, then the momentum book, then the rest of the universe, and
+the selected ticker rides along with each message — so *"is it extended?"* means the
+name on screen rather than whatever was mentioned last.
+
+The chat is a conversation, not a series of one-shot questions: the transcript is
+re-sent with each message, so follow-ups resolve. Two limits, both deliberate. Only the
+last 20 turns go back, because every turn re-sends the whole thing and an unbounded
+history grows the bill and the latency on every message. And **tool output is never
+replayed** — results run to thousands of lines, and the model can call the tool again
+when it needs the numbers twice.
+
+Each answer carries its tool calls folded underneath, and an answer that used **no**
+tools is labelled as opinion in the transcript itself rather than in a banner the next
+message scrolls away from.
+
+The tab hands the agent the frames the app has already loaded instead of re-reading the
+cache.
 
 ### Where the key comes from
 

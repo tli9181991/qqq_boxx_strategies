@@ -234,6 +234,8 @@ def analyse(
     agent=None,
     model: Optional[str] = None,
     recursion_limit: int = DEFAULT_RECURSION_LIMIT,
+    history: Optional[List[Dict[str, str]]] = None,
+    max_history: int = 20,
     **tool_kwargs,
 ) -> Answer:
     """Ask the analyst one question. Returns an `Answer`, never raises.
@@ -241,6 +243,17 @@ def analyse(
     Failures come back in `Answer.error` with the text explaining what went
     wrong, because the callers are a CLI and a Streamlit tab and both want to
     show the reason rather than a stack trace.
+
+    `history` is prior `{"role", "content"}` turns, oldest first, and is what
+    turns this from a question box into a conversation -- without it "what
+    about the second one?" has nothing to refer to.
+
+    Only the last `max_history` turns are sent. Every turn re-sends the whole
+    transcript, so an unbounded history grows the bill and the latency on
+    every message and eventually overruns the context. Tool RESULTS are not
+    replayed, only the questions and answers: the results are often thousands
+    of lines, and the model can call the tool again if it needs the numbers
+    a second time.
     """
     name = model or DEFAULT_MODEL
     # Checked before building anything: a switched-off analyst should not
@@ -254,9 +267,12 @@ def analyse(
     except Exception as exc:              # noqa: BLE001
         return Answer(text=str(exc), model=name, error=str(exc))
 
+    turns = [{"role": t.get("role", "user"), "content": t.get("content", "")}
+             for t in (history or []) if t.get("content")]
+    turns = turns[-max_history:] + [{"role": "user", "content": question}]
     try:
         state = agent.invoke(
-            {"messages": [{"role": "user", "content": question}]},
+            {"messages": turns},
             config={"recursion_limit": recursion_limit},
         )
     except Exception as exc:              # noqa: BLE001 -- API, quota, network
