@@ -878,17 +878,18 @@ def test_finviz_volume_filter_only_ever_removes_names():
         assert set(withv.holdings_log[dt]) <= set(base.holdings_log[dt])
 
 
-def test_finviz_min_turnover_needs_volumes():
+def test_finviz_min_dollar_volume_needs_volumes():
     """Silently ignoring a criterion the caller asked for would overstate the
     strategy, so an unusable parameter has to raise."""
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
     try:
-        finviz_momentum_screen(uni, safe, FinvizScreenParams(min_turnover=5e6))
+        finviz_momentum_screen(uni, safe,
+                               FinvizScreenParams(min_dollar_volume=5e6))
     except ValueError:
         return
-    raise AssertionError("min_turnover without volumes must raise")
+    raise AssertionError("min_dollar_volume without volumes must raise")
 
 
 def test_finviz_quarter_up_gate_removes_names():
@@ -1592,13 +1593,13 @@ def test_leader_mask_turnover_leg_only_removes_names():
 
 
 def test_leader_rule_is_the_stated_definition():
-    """A US stock or ADR over $5, turning over more than $5m/day, up more than
-    28% on the quarter. Each leg is pinned separately so a name can only fail
-    for the reason the test is about."""
+    """A US stock or ADR over $5, trading more than $5m of stock a day, up
+    more than 28% on the quarter. Each leg is pinned separately so a name can
+    only fail for the reason the test is about."""
     from qbs.breadth import BreadthParams, leader_mask
 
     p = BreadthParams()
-    assert (p.leader_min_price, p.leader_min_turnover,
+    assert (p.leader_min_price, p.leader_min_dollar_volume,
             p.leader_min_quarter_return) == (5.0, 5_000_000.0, 0.28)
 
     idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 5)
@@ -1641,6 +1642,28 @@ def test_the_quarterly_gate_is_28_percent_not_20():
         "the same name passes the old 20% gate, so the fixture is the gate's"
 
 
+def test_the_liquidity_leg_is_dollars_not_a_share_count():
+    """`leader_min_dollar_volume` is close x shares, a sum of money. Reading it
+    as a share count would be roughly a 100x different test for a typical
+    name, so both directions are pinned here."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    # Both names have a strong quarter and clear $5; only the price differs.
+    px = pd.DataFrame({"PRICEY": np.linspace(50.0, 100.0, n),
+                       "CHEAPISH": np.linspace(3.0, 6.0, n)}, index=idx)
+    # 200k shares: $20m/day for PRICEY, $1.2m/day for CHEAPISH.
+    vol = pd.DataFrame(200_000.0, index=idx, columns=px.columns)
+
+    last = leader_mask(px, volumes=vol).iloc[-1]
+    assert last["PRICEY"], "200k shares at $100 is $20m of stock a day"
+    assert not last["CHEAPISH"], "the same 200k shares at $6 is only $1.2m"
+    # A share-count reading would pass or fail them together, since the share
+    # counts are identical. That it splits them is the whole point.
+
+
 def test_every_leader_leg_is_strictly_greater_than():
     """Not pedantry on the price leg: a stock at exactly $5.00 is common, and
     `>=` would admit names the Finviz universe screen ("Over $5") excludes, so
@@ -1657,7 +1680,7 @@ def test_every_leader_leg_is_strictly_greater_than():
     assert at_price["EDGE"].iloc[-1] == 5.0, "the fixture must sit on the line"
     assert not leader_mask(at_price, volumes=vol).iloc[-1]["EDGE"]
 
-    # Exactly $5m of turnover: 500k shares at $10.
+    # Exactly $5m of dollar volume: 500k shares at $10.
     flat = pd.DataFrame({"EDGE": np.linspace(5.0, 10.0, n)}, index=idx)
     exact = pd.DataFrame(500_000.0, index=idx, columns=["EDGE"])
     assert flat["EDGE"].iloc[-1] * 500_000.0 == 5_000_000.0

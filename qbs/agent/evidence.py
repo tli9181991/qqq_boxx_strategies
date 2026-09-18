@@ -189,7 +189,8 @@ def name_report(book: Book, ticker: str, n_hold: int = 6) -> str:
                                     else "nothing; it clears every rule shown"))
     lines.append(
         "Two gates are missing because this universe carries closes only: the "
-        "screen's average-volume filter and the leader rule's turnover leg. "
+        "screen's average-volume filter and the leader rule's dollar-volume "
+        "leg. "
         "Clearing every rule above is necessary, not sufficient.")
     return "\n".join(lines)
 

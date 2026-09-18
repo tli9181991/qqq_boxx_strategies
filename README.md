@@ -831,7 +831,7 @@ Two tabs:
   strategy does not use with the name of the rule it claims to explain.
 
   Two legs are deliberately missing: the screen's average-volume filter and the leader
-  rule's turnover both need share volume, which this panel does not carry, so clearing
+  rule's dollar volume both need share volume, which this panel does not carry, so clearing
   every row shown is **necessary but not sufficient**. The momentum hurdle is BOXX over
   the same window where a safe asset is supplied, and zero where it is not — the row
   says which.
@@ -882,7 +882,7 @@ than an index summary. Two panels light up as a consequence:
   share / pool-weight / penetration / excess-pp table now computes. `Excess pp` is the
   column to read: a sector holding 20% of the leaders is unremarkable if it *is* 20% of
   the universe.
-- **The turnover leg of the leader screen** — volume arrives in the same yfinance
+- **The dollar-volume leg of the leader screen** — volume arrives in the same yfinance
   response as the closes, so the $5m/day test applies instead of being skipped.
 
 #### What counts as a high-momentum stock
@@ -893,8 +893,15 @@ greater-than, applied to every name in the universe on every date:
 | Leg | Threshold | Parameter |
 |---|---|---|
 | Any US stock or ADR, price | **> $5** | `leader_min_price` |
-| Dollar turnover (close × volume) | **> $5m/day** | `leader_min_turnover` |
+| Dollar volume (close × shares) | **> $5m/day** | `leader_min_dollar_volume` |
 | Quarterly gain, over 63 sessions | **> 28%** | `leader_min_quarter_return` |
+
+**Dollar volume is a sum of money**, `close × shares` — 200k shares at $100 is $20m a
+day and passes; the same 200k shares at $2 is $400k and does not. It is not a share
+count. The parameter was called `leader_min_turnover` until this was spelled out, which
+was a bad name: *turnover* elsewhere in this package means **portfolio** turnover — how
+much the book trades, the `5.7×` in the results table above — an entirely different
+quantity. One word for two things is worth a rename.
 
 Strictly greater-than on all three, which matters most on price: a stock sitting at
 exactly $5.00 is a common thing, and `>=` would admit names the universe screen itself
@@ -906,9 +913,9 @@ count and the sector table built on it, and nothing here claims the smaller grou
 performs better. It lives in a diff for that reason.
 
 **One interaction to know about.** The universe filter (`Average Volume > 300K`) runs
-*before* the turnover test, and it is not implied by it. A name over $16.67 can clear
-$5m/day turnover on fewer than 300k shares — a $100 stock trading 200k shares is $20m
-a day — and the universe screen drops it before the leader rule ever sees it. The
+*before* the dollar-volume test, and it is not implied by it. A name over $16.67 can
+clear $5m/day on fewer than 300k shares — a $100 stock trading 200k shares is $20m a
+day — and the universe screen drops it before the leader rule ever sees it. The
 share-volume floor comes from the source notebook's own universe definition rather than
 from the leader rule, and it is kept because widening it multiplies an already
 minutes-long screener fetch. So the leader count is a slight **under**-estimate,

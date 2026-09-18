@@ -792,10 +792,11 @@ with tab_market:
             f"quarterly gain > {p.leader_min_quarter_return:.0%} "
             f"({p.leader_quarter_days} sessions)")
     if breadth.has_volume:
-        note += f" · turnover > ${p.leader_min_turnover/1e6:.0f}M/day ✅"
+        note += f" · dollar volume > ${p.leader_min_dollar_volume/1e6:.0f}M/day ✅"
     else:
-        note += (f" · ⚠️ the turnover test (> ${p.leader_min_turnover/1e6:.0f}M/day) "
-                 "cannot run without volume, so this leader count is an over-estimate")
+        note += (f" · ⚠️ the dollar-volume test "
+                 f"(> ${p.leader_min_dollar_volume/1e6:.0f}M/day) cannot run "
+                 "without volume, so this leader count is an over-estimate")
     st.caption(md(note))
 
     c = st.columns(3)

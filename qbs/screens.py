@@ -273,7 +273,7 @@ def trend_template_screen(
 #      and then by distance below the 52-week high ascending
 #
 # Stage 3 is the selection rule, so that is what is reproduced here. Stage 2
-# is available through `min_quarter_return` / `min_turnover` but is off by
+# is available through `min_quarter_return` / `min_dollar_volume` but is off by
 # default, because in the notebook it feeds the breakdown table and nothing
 # else. Stage 1 is a set of absolute tests, which is what makes this a screen
 # rather than a ranking: on a bad day nothing passes and the book is in cash.
@@ -295,7 +295,8 @@ def finviz_momentum_screen(
                       too few names pass, sit here.
     volumes         : optional date x ticker share volume. Supplying it enables
                       the "Average Volume over 200K" criterion (and
-                      `min_turnover`, if set); without it both are skipped and
+                      `min_dollar_volume`, if set); without it both are skipped
+                      and
                       `volume_filter_applied` on the result is False.
 
     The ranking
@@ -349,10 +350,10 @@ def finviz_momentum_screen(
         avg_vol = vol.rolling(p.avg_volume_window,
                               min_periods=p.avg_volume_window).mean()
         passes &= avg_vol > p.min_avg_volume
-        if p.min_turnover is not None:
-            passes &= (px * vol) >= p.min_turnover
-    elif p.min_turnover is not None:
-        raise ValueError("min_turnover needs `volumes`; pass it or leave the "
+        if p.min_dollar_volume is not None:
+            passes &= (px * vol) >= p.min_dollar_volume
+    elif p.min_dollar_volume is not None:
+        raise ValueError("min_dollar_volume needs `volumes`; pass it or leave the "
                          "parameter at None")
 
     # ---- the notebook's stage-2 gate, if it was switched on ---------------

@@ -30,8 +30,8 @@ What this costs, because it is not free
   it, but the first run takes a while and the cache runs to tens of megabytes.
   Volume comes back in the same yfinance response as the closes, so keeping it
   costs no extra network -- only disk -- and it is what lets the momentum
-  screen apply its $5m turnover test instead of skipping it.
-* **The 300k share floor is not implied by that turnover test**, and runs
+  screen apply its $5m dollar-volume test instead of skipping it.
+* **The 300k share floor is not implied by that dollar-volume test**, and runs
   before it. Above ~$16.67 a name can clear $5m/day on fewer than 300k shares
   -- a $100 stock trading 200k shares is $20m a day -- and this filter drops
   it before the leader rule sees it. The floor is the source notebook's own
@@ -190,7 +190,7 @@ def load_universe_bars(
 
     Volume is kept because it arrives in the same yfinance response as the
     closes -- no extra network -- and it is the only thing standing between
-    the momentum screen and its $5m turnover test. `universe.load_universe_prices`
+    the momentum screen and its $5m dollar-volume test. `universe.load_universe_prices`
     deliberately discards it, which is right for the ranking strategies and
     wrong here.
 
