@@ -30,14 +30,13 @@ What this costs, because it is not free
   it, but the first run takes a while and the cache runs to tens of megabytes.
   Volume comes back in the same yfinance response as the closes, so keeping it
   costs no extra network -- only disk -- and it is what lets the momentum
-  screen apply its $5m dollar-volume test instead of skipping it.
-* **The 300k share floor is not implied by that dollar-volume test**, and runs
-  before it. Above ~$16.67 a name can clear $5m/day on fewer than 300k shares
-  -- a $100 stock trading 200k shares is $20m a day -- and this filter drops
-  it before the leader rule sees it. The floor is the source notebook's own
-  universe definition, kept because loosening it multiplies an already
-  minutes-long fetch, so the leader count is a slight UNDER-estimate
-  concentrated in high-priced names.
+  screen apply its 300k-share volume test instead of skipping it.
+* **This 300k floor and the leader rule's now measure the same thing**, which
+  makes the leader leg close to non-binding here: a name in this universe
+  already AVERAGES over 300k shares, so it fails the leg only on an unusually
+  quiet session. That is fine -- it is a sanity check rather than a filter --
+  but do not read the leader count as liquidity-screened beyond what this
+  universe filter already did.
 * **Finviz is a scrape, not an API.** It rate-limits, and the page layout is
   not a contract. Every entry point here returns None or raises a clear error
   rather than half a universe, because a breadth reading computed over a
@@ -190,7 +189,7 @@ def load_universe_bars(
 
     Volume is kept because it arrives in the same yfinance response as the
     closes -- no extra network -- and it is the only thing standing between
-    the momentum screen and its $5m dollar-volume test. `universe.load_universe_prices`
+    the momentum screen and its volume test. `universe.load_universe_prices`
     deliberately discards it, which is right for the ranking strategies and
     wrong here.
 

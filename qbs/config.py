@@ -172,10 +172,10 @@ class FinvizScreenParams:
 
     # ---- the notebook's stage-2 gate, off by default --------------------
     min_quarter_return: float | None = None   # 0.28 reproduces its 動力股 rule
-    # Dollar volume (close x shares), the same quantity the leader rule calls
-    # `leader_min_dollar_volume` -- NOT the portfolio turnover of `Ann.
-    # turnover`, which is what the old name here was confusable with.
-    min_dollar_volume: float | None = None    # 5e6, same rule -- needs volumes=
+    # Dollar volume (close x shares) -- NOT the portfolio turnover of `Ann.
+    # turnover`, which is what the old name here was confusable with, and no
+    # longer the same test as the leader rule's, which counts shares.
+    min_dollar_volume: float | None = None    # e.g. 5e6 -- needs volumes=
 
     # ---- stage-3 ranking ------------------------------------------------
     rs_lookback: int = 252              # the notebook's Perf_1Y

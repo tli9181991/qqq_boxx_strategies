@@ -1593,14 +1593,14 @@ def test_leader_mask_turnover_leg_only_removes_names():
 
 
 def test_leader_rule_is_the_stated_definition():
-    """A US stock or ADR over $5, trading more than $5m of stock a day, up
-    more than 28% on the quarter. Each leg is pinned separately so a name can
-    only fail for the reason the test is about."""
+    """A US stock or ADR over $5, trading more than 300k shares a day, up more
+    than 28% on the quarter. Each leg is pinned separately so a name can only
+    fail for the reason the test is about."""
     from qbs.breadth import BreadthParams, leader_mask
 
     p = BreadthParams()
-    assert (p.leader_min_price, p.leader_min_dollar_volume,
-            p.leader_min_quarter_return) == (5.0, 5_000_000.0, 0.28)
+    assert (p.leader_min_price, p.leader_min_volume,
+            p.leader_min_quarter_return) == (5.0, 300_000.0, 0.28)
 
     idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 5)
     n = len(idx)
@@ -1642,26 +1642,42 @@ def test_the_quarterly_gate_is_28_percent_not_20():
         "the same name passes the old 20% gate, so the fixture is the gate's"
 
 
-def test_the_liquidity_leg_is_dollars_not_a_share_count():
-    """`leader_min_dollar_volume` is close x shares, a sum of money. Reading it
-    as a share count would be roughly a 100x different test for a typical
-    name, so both directions are pinned here."""
+def test_the_liquidity_leg_counts_shares_and_ignores_price():
+    """`leader_min_volume` is a share count. Price does not enter it, so two
+    names on the same volume must agree however far apart they trade -- which
+    is exactly what the $5m dollar test it replaced would NOT have done."""
     from qbs.breadth import BreadthParams, leader_mask
 
     p = BreadthParams()
     idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
     n = len(idx)
-    # Both names have a strong quarter and clear $5; only the price differs.
+    # Same share volume, wildly different prices, both with a strong quarter.
     px = pd.DataFrame({"PRICEY": np.linspace(50.0, 100.0, n),
                        "CHEAPISH": np.linspace(3.0, 6.0, n)}, index=idx)
-    # 200k shares: $20m/day for PRICEY, $1.2m/day for CHEAPISH.
-    vol = pd.DataFrame(200_000.0, index=idx, columns=px.columns)
+    vol = pd.DataFrame(400_000.0, index=idx, columns=px.columns)
 
     last = leader_mask(px, volumes=vol).iloc[-1]
-    assert last["PRICEY"], "200k shares at $100 is $20m of stock a day"
-    assert not last["CHEAPISH"], "the same 200k shares at $6 is only $1.2m"
-    # A share-count reading would pass or fail them together, since the share
-    # counts are identical. That it splits them is the whole point.
+    assert last["PRICEY"] and last["CHEAPISH"], \
+        "400k shares is 400k shares; the dollar amounts are irrelevant"
+    # $2.4m/day for CHEAPISH -- it would have failed the old $5m floor, and
+    # that it passes now is the change, not an accident of the fixture.
+    assert px["CHEAPISH"].iloc[-1] * 400_000.0 < 5_000_000.0
+
+
+def test_a_thin_but_expensive_name_now_fails_the_volume_leg():
+    """The reverse direction of the same change. 50k shares of a $200 stock is
+    $10m a day: it cleared the old dollar floor comfortably and must fail a
+    300k share count. Neither test is a stricter version of the other."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    px = pd.DataFrame({"THIN": np.linspace(100.0, 200.0, n)}, index=idx)
+    vol = pd.DataFrame(50_000.0, index=idx, columns=["THIN"])
+
+    assert px["THIN"].iloc[-1] * 50_000.0 > 5_000_000.0, "clears the old floor"
+    assert not leader_mask(px, volumes=vol).iloc[-1]["THIN"]
 
 
 def test_every_leader_leg_is_strictly_greater_than():
@@ -1674,18 +1690,17 @@ def test_every_leader_leg_is_strictly_greater_than():
     idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
     n = len(idx)
 
-    # Exactly $5.00 on the last bar, with a strong quarter and huge turnover.
+    # Exactly $5.00 on the last bar, with a strong quarter and heavy volume.
     at_price = pd.DataFrame({"EDGE": np.linspace(2.0, 5.0, n)}, index=idx)
     vol = pd.DataFrame(1e7, index=idx, columns=["EDGE"])
     assert at_price["EDGE"].iloc[-1] == 5.0, "the fixture must sit on the line"
     assert not leader_mask(at_price, volumes=vol).iloc[-1]["EDGE"]
 
-    # Exactly $5m of dollar volume: 500k shares at $10.
+    # Exactly 300,000 shares.
     flat = pd.DataFrame({"EDGE": np.linspace(5.0, 10.0, n)}, index=idx)
-    exact = pd.DataFrame(500_000.0, index=idx, columns=["EDGE"])
-    assert flat["EDGE"].iloc[-1] * 500_000.0 == 5_000_000.0
+    exact = pd.DataFrame(300_000.0, index=idx, columns=["EDGE"])
     assert not leader_mask(flat, volumes=exact).iloc[-1]["EDGE"]
-    more = pd.DataFrame(500_001.0, index=idx, columns=["EDGE"])
+    more = pd.DataFrame(300_001.0, index=idx, columns=["EDGE"])
     assert leader_mask(flat, volumes=more).iloc[-1]["EDGE"], "one share over passes"
 
 

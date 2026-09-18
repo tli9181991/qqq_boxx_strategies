@@ -22,7 +22,7 @@ measurements, and only one of them is "market breadth":
 Two inputs are optional because this package does not carry them, and the
 metrics that need them are skipped rather than approximated:
 
-* **volume** -- the leadership screen's dollar-volume test ($5m/day) cannot run
+* **volume** -- the leadership screen's volume test (300k shares/day) cannot run
   without it. Pass `volumes=` to enable it. Without it the leader set is
   defined on price and quarterly return alone, which is strictly MORE
   permissive, so the leader count is an over-estimate.
@@ -55,15 +55,16 @@ class BreadthParams:
     atr_window: int = 14              # ... in units of ATR(14)
 
     # Momentum leaders ("動力股"). Three legs, all strictly greater-than:
-    # a US stock or ADR over $5, trading more than $5m of stock a day, up
-    # more than 28% on the quarter. The 28% was 20% until it was raised by hand --
+    # a US stock or ADR over $5, trading more than 300k shares a day, up more
+    # than 28% on the quarter. The 28% was 20% until it was raised by hand --
     # it is a preference about how selective "high momentum" should be, not a
     # measured optimum, so it lives in a diff rather than being tuned.
     leader_min_price: float = 5.0
-    # DOLLAR volume -- close x shares -- not a share count, and not the
-    # portfolio turnover that `Ann. turnover` and COST_BPS mean. One word for
-    # two quantities is what made this worth renaming.
-    leader_min_dollar_volume: float = 5_000_000.0   # needs `volumes`
+    # SHARES traded, not dollars: the leg is a share count and price does not
+    # enter it. 300k shares is $1.5m/day at $5 and $30m/day at $100, so this
+    # scales with price rather than holding a flat dollar floor -- which is
+    # the opposite of the $5m dollar-volume test it replaced.
+    leader_min_volume: float = 300_000.0            # needs `volumes`
     leader_quarter_days: int = 63              # ~one quarter of trading
     leader_min_quarter_return: float = 0.28
 
@@ -141,15 +142,22 @@ def leader_mask(
     """date x ticker boolean: was this name a momentum leader that day?
 
     The finviz notebook's `動力股` rule -- close ABOVE `leader_min_price`,
-    dollar volume ABOVE `leader_min_dollar_volume`, and a quarterly return
-    ABOVE `leader_min_quarter_return`. The dollar-volume leg is skipped when
-    no volume is supplied, which makes the set strictly larger.
+    share volume ABOVE `leader_min_volume`, and a quarterly return ABOVE
+    `leader_min_quarter_return`. The volume leg is skipped when no volume is
+    supplied, which makes the set strictly larger.
 
-    Dollar volume is `close * shares`, a sum of money: a $100 stock trading
-    200k shares clears a $5m test comfortably, while the same 200k shares at
-    $2 does not. It is NOT a share count, and it is NOT the portfolio turnover
-    reported as `Ann. turnover` -- a different quantity that happened to share
-    the word.
+    The volume leg counts SHARES. Price does not enter it, so it is worth
+    knowing which names this admits that a dollar test would not, and the
+    reverse: 400k shares of a $6 stock is $2.4m a day and passes here while
+    failing a $5m floor, and 50k shares of a $200 stock is $10m a day and
+    fails here while clearing that floor. Neither test is a stricter version
+    of the other.
+
+    At 300k it is also close to non-binding on either universe this package
+    uses. The Finviz screen already filters to names averaging over 300k
+    shares, and every Nasdaq-100 constituent trades far above it, so on most
+    days this leg removes nobody -- it catches an unusually quiet session
+    rather than an illiquid name.
 
     Strictly greater-than on all three, matching both the stated definition
     and Finviz's own "Over $5". It is not pedantry on the price leg: a stock
@@ -164,7 +172,7 @@ def leader_mask(
     ok = (px > p.leader_min_price) & (qtr > p.leader_min_quarter_return)
     if volumes is not None:
         vol = volumes.reindex(index=px.index, columns=px.columns)
-        ok &= (px * vol) > p.leader_min_dollar_volume
+        ok &= vol > p.leader_min_volume
     return ok.fillna(False)
 
 
@@ -425,7 +433,7 @@ def momentum_profile(
     Two honest gaps. The momentum hurdle is measured against `safe` (BOXX) when
     supplied and against zero when not -- a weaker test, and the row says
     which was used. And the two legs that need share volume (the screen's
-    average-volume filter, the leader rule's dollar volume) are omitted rather
+    average-volume filter, the leader rule's share volume) are omitted rather
     than guessed, so passing every row here is necessary but not sufficient.
 
     `Fmt` tells a caller how to render `Value`: `pct` a signed percentage,
@@ -564,10 +572,10 @@ def momentum_profile(
                      "Value": screen_qtr, "Fmt": "pct",
                      "Pass": bool(screen_qtr >= screen.min_quarter_return)
                      if pd.notna(screen_qtr) else None})
-    # The leader rule has three legs (`leader_mask`): price, dollar volume and
-    # quarterly gain. Two are shown. The dollar-volume leg needs share volume,
-    # which this panel does not carry, so it is left out rather than guessed --
-    # a name passing both rows below may still miss on dollar volume.
+    # The leader rule has three legs (`leader_mask`): price, share volume and
+    # quarterly gain. Two are shown. The volume leg needs share volume, which
+    # this panel does not carry, so it is left out rather than guessed -- a
+    # name passing both rows below may still miss on volume.
     rows.append({"Strategy": "Momentum leader",
                  "Rule": f"close over ${p.leader_min_price:,.0f}",
                  "Value": last, "Fmt": "price",

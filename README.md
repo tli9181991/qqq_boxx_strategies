@@ -831,7 +831,7 @@ Two tabs:
   strategy does not use with the name of the rule it claims to explain.
 
   Two legs are deliberately missing: the screen's average-volume filter and the leader
-  rule's dollar volume both need share volume, which this panel does not carry, so clearing
+  rule's share volume both need volume data, which this panel does not carry, so clearing
   every row shown is **necessary but not sufficient**. The momentum hurdle is BOXX over
   the same window where a safe asset is supplied, and zero where it is not — the row
   says which.
@@ -882,8 +882,8 @@ than an index summary. Two panels light up as a consequence:
   share / pool-weight / penetration / excess-pp table now computes. `Excess pp` is the
   column to read: a sector holding 20% of the leaders is unremarkable if it *is* 20% of
   the universe.
-- **The dollar-volume leg of the leader screen** — volume arrives in the same yfinance
-  response as the closes, so the $5m/day test applies instead of being skipped.
+- **The volume leg of the leader screen** — volume arrives in the same yfinance
+  response as the closes, so the 300k-share test applies instead of being skipped.
 
 #### What counts as a high-momentum stock
 
@@ -893,15 +893,30 @@ greater-than, applied to every name in the universe on every date:
 | Leg | Threshold | Parameter |
 |---|---|---|
 | Any US stock or ADR, price | **> $5** | `leader_min_price` |
-| Dollar volume (close × shares) | **> $5m/day** | `leader_min_dollar_volume` |
+| Share volume | **> 300,000/day** | `leader_min_volume` |
 | Quarterly gain, over 63 sessions | **> 28%** | `leader_min_quarter_return` |
 
-**Dollar volume is a sum of money**, `close × shares` — 200k shares at $100 is $20m a
-day and passes; the same 200k shares at $2 is $400k and does not. It is not a share
-count. The parameter was called `leader_min_turnover` until this was spelled out, which
-was a bad name: *turnover* elsewhere in this package means **portfolio** turnover — how
-much the book trades, the `5.7×` in the results table above — an entirely different
-quantity. One word for two things is worth a rename.
+**The volume leg counts shares, and price does not enter it.** That is worth stating
+because the leg previously held a flat $5m/day dollar floor, and neither test is a
+stricter version of the other:
+
+| | 400k shares at $6 | 50k shares at $200 |
+|---|---|---|
+| Dollar volume | $2.4m/day | $10m/day |
+| Old `> $5m/day` | ❌ | ✅ |
+| Now `> 300k shares` | ✅ | ❌ |
+
+A share count scales the dollar bar with price — 300k shares is $1.5m/day at $5 and
+$30m/day at $100 — where the old test held the money constant and let the share count
+float.
+
+**At 300k it is close to non-binding on either universe this package uses.** The Finviz
+screen already filters to names *averaging* over 300k shares, and every Nasdaq-100
+constituent trades far above it, so on most days this leg removes nobody: it catches an
+unusually quiet session rather than an illiquid name. Treat it as a sanity check, and
+do not read the leader count as liquidity-screened beyond what the universe filter
+already did. (Same-day volume, not a rolling average — a quiet holiday session can
+drop a name out for a day. Say so if you would rather it averaged.)
 
 Strictly greater-than on all three, which matters most on price: a stock sitting at
 exactly $5.00 is a common thing, and `>=` would admit names the universe screen itself
@@ -912,14 +927,11 @@ The 28% was 20% until it was raised by hand. It is a **preference about how sele
 count and the sector table built on it, and nothing here claims the smaller group
 performs better. It lives in a diff for that reason.
 
-**One interaction to know about.** The universe filter (`Average Volume > 300K`) runs
-*before* the dollar-volume test, and it is not implied by it. A name over $16.67 can
-clear $5m/day on fewer than 300k shares — a $100 stock trading 200k shares is $20m a
-day — and the universe screen drops it before the leader rule ever sees it. The
-share-volume floor comes from the source notebook's own universe definition rather than
-from the leader rule, and it is kept because widening it multiplies an already
-minutes-long screener fetch. So the leader count is a slight **under**-estimate,
-concentrated in high-priced names.
+**One interaction to know about.** The universe filter (`Average Volume > 300K`) now
+measures the same quantity as the leader rule's volume leg, at the same threshold — the
+only difference being that Finviz averages it and the leader rule reads the single
+session. That is why the leg barely bites in the US-universe mode: anything that got
+into the universe already clears it on a normal day.
 
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real
