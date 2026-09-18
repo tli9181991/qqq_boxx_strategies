@@ -688,9 +688,9 @@ notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
 tests/test_qbs.py 149 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
-tests/test_agent.py 53 tests: the analyst's data layers, .env loading and
-                  precedence, its tools, and one real agent run driven by a
-                  scripted model (no key, no network)
+tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
+                  precedence, the kill switch, its tools, and one real agent
+                  run driven by a scripted model (no key, no network)
 ```
 
 ### The one convention that matters
@@ -978,6 +978,7 @@ and a notebook all pick it up with nothing further to do. `.env` is gitignored;
 GOOGLE_API_KEY=...          # GEMINI_API_KEY works too — Google's docs use both
 QBS_GEMINI_MODEL=gemini-2.5-flash    # optional
 TAVILY_API_KEY=...                   # optional, better search than the default
+QBS_DISABLE_ANALYST=1                # optional kill switch, see below
 ```
 
 **A real environment variable always wins**, so `GOOGLE_API_KEY=... python -m qbs.agent
@@ -1007,6 +1008,36 @@ skipped, and the other lines still load.
 
 Streamlit will not re-import a package it has already loaded, so **restart the
 dashboard** after creating `.env`; a rerun alone will not pick the key up.
+
+### Switching it off
+
+```bash
+QBS_DISABLE_ANALYST=1          # environment, or a line in .env
+```
+
+No Gemini call is made from anywhere in the package: `check_requirements` reports it,
+`analyse` returns an `Answer` with `disabled=True` before loading anything, and
+`build_model` refuses — so nothing reaches the API even from a caller that skipped the
+check, and nothing is billed. **Everything that does not need the model keeps working**
+— the picks, momentum profiles, breadth, fundamentals, search, and every
+`python -m qbs.agent --report ...`. That is the point of a switch rather than an
+uninstall.
+
+Only an explicit off-word re-enables it — `0`, `false`, `no`, `off`, `none`,
+`disabled`. **Any other non-empty value switches it off.** That is deliberately not
+`qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
+as false: for a flag whose job is to stop spending money, an unrecognised value has to
+fail *safe*, so a half-remembered `QBS_DISABLE_ANALYST=disable` stops the spending
+rather than quietly leaving it running.
+
+`python -m qbs.agent --check` prints the switch on its own line and says **"DISABLED on
+purpose"** rather than "not ready", because a deliberate shutdown and a missing key
+have different remedies. The dashboard does the same: a paused notice with `unset`,
+not the "create a `.env`" instructions, which would send you to fix something that is
+not broken.
+
+Streamlit reads the environment once at start-up, so **restart the app** after changing
+this — a rerun alone will not pick it up.
 
 ### What it can look at
 

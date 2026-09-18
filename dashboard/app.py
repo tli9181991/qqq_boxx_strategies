@@ -880,17 +880,24 @@ with tab_analyst:
     st.subheader("Ask the analyst")
 
     from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
-    from qbs.agent.env import load_env
+    from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
     from qbs.agent.evidence import Book
     from qbs.agent.news import available_backends
 
     env_load = load_env()
+    switched_off = analyst_disabled()
     blocker = check_requirements()
     backends = available_backends()
 
     with st.sidebar:
         st.markdown("---")
         st.markdown("**Analyst**")
+        if switched_off:
+            # The controls below stay editable on purpose -- you can line the
+            # model and the toggles up while it is off -- but without this they
+            # read as an analyst that is simply misbehaving.
+            st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
+                       "saved for when it is switched back on.")
         model_name = st.text_input("Gemini model", DEFAULT_MODEL,
                                    help="Model names move faster than this app. "
                                         "Override here or set QBS_GEMINI_MODEL.")
@@ -903,7 +910,26 @@ with tab_analyst:
             "Fetch fundamentals live", value=True,
             help="Off reads only what is already cached in data/fundamentals/.")
 
-    if blocker:
+    if switched_off:
+        # A deliberate shutdown and a missing key have different remedies, and
+        # "create a .env and paste your key in" is actively wrong advice for
+        # someone who turned the analyst off on purpose.
+        st.info(
+            f"**The analyst is switched off.** `{DISABLE_VAR}` is set, so no "
+            "Gemini call is made from anywhere in this app — nothing is being "
+            "billed. Every other tab is unaffected, and so are the reports "
+            "below the model: picks, momentum profiles, breadth, fundamentals "
+            "and search all still run.", icon="⏸️")
+        st.markdown(
+            "```bash\n"
+            f"unset {DISABLE_VAR}          # or set it to 0\n"
+            "python -m qbs.agent --check\n"
+            "```")
+        st.caption(
+            "Streamlit reads the environment once at start-up, so **restart "
+            "the app** after changing this — a rerun alone will not pick it up."
+        )
+    elif blocker:
         st.warning(
             f"**The analyst is not configured.** {blocker}\n\n"
             "Everything else in this dashboard works without it — the analyst "
@@ -959,7 +985,9 @@ with tab_analyst:
                 book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
                 offline_fundamentals=not live_fundamentals)
 
-        if answer.error:
+        if answer.disabled:
+            st.info(f"**The analyst is switched off.** {answer.text}", icon="⏸️")
+        elif answer.error:
             st.error(f"**The analyst could not answer.** {answer.text}", icon="🚫")
         else:
             st.markdown(answer.text)

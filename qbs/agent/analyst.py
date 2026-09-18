@@ -27,6 +27,14 @@ It is still a language model. Treat its output as a research note from a
 capable but unaccountable junior, not as a result. The numbers in it are
 checkable against the tools; check them.
 
+Turning it off
+--------------
+`QBS_DISABLE_ANALYST=1` (environment or `.env`) stops every Gemini call from
+this package without uninstalling anything. `check_requirements` reports it,
+`analyse` returns an `Answer` with `disabled=True`, and `build_model` refuses
+-- so nothing reaches the API even from a caller that skipped the check.
+Everything that does not need the model keeps working.
+
 Requirements
 ------------
 `pip install -r requirements-agent.txt` and a Google AI Studio key, either
@@ -42,7 +50,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .env import load_env, resolve_google_key
+from .env import analyst_disabled, load_env, resolve_google_key
 
 DEFAULT_MODEL = os.environ.get("QBS_GEMINI_MODEL", "gemini-2.5-pro")
 DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
@@ -126,6 +134,7 @@ class Answer:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     model: str = ""
     error: Optional[str] = None
+    disabled: bool = False       # stopped by QBS_DISABLE_ANALYST, not a fault
 
     @property
     def tools_used(self) -> List[str]:
@@ -141,6 +150,14 @@ def check_requirements() -> Optional[str]:
     Returned rather than raised so a UI can render the remedy next to a
     disabled button instead of catching an exception to read its message.
     """
+    # The switch is checked before anything else so its message is the one
+    # that reaches the user. A missing key and a deliberate shutdown have
+    # different remedies, and "put a key in .env" is actively wrong advice
+    # for someone who turned the analyst off on purpose.
+    load_env()
+    off = analyst_disabled()
+    if off:
+        return off
     try:
         import langchain  # noqa: F401
         from langchain.agents import create_agent  # noqa: F401
@@ -152,12 +169,10 @@ def check_requirements() -> Optional[str]:
     except ImportError:
         return ("langchain-google-genai is not installed — "
                 "pip install -r requirements-agent.txt")
-    if resolve_google_key() is None:
-        # Importing `qbs.agent` already read any `.env`, but this function is
-        # reachable via `qbs.agent.analyst` directly. Re-reading is cheap and
-        # cannot clobber the shell, so the answer does not depend on which
-        # module the caller happened to import.
-        load_env()
+    # `load_env` above covers the case where this module was imported
+    # directly rather than through `qbs.agent` -- it is cached, cheap, and
+    # cannot clobber the shell, so the answer does not depend on which module
+    # the caller happened to import.
     if resolve_google_key() is None:
         return ("GOOGLE_API_KEY is not set — put it in a .env at the repo "
                 "root (cp .env.example .env) or export it. Create a key at "
@@ -172,6 +187,13 @@ def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
     Temperature defaults to 0. This agent reports numbers; there is nothing
     here that creative sampling improves and a great deal it can corrupt.
     """
+    # Enforced here as well as in `check_requirements`, because this is the
+    # last line before a billable call: a caller that builds the model
+    # directly, or a future code path that forgets to check, still cannot
+    # reach Gemini while the switch is on.
+    off = analyst_disabled()
+    if off:
+        raise RuntimeError(f"Refusing to build a Gemini client: {off}")
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     # Passed explicitly rather than left to the library's own GOOGLE_API_KEY
@@ -214,6 +236,12 @@ def analyse(
     show the reason rather than a stack trace.
     """
     name = model or DEFAULT_MODEL
+    # Checked before building anything: a switched-off analyst should not
+    # spend a second loading a universe it is never going to reason about.
+    off = analyst_disabled()
+    if off:
+        return Answer(text=f"The analyst is disabled — {off}", model=name,
+                      error=off, disabled=True)
     try:
         agent = agent or build_analyst(model=name, **tool_kwargs)
     except Exception as exc:              # noqa: BLE001

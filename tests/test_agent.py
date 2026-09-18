@@ -265,6 +265,86 @@ def test_the_summary_never_leaks_a_value(tmp_path):
     assert "GOOGLE_API_KEY" in summary, "names are fine, values are not"
 
 
+def test_the_kill_switch_reads_off_words_as_off():
+    """0/false/no/off/none/disabled leave it running; unset and empty too."""
+    for value in ("", "0", "false", "FALSE", "no", "off", "OFF", "none",
+                  "disabled", "  0  "):
+        assert env.analyst_disabled({env.DISABLE_VAR: value}) is None, value
+    assert env.analyst_disabled({}) is None
+
+
+def test_the_kill_switch_fails_safe_on_anything_else():
+    """It exists to stop spending money, so an unrecognised value must
+    DISABLE. `QBS_DISABLE_ANALYST=disable` is a natural thing to type, and
+    the repo's own `_env_bool` would read it as false and keep billing."""
+    for value in ("1", "true", "yes", "on", "disable", "temporarily", "y"):
+        assert env.analyst_disabled({env.DISABLE_VAR: value}), value
+
+
+def test_the_kill_switch_says_why_and_how_to_undo_it():
+    reason = env.analyst_disabled({env.DISABLE_VAR: "1"})
+    assert env.DISABLE_VAR in reason
+    assert "0" in reason or "Unset" in reason, "the remedy must be in the message"
+
+
+def test_a_disabled_analyst_answers_without_calling_anything(monkeypatch):
+    from qbs.agent import analyst
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "would-work-if-enabled")
+
+    answer = analyst.analyse("what do we hold?")
+    assert answer.disabled, "the caller must be able to tell this from a fault"
+    assert answer.tool_calls == [], "nothing should have run"
+    assert env.DISABLE_VAR in answer.text
+
+
+def test_the_switch_outranks_a_missing_key(monkeypatch):
+    """Two different remedies. Telling someone who switched the analyst off to
+    go and create a `.env` sends them to fix a thing that is not broken."""
+    from qbs.agent import analyst
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    _no_key(monkeypatch)
+    blocker = analyst.check_requirements()
+    assert env.DISABLE_VAR in blocker
+    assert "aistudio" not in blocker, "the key remedy must not be offered here"
+
+
+def test_no_gemini_client_can_be_built_while_the_switch_is_on(monkeypatch):
+    """The last line before a billable call. A caller that builds the model
+    directly, or a future path that forgets to check, still cannot reach the
+    API."""
+    from qbs.agent import analyst
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "would-work-if-enabled")
+    for build in (analyst.build_model, analyst.build_analyst):
+        with pytest.raises(RuntimeError) as excinfo:
+            build()
+        assert env.DISABLE_VAR in str(excinfo.value)
+
+
+def test_the_switch_leaves_everything_else_working(monkeypatch):
+    """The point of a switch rather than an uninstall: the reports under the
+    model do not need it and must not notice."""
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    book = _book()
+    assert "CURRENT PICKS" in ev.picks_report(book)
+    assert "[Gates each strategy applies]" in ev.name_report(
+        book, book.universe.columns[0])
+    assert "MARKET BREADTH" in ev.breadth_report(book)
+    # And the tools still build -- only the model is off.
+    from qbs.agent.tools import build_tools, tool_names
+    assert "current_picks" in tool_names(build_tools(book=book))
+
+
+def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
+    """It is settable from `.env`, so it has to be on the recognised list --
+    otherwise the loader would flag the real thing as an unknown key."""
+    assert env.DISABLE_VAR in env.KNOWN_KEYS
+    path = _write_env(tmp_path, f"{env.DISABLE_VAR}=1\n")
+    load = env.load_env(path, environ={})
+    assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
+
+
 def test_either_google_key_name_resolves():
     """Google's own docs use both names, and people copy whichever they read.
     Accepting one and ignoring the other reports a missing key that is

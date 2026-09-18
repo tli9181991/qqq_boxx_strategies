@@ -29,6 +29,12 @@ and reports what it skipped, so `GOOGLE_API_KEY=... python -m qbs.agent` does
 what you would expect even with a `.env` sitting next to it. Pass
 `override=True` only if you mean the opposite.
 
+The kill switch
+---------------
+`QBS_DISABLE_ANALYST=1` -- here rather than in `analyst.py` because it is read
+the same way as the keys, from the environment or a `.env`, and `--check`
+reports all of them together. See `analyst_disabled`.
+
 Secrets
 -------
 Nothing here returns, logs or renders a value -- only key names and where
@@ -46,10 +52,18 @@ from typing import Dict, List, Optional, Tuple
 # The repository root: qbs/agent/env.py -> qbs/agent -> qbs -> root
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# The kill switch. Set it and no Gemini call is made from anywhere in this
+# package -- see `analyst_disabled`.
+DISABLE_VAR = "QBS_DISABLE_ANALYST"
+
 # The keys this package looks for. Listed so `--check` can report on all of
 # them, and so a typo in a `.env` can be pointed out rather than ignored.
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
-              "QBS_GEMINI_MODEL")
+              "QBS_GEMINI_MODEL", DISABLE_VAR)
+
+# Values that mean "switch is off, carry on". Everything else non-empty
+# disables -- see `analyst_disabled` for why this is not `_env_bool`.
+OFF_VALUES = ("0", "false", "no", "off", "none", "disabled")
 
 
 @dataclass
@@ -215,6 +229,34 @@ def load_env(path: Optional[str] = None, override: bool = False,
     except OSError:
         pass
     return _done(out)
+
+
+def analyst_disabled(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Why the analyst is switched off, or None if it is not.
+
+    `QBS_DISABLE_ANALYST=1` stops every Gemini call in this package: the model
+    is never constructed, so nothing reaches the API and nothing is billed.
+    Everything that does not need the model keeps working -- the picks, the
+    momentum profile, breadth, fundamentals, search, `--report`. That is the
+    point of a switch rather than an uninstall.
+
+    Deliberately NOT `qbs.live.config._env_bool`, which treats anything
+    outside ("1", "true", "yes", "on") as false. For a flag that exists to
+    stop spending money, an unrecognised value must fail SAFE: only an
+    explicit off-word re-enables, so `QBS_DISABLE_ANALYST=disable` -- a
+    perfectly natural thing to type -- switches it off rather than quietly
+    leaving it on.
+
+    Returns a sentence, not a bool, because every caller needs to tell
+    somebody why: a blank panel with no reason is the thing this avoids.
+    """
+    env = os.environ if environ is None else environ
+    raw = (env.get(DISABLE_VAR) or "").strip()
+    if not raw or raw.lower() in OFF_VALUES:
+        return None
+    return (f"the analyst is switched off by {DISABLE_VAR}={raw!r}. "
+            f"Unset it (or set it to 0) to turn Gemini back on; everything "
+            f"that does not call the model is unaffected.")
 
 
 def resolve_google_key(environ: Optional[Dict[str, str]] = None) -> Optional[str]:

@@ -11,6 +11,9 @@ answer looks wrong, diff it against the report rather than re-prompting.
 
 The key comes from a `.env` at the repository root (see `.env.example`) or
 from the environment, which wins. `--check` says which, without printing it.
+
+`QBS_DISABLE_ANALYST=1` switches Gemini off without uninstalling anything.
+`--report` and everything else in this package carry on working.
 """
 
 from __future__ import annotations
@@ -44,9 +47,11 @@ def main(argv=None) -> int:
 
     if args.check:
         from .analyst import DEFAULT_MODEL, check_requirements
-        from .env import KNOWN_KEYS, load_env, resolve_google_key
+        from .env import (DISABLE_VAR, KNOWN_KEYS, analyst_disabled, load_env,
+                          resolve_google_key)
         from .news import available_backends
         loaded = load_env()
+        off = analyst_disabled()
         missing = check_requirements()
         print(f".env:            {loaded.summary()}")
         # Key names and set/unset only. Printing a secret to a terminal puts
@@ -56,7 +61,17 @@ def main(argv=None) -> int:
         print(f"google key:      {'found' if resolve_google_key() else 'MISSING'}")
         print(f"model:           {DEFAULT_MODEL}")
         print(f"search backends: {', '.join(available_backends()) or 'none'}")
-        print(f"analyst:         {'ready' if not missing else 'NOT ready — ' + missing}")
+        # The switch gets its own line and its own word. "NOT ready" reads as
+        # a misconfiguration and sends someone hunting for one; "disabled on
+        # purpose" tells them they already know the cause.
+        state = os.environ.get(DISABLE_VAR)
+        print(f"{DISABLE_VAR}: {state!r}" if state else
+              f"{DISABLE_VAR}: unset (the analyst may call Gemini)")
+        if off:
+            print("analyst:         DISABLED on purpose — "
+                  f"unset {DISABLE_VAR} to turn it back on")
+        else:
+            print(f"analyst:         {'ready' if not missing else 'NOT ready — ' + missing}")
         return 0 if not missing else 1
 
     if args.report:
