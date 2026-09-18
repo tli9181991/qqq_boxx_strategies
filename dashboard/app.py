@@ -139,19 +139,29 @@ def load_data(download_start: str, online: bool, force: bool, _token: int):
 @st.cache_data(show_spinner="Building selections…")
 def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
                      exit_rank: int, n_screen: int) -> Dict[str, pd.DataFrame]:
-    """Daily holdings for each strategy, as date x (tickers, buys, sells)."""
+    """Daily holdings for each strategy, plus whether the volume leg ran.
+
+    Returns `(frames, volume_applied)`. The screen RAISES on a volume leg it
+    cannot apply rather than skipping one, so this either supplies volumes or
+    opts out explicitly -- and the caller has to be told which, because
+    without the leg the screen is more permissive than its own definition.
+    """
     from qbs.config import MomentumParams
+    from qbs.universe import load_universe_volumes
 
     out: Dict[str, pd.DataFrame] = {}
 
     mom = cross_sectional_momentum(
         _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
-    # `min_volume=None` opts the screen's volume leg out EXPLICITLY, because
-    # this universe is closes-only and the screen raises rather than dropping
-    # a leg of the definition silently. The caption under the column says so;
-    # without volume the screen is more permissive than its own definition.
-    fin = finviz_momentum_screen(
-        _uni, _safe, FinvizScreenParams(n_hold=n_screen, min_volume=None))
+
+    vols = load_universe_volumes(list(_uni.columns))
+    volume_applied = vols is not None and not vols.empty
+    screen = FinvizScreenParams(n_hold=n_screen)
+    if volume_applied:
+        vols = vols.reindex(index=_uni.index).ffill()
+    else:
+        vols, screen = None, FinvizScreenParams(n_hold=n_screen, min_volume=None)
+    fin = finviz_momentum_screen(_uni, _safe, screen, volumes=vols)
 
     for key, sig in (("momentum", mom), ("finviz", fin)):
         ev = sig.events
@@ -167,7 +177,7 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
             })
         out[key] = pd.DataFrame(rows).set_index("date")
 
-    return out
+    return out, volume_applied
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -368,8 +378,8 @@ st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
-selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank),
-                              int(n_screen))
+selections, SCREEN_VOLUME_APPLIED = build_selections(
+    uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
 
 tab_picks, tab_market, tab_analyst = st.tabs(
@@ -406,14 +416,20 @@ with tab_picks:
                 # Say it here rather than leaving someone to wonder why a
                 # "top-20" shows 6 names.
                 short = len(names) < int(n_screen)
-                st.caption(
+                p_scr = FinvizScreenParams()
+                vol_note = (
+                    f"volume > {p_scr.min_volume/1e3:,.0f}k shares/day ✅"
+                    if SCREEN_VOLUME_APPLIED else
+                    f"**the volume leg (> {p_scr.min_volume/1e3:,.0f}k "
+                    "shares/day) is not applied** — no volumes in this cache, "
+                    "so the screen is more permissive than its own definition")
+                st.caption(md(
                     (f"{len(names)} of {int(n_screen)} slots — fewer names "
                      "cleared the filter than the screen ranks down to. "
                      if short else "")
-                    + "Filter: close > \$5 · quarterly gain > 28%. "
-                    "**The volume leg (> 300k shares/day) is not applied** — "
-                    "this universe carries closes only, so the screen is more "
-                    "permissive than its own definition.")
+                    + f"Filter: close > ${p_scr.min_price:.0f} · "
+                    f"quarterly gain > {p_scr.min_quarter_return:.0%} · "
+                    + vol_note))
             if names:
                 st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
                              width="stretch",

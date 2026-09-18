@@ -109,7 +109,7 @@ class MomentumParams:
     lookback_months: int = 6
     skip_months: int = 1          # 6-1 momentum: skip the most recent month
     n_hold: int = 6
-    exit_rank: int = 10           # hysteresis band; == n_hold means no band
+    exit_rank: int = 8            # hysteresis band; == n_hold means no band
     rebalance: str = "daily"      # "daily" | "ME" (month end) | "W-FRI"
     weighting: str = "equal"      # "equal" | "inv_vol"
     absolute_filter: bool = True  # a name must also beat the safe asset
@@ -454,6 +454,18 @@ class Config:
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
     dd_stop: DrawdownStopParams = field(default_factory=DrawdownStopParams)
     dd_stop_benchmark: str = RISK_ASSET   # the series dd_stop.qqq_drawdown reads
+    # Restrict the ranker to the dashboard's momentum-leader set before it
+    # picks the top N -- close over $5, over 300k shares a day, up more than
+    # 28% on the quarter (the thresholds live in `breadth.BreadthParams`, so
+    # there is one definition and the dashboard and the ranker cannot drift).
+    #
+    # Off, and measured harmful: on 2020-2026 it takes CAGR from 22.9% to 8.1%
+    # and max drawdown from -17.6% to -30.4%, at 26x annual turnover against
+    # 11x. The leader set is not stable enough to hold a book -- a name crosses
+    # the quarterly threshold in and out constantly, and since the mask forces
+    # an exit the whole risk sleeve churns. Every threshold from 0% to 28% was
+    # worse than no filter, in every window tested.
+    use_leader_filter: bool = False
 
     def to_dict(self) -> Dict:
         return asdict(self)

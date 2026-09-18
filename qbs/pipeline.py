@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
@@ -13,7 +13,7 @@ from .config import (
 )
 from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
 from .engine import BacktestResult, run_backtest
-from .metrics import format_summary, summary_table
+from .metrics import format_summary, summarise, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2, drawdown_stop,
@@ -140,6 +140,10 @@ def run(
                       f"names are exactly the ones that failed.")
             eligible = membership_mask(uni.index, list(uni.columns), pit_membership)
 
+        if cfg.use_leader_filter:
+            from .breadth import leader_eligibility
+            eligible = leader_eligibility(uni, volumes=None, existing=eligible)
+
         mom_sig = cross_sectional_momentum(
             uni, prices[SAFE_ASSET], cfg.momentum, eligible=eligible,
         )
@@ -191,14 +195,26 @@ def run(
         # universe would be today's screener result applied to history --
         # i.e. names chosen for having gone up. See the README.
         if with_finviz:
-            # The universe here is closes-only, so the screen's volume leg is
-            # opted out EXPLICITLY rather than skipped: the screen raises on a
-            # leg it cannot apply, and this backtest is more permissive than
-            # the live definition as a result. `volume_filter_applied` on the
-            # returned signal records that.
-            screen = replace(cfg.finviz, min_volume=None)
+            # The screen's volume leg runs when the cache has volumes and is
+            # opted out EXPLICITLY when it does not -- the screen raises on a
+            # leg it cannot apply rather than skipping one, so this has to be
+            # a decision, not an omission. Without it the backtest is more
+            # permissive than the live definition, and `volume_filter_applied`
+            # on the returned signal records which happened.
+            from .universe import load_universe_volumes
+
+            fin_vols = load_universe_volumes(list(uni.columns))
+            if fin_vols is not None and not fin_vols.empty:
+                fin_vols = fin_vols.reindex(index=uni.index).ffill()
+                screen = cfg.finviz
+            else:
+                fin_vols, screen = None, replace(cfg.finviz, min_volume=None)
+                print("[finviz] WARNING: no cached volumes, so the screen's "
+                      "300k-share leg is NOT applied -- it is more permissive "
+                      "than the live definition. Re-download the universe "
+                      "(run_backtest.py --refresh) to enable it.")
             signals["finviz"] = finviz_momentum_screen(
-                uni, prices[SAFE_ASSET], screen)
+                uni, prices[SAFE_ASSET], screen, volumes=fin_vols)
 
     # ---- backtest everything on identical assumptions -------------------
     results: Dict[str, BacktestResult] = {}
@@ -217,6 +233,66 @@ def run(
 
     return Lab(prices=prices, signals=signals, results=results, rf=rf, config=cfg,
                universe=universe_prices, combined=combined, vix=vix)
+
+
+def sweep_volume(
+    lab,
+    min_ratios: Sequence[float] = (0.0, 0.8, 1.0, 1.2, 1.5),
+    max_ratios: Sequence[float] = (0.0,),
+    fast: int = 5,
+    slow: int = 50,
+) -> pd.DataFrame:
+    """Rebuild the momentum book under volume filters and score each.
+
+    Needs `universe_volumes.csv`, written alongside the closes by
+    `load_universe_prices`. Returns an empty frame when it is absent rather
+    than pretending a filter ran -- a cache from before volumes were kept is a
+    missing measurement, not a result.
+
+    The filter gates entry AND forces an exit, which is what an eligibility
+    mask does. That is the strict reading and the one worth measuring first:
+    on the leader screen it was the forced exits, not the screening, that did
+    the damage.
+    """
+    from .breadth import volume_eligibility
+    from .universe import load_universe_volumes
+
+    # `lab.universe` is the frame as it arrived: unreindexed and not yet pruned
+    # by min_history, so it carries columns the engine never priced. Taking it
+    # from `combined` is the same idiom sweep_band uses, and the reason this is
+    # not a matter of taste -- a weight on a column the return frame lacks is a
+    # KeyError deep inside run_backtest.
+    if lab.combined is None:
+        return pd.DataFrame()
+    uni = lab.combined.drop(columns=[SAFE_ASSET])
+    vols = load_universe_volumes(list(uni.columns))
+    if vols is None or vols.empty:
+        return pd.DataFrame()
+    vols = vols.reindex(index=uni.index).ffill()
+
+    rows = []
+    for lo in min_ratios:
+        for hi in max_ratios:
+            gate = (None if not (lo or hi) else
+                    volume_eligibility(vols, min_ratio=lo, max_ratio=hi,
+                                       fast=fast, slow=slow))
+            mom = cross_sectional_momentum(uni, lab.prices[SAFE_ASSET],
+                                           lab.config.momentum, eligible=gate)
+            vt = book_vol_target(mom, lab.combined, lab.config.book_vol,
+                                 lag=lab.config.execution_lag)
+            sig = drawdown_stop(vt, lab.combined, lab.config.dd_stop,
+                                lag=lab.config.execution_lag,
+                                benchmark=lab.prices.get(lab.config.dd_stop_benchmark))
+            res = run_backtest(lab.combined, sig, lag=lab.config.execution_lag,
+                               cost_bps=lab.config.cost_bps,
+                               slippage_bps=lab.config.slippage_bps)
+            st = summarise(res, rf=lab.rf)
+            rows.append({"min_ratio": lo, "max_ratio": hi,
+                         "CAGR": st["CAGR"], "MaxDD": st["Max drawdown"],
+                         "Calmar": st["Calmar"],
+                         "Turnover": st["Ann. turnover"],
+                         "AvgRisk": st["Avg risk exposure"]})
+    return pd.DataFrame(rows)
 
 
 def sweep_band(

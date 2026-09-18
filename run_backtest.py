@@ -43,6 +43,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="CSV of date,ticker point-in-time index membership")
     p.add_argument("--sweep-band", action="store_true",
                    help="also print the hysteresis-band sensitivity table")
+    p.add_argument("--sweep-volume", action="store_true",
+                   help="also print the volume-filter table (needs a cached "
+                        "universe_volumes.csv, written by a non-offline run)")
     p.add_argument("--vix-exit", type=float, default=None,
                    help="VIX close above this switches the book to cash")
     p.add_argument("--vix-entry", type=float, default=None,
@@ -220,6 +223,19 @@ def main(argv=None) -> int:
         print("\nVIX trigger sensitivity (read 'Time invested' first):")
         with pd.option_context("display.width", 200):
             print(svx.round(4).to_string(index=False))
+
+    if args.sweep_volume and "momentum" in lab.signals:
+        from qbs.pipeline import sweep_volume
+        sv = sweep_volume(lab)
+        print("\nVolume filter on the ranker "
+              "(min_ratio = recent volume over its own 50d average):")
+        if sv.empty:
+            print("  no universe_volumes.csv yet -- run once without --offline "
+                  "to cache it, then re-run this.")
+        else:
+            with pd.option_context("display.width", 200):
+                print(sv.round(4).to_string(index=False))
+            print("  min_ratio 0.0 is the unfiltered book; compare the rest to it.")
 
     if args.sweep_band and "momentum" in lab.signals:
         sw = sweep_band(lab, n_holds=[cfg.momentum.n_hold],

@@ -183,7 +183,7 @@ Cross-sectional momentum: rank the whole index, hold the strongest names.
 |---|---|
 | Score | **6-1 momentum** — return from 6 months ago to 1 month ago |
 | Hold | the top `n_hold` (6), equal weight per *slot* |
-| Exit | only once a name falls past `exit_rank` (10) — the hysteresis band |
+| Exit | only once a name falls past `exit_rank` (8) — the hysteresis band |
 | Filter | a name must also beat BOXX's own return over the same window, else that slot goes to cash |
 | Rebalance | daily by default, matching the intended live design |
 

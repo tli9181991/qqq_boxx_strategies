@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dataclasses import replace
 
 from qbs.config import (
-    BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams, GEMParams,
-    MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
+    SAFE_ASSET, BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams,
+    GEMParams, MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -2530,3 +2530,194 @@ def test_a_missing_safe_asset_is_rejected():
 
     with pytest.raises(ValueError, match="safe asset"):
         drawdown_stop(bad, frame, DrawdownStopParams(enabled=True))
+
+
+# --------------------------------------------------------------------------
+# The momentum-leader filter as a pre-screen for the ranker
+# --------------------------------------------------------------------------
+
+def test_leader_eligibility_is_the_dashboards_own_mask():
+    """One definition. The screen and the ranker must not drift apart."""
+    from qbs.breadth import BreadthParams, leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    p = BreadthParams()
+
+    pd.testing.assert_frame_equal(leader_eligibility(px, p=p), leader_mask(px, p=p))
+
+
+def test_leader_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    half = pd.DataFrame(False, index=px.index, columns=px.columns)
+    half.iloc[:, :5] = True
+
+    out = leader_eligibility(px, existing=half)
+
+    assert not out.iloc[:, 5:].to_numpy().any(), "the existing mask was ignored"
+    assert (out == (leader_mask(px) & half)).to_numpy().all()
+
+
+def test_the_leader_filter_is_off_and_inert_by_default():
+    cfg = Config()
+    assert cfg.use_leader_filter is False
+
+    px = synthetic_prices()
+    lab_off = run(cfg=cfg, prices=px, universe_prices=synthetic_universe(
+        n=20, start="2023-06-01").reindex(px.index).ffill(),
+        offline=True, fetch_universe=False, with_vix=False)
+    assert "momentum" in lab_off.signals
+
+
+def test_the_leader_filter_narrows_the_book_when_switched_on():
+    """Switched on it must actually bind, and unfilled slots go to cash."""
+    from dataclasses import replace as _replace
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01").reindex(px.index).ffill()
+
+    off = run(cfg=Config(), prices=px, universe_prices=uni, offline=True,
+              fetch_universe=False, with_vix=False)
+    cfg_on = Config()
+    cfg_on.use_leader_filter = True
+    on = run(cfg=cfg_on, prices=px, universe_prices=uni, offline=True,
+             fetch_universe=False, with_vix=False)
+
+    w_off = off.signals["momentum"].weights
+    w_on = on.signals["momentum"].weights
+    risk = [c for c in w_on.columns if c != SAFE_ASSET]
+
+    assert w_on[risk].sum(axis=1).mean() < w_off[risk].sum(axis=1).mean(), \
+        "the filter did not reduce exposure at all"
+    # Every weight it does hold is one the unfiltered book could also hold.
+    assert (w_on[risk].to_numpy() > 0).sum() < (w_off[risk].to_numpy() > 0).sum()
+
+
+def test_a_disabled_stop_never_reports_itself_as_blocking():
+    """`blocked` must mean the book was held flat, not that it might have been.
+
+    A risk readout claiming the breaker is halting a fully invested book is
+    worse than none: it is the one line an operator would trust in a hurry.
+    """
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    off = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+    on = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                       lag=cfg.execution_lag)
+
+    assert not off.diagnostics["blocked"].astype(bool).any()
+    assert on.diagnostics["blocked"].astype(bool).any()
+    # The condition itself is reported either way, so a dry run still shows it.
+    pd.testing.assert_series_equal(off.diagnostics["dd_flag"], on.diagnostics["dd_flag"])
+    pd.testing.assert_frame_equal(off.weights, vt.weights)
+
+
+# --------------------------------------------------------------------------
+# Volume filters on the ranker
+# --------------------------------------------------------------------------
+
+def _vol_fixture():
+    idx = pd.bdate_range("2024-01-01", periods=200)
+    return pd.DataFrame({
+        "SURGE": np.r_[np.full(195, 1e6), np.full(5, 4e6)],
+        "QUIET": np.r_[np.full(195, 1e6), np.full(5, 2e5)],
+        "FLAT":  np.full(200, 1e6),
+    }, index=idx)
+
+
+def test_relative_volume_is_a_ratio_to_the_names_own_norm():
+    from qbs.breadth import relative_volume
+
+    r = relative_volume(_vol_fixture()).iloc[-1]
+
+    assert r["SURGE"] > 2.5 and r["QUIET"] < 0.4
+    assert r["FLAT"] == pytest.approx(1.0)
+
+
+def test_an_unconfigured_volume_filter_admits_everything():
+    """A filter nobody asked for must never quietly remove a name."""
+    from qbs.breadth import volume_eligibility
+
+    assert volume_eligibility(_vol_fixture()).to_numpy().all()
+
+
+def test_each_volume_leg_selects_what_it_claims():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    assert [c for c in v if volume_eligibility(v, min_ratio=1.5)[c].iloc[-1]] == ["SURGE"]
+    assert [c for c in v if volume_eligibility(v, max_ratio=0.5)[c].iloc[-1]] == ["QUIET"]
+    # The absolute floor is the near-useless one on a large-cap index.
+    assert [c for c in v if volume_eligibility(v, min_shares=3e5)[c].iloc[-1]] \
+        == ["SURGE", "FLAT"]
+
+
+def test_volume_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    only_flat = pd.DataFrame(False, index=v.index, columns=v.columns)
+    only_flat["FLAT"] = True
+
+    out = volume_eligibility(v, min_shares=3e5, existing=only_flat)
+
+    assert not out["SURGE"].any(), "the existing mask was ignored"
+    assert out["FLAT"].iloc[-1]
+
+
+def test_missing_volumes_read_as_none_rather_than_failing(tmp_path):
+    """A cache written before volumes were kept must not break a price load."""
+    from qbs.universe import load_universe_volumes
+
+    assert load_universe_volumes(cache_dir=str(tmp_path)) is None
+
+
+def test_sweep_volume_scores_the_book_it_can_actually_price(tmp_path, monkeypatch):
+    """`lab.universe` carries columns the engine never priced.
+
+    It is the frame as it arrived -- not reindexed, not pruned by min_history --
+    so building weights from it puts a position on a ticker the return frame
+    lacks, and run_backtest raises a KeyError from deep inside. The sweep must
+    take its universe from `combined`, as the other sweeps do.
+    """
+    from qbs import pipeline
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01")
+    # A column with almost no history: pruned out of `combined`, still present
+    # in `universe`. This is exactly the shape that broke it.
+    uni["SPARSE"] = np.nan
+    uni.iloc[-5:, uni.columns.get_loc("SPARSE")] = 100.0
+
+    lab = run(cfg=Config(), prices=px, universe_prices=uni.reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    assert "SPARSE" in lab.universe.columns
+    assert "SPARSE" not in lab.combined.columns, "the fixture no longer bites"
+
+    vols = pd.DataFrame(1e6, index=lab.combined.index,
+                        columns=lab.combined.drop(columns=[SAFE_ASSET]).columns)
+    monkeypatch.setattr(pipeline, "load_universe_volumes", lambda *a, **k: vols,
+                        raising=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: vols)
+
+    out = sweep_volume(lab, min_ratios=(0.0, 1.0))
+
+    assert not out.empty
+    assert list(out["min_ratio"]) == [0.0, 1.0]
+
+
+def test_sweep_volume_says_nothing_rather_than_zero_without_a_cache(monkeypatch):
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    lab = run(cfg=Config(), prices=px,
+              universe_prices=synthetic_universe(n=20, start="2023-06-01")
+              .reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: None)
+
+    assert sweep_volume(lab).empty, "a missing cache must not read as a result"
