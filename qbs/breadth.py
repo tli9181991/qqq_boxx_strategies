@@ -176,6 +176,25 @@ def leader_mask(
     return ok.fillna(False)
 
 
+def leader_eligibility(
+    closes: pd.DataFrame,
+    volumes: Optional[pd.DataFrame] = None,
+    p: Optional[BreadthParams] = None,
+    existing: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """`leader_mask`, shaped for the ranker's `eligible` argument.
+
+    Kept here rather than at the call sites so the dashboard's definition of a
+    momentum leader and the ranker's are the same object, not two readings of
+    the same sentence. `existing` is any mask already in force (point-in-time
+    index membership, say) and is ANDed in.
+    """
+    mask = leader_mask(closes, volumes=volumes, p=p)
+    if existing is not None:
+        mask &= existing.reindex(index=mask.index, columns=mask.columns).fillna(False)
+    return mask
+
+
 def sector_breakdown(
     closes: pd.DataFrame,
     sector_map: Dict[str, str],

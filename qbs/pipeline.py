@@ -140,6 +140,10 @@ def run(
                       f"names are exactly the ones that failed.")
             eligible = membership_mask(uni.index, list(uni.columns), pit_membership)
 
+        if cfg.use_leader_filter:
+            from .breadth import leader_eligibility
+            eligible = leader_eligibility(uni, volumes=None, existing=eligible)
+
         mom_sig = cross_sectional_momentum(
             uni, prices[SAFE_ASSET], cfg.momentum, eligible=eligible,
         )

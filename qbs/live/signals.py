@@ -306,8 +306,22 @@ def compute_targets(
             f"history the ranker needs{' after exclusions' if dropped else ''}; "
             f"cannot fill {cfg.momentum.n_hold} slots")
 
+    # The dashboard's momentum-leader screen, when configured. No volume is
+    # available on this path, which skips that leg and makes the set slightly
+    # larger -- at 300k shares it is close to non-binding on the Nasdaq-100
+    # anyway, where every constituent trades far above it.
+    leaders = None
+    if cfg.use_leader_filter:
+        from ..breadth import leader_eligibility
+        leaders = leader_eligibility(uni, volumes=None)
+        n_lead = int(leaders.iloc[-1].sum())
+        log.info("momentum-leader filter: %d of %d names pass", n_lead, uni.shape[1])
+        if n_lead < cfg.momentum.n_hold:
+            log.warning("only %d leaders for %d slots; the rest goes to cash",
+                        n_lead, cfg.momentum.n_hold)
+
     mom = cross_sectional_momentum(uni, prices[safe], cfg.momentum,
-                                   record_ranks=record_ranks)
+                                   eligible=leaders, record_ranks=record_ranks)
 
     combined = uni.copy()
     combined[safe] = prices[safe]

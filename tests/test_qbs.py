@@ -19,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dataclasses import replace
 
 from qbs.config import (
-    BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams, GEMParams,
-    MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
+    SAFE_ASSET, BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams,
+    GEMParams, MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -2431,3 +2431,86 @@ def test_a_missing_safe_asset_is_rejected():
 
     with pytest.raises(ValueError, match="safe asset"):
         drawdown_stop(bad, frame, DrawdownStopParams(enabled=True))
+
+
+# --------------------------------------------------------------------------
+# The momentum-leader filter as a pre-screen for the ranker
+# --------------------------------------------------------------------------
+
+def test_leader_eligibility_is_the_dashboards_own_mask():
+    """One definition. The screen and the ranker must not drift apart."""
+    from qbs.breadth import BreadthParams, leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    p = BreadthParams()
+
+    pd.testing.assert_frame_equal(leader_eligibility(px, p=p), leader_mask(px, p=p))
+
+
+def test_leader_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    half = pd.DataFrame(False, index=px.index, columns=px.columns)
+    half.iloc[:, :5] = True
+
+    out = leader_eligibility(px, existing=half)
+
+    assert not out.iloc[:, 5:].to_numpy().any(), "the existing mask was ignored"
+    assert (out == (leader_mask(px) & half)).to_numpy().all()
+
+
+def test_the_leader_filter_is_off_and_inert_by_default():
+    cfg = Config()
+    assert cfg.use_leader_filter is False
+
+    px = synthetic_prices()
+    lab_off = run(cfg=cfg, prices=px, universe_prices=synthetic_universe(
+        n=20, start="2023-06-01").reindex(px.index).ffill(),
+        offline=True, fetch_universe=False, with_vix=False)
+    assert "momentum" in lab_off.signals
+
+
+def test_the_leader_filter_narrows_the_book_when_switched_on():
+    """Switched on it must actually bind, and unfilled slots go to cash."""
+    from dataclasses import replace as _replace
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01").reindex(px.index).ffill()
+
+    off = run(cfg=Config(), prices=px, universe_prices=uni, offline=True,
+              fetch_universe=False, with_vix=False)
+    cfg_on = Config()
+    cfg_on.use_leader_filter = True
+    on = run(cfg=cfg_on, prices=px, universe_prices=uni, offline=True,
+             fetch_universe=False, with_vix=False)
+
+    w_off = off.signals["momentum"].weights
+    w_on = on.signals["momentum"].weights
+    risk = [c for c in w_on.columns if c != SAFE_ASSET]
+
+    assert w_on[risk].sum(axis=1).mean() < w_off[risk].sum(axis=1).mean(), \
+        "the filter did not reduce exposure at all"
+    # Every weight it does hold is one the unfiltered book could also hold.
+    assert (w_on[risk].to_numpy() > 0).sum() < (w_off[risk].to_numpy() > 0).sum()
+
+
+def test_a_disabled_stop_never_reports_itself_as_blocking():
+    """`blocked` must mean the book was held flat, not that it might have been.
+
+    A risk readout claiming the breaker is halting a fully invested book is
+    worse than none: it is the one line an operator would trust in a hurry.
+    """
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    off = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+    on = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                       lag=cfg.execution_lag)
+
+    assert not off.diagnostics["blocked"].astype(bool).any()
+    assert on.diagnostics["blocked"].astype(bool).any()
+    # The condition itself is reported either way, so a dry run still shows it.
+    pd.testing.assert_series_equal(off.diagnostics["dd_flag"], on.diagnostics["dd_flag"])
+    pd.testing.assert_frame_equal(off.weights, vt.weights)

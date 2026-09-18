@@ -818,6 +818,12 @@ def drawdown_stop(
     if p.enabled:
         w.loc[blocked, risk_cols] = 0.0
         w.loc[blocked, safe] = 1.0
+    else:
+        # `dd_flag` keeps the condition either way, so a disabled stop still
+        # reports what it would have done. `blocked` means the book was
+        # actually held flat, and a risk readout that says "halted" while the
+        # book is fully invested is worse than no readout at all.
+        blocked = pd.Series(False, index=blocked.index)
 
     # Added to the base's diagnostics, not substituted for them: this is an
     # overlay, and the scalar underneath it is still what sized the book.
