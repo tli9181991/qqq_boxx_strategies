@@ -2171,6 +2171,87 @@ def test_load_universe_bars_reads_both_cached_frames():
         assert (v["MSFT"] == 20).all()
 
 
+# ---- the once-a-day auto-fetch gate --------------------------------------
+
+def test_the_fetch_gate_allows_the_first_run(tmp_path):
+    from qbs.finviz import due_for_fetch
+
+    due, why = due_for_fetch(str(tmp_path / "stamp.txt"))
+    assert due and "no automatic fetch" in why
+
+
+def test_the_fetch_gate_closes_for_the_rest_of_the_day(tmp_path):
+    """The gate counts ATTEMPTS, not data age. Streamlit re-runs the script on
+    every widget interaction, and before the close the last bar is always
+    yesterday's -- so a data-based test would start a 2,400-name download on
+    every rerun and never stop."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    record_fetch_attempt(stamp)
+    due, why = due_for_fetch(stamp)
+    assert not due
+    assert "already fetched today" in why and "Refresh now" in why
+
+
+def test_the_fetch_gate_reopens_on_the_next_calendar_day(tmp_path):
+    """Calendar days, not 24 hours: an app opened at 08:00 and again at 09:00
+    the next morning should refresh, and a 24-hour rule would refuse."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    now = pd.Timestamp("2026-09-18 08:00:00")
+    record_fetch_attempt(stamp, now=now)
+
+    assert not due_for_fetch(stamp, now=now + pd.Timedelta(hours=15))[0]
+    assert due_for_fetch(stamp, now=now + pd.Timedelta(hours=25))[0], \
+        "09:00 the next morning is a new day even though it is under 24h"
+
+
+def test_an_unwritable_stamp_does_not_break_the_fetch(tmp_path):
+    """Worst case it costs one extra attempt tomorrow. Raising here would turn
+    a read-only data directory into a dashboard that will not start."""
+    from qbs.finviz import last_fetch_attempt, record_fetch_attempt
+
+    bad = str(tmp_path / "nope" / "\x00" / "stamp.txt")
+    record_fetch_attempt(bad)             # must not raise
+    assert last_fetch_attempt(bad) is None
+
+
+def test_a_corrupt_stamp_reads_as_never_fetched(tmp_path):
+    from qbs.finviz import due_for_fetch
+
+    stamp = tmp_path / "stamp.txt"
+    stamp.write_text("not a timestamp")
+    assert due_for_fetch(str(stamp))[0], "unreadable means unknown means try"
+
+
+def test_a_stale_bars_cache_stops_counting_as_a_hit(tmp_path):
+    """A cache hit that never asks how old it is pins the app to whatever was
+    on disk when it started. With `stale_after` the hit expires; without it the
+    old behaviour is kept for callers that manage freshness themselves."""
+    import os
+    from qbs.finviz import load_universe_bars
+
+    old_idx = pd.bdate_range("2020-01-01", periods=6)     # years behind
+    d = str(tmp_path)
+    pd.DataFrame({"AAPL": 1.0}, index=old_idx).rename_axis("Date") \
+        .to_csv(os.path.join(d, "us_closes.csv"))
+    pd.DataFrame({"AAPL": 10}, index=old_idx).rename_axis("Date") \
+        .to_csv(os.path.join(d, "us_volumes.csv"))
+
+    # No staleness limit: the stale cache is returned, as before.
+    c, _, err = load_universe_bars(["AAPL"], cache_dir=d, verbose=False)
+    assert c is not None and err is None
+
+    # With one: the cache is rejected, so the loader goes to the network. There
+    # is none here, so it must come back with a REASON rather than silently
+    # handing over the stale frame it just declined to trust.
+    c2, _, err2 = load_universe_bars(["AAPL"], cache_dir=d, verbose=False,
+                                     stale_after=1)
+    assert err2, "a rejected cache and a failed download must report something"
+
+
 def test_fetch_us_universe_names_a_missing_package():
     """The commonest failure by far: installed in a notebook or on Colab, not
     for the interpreter running Streamlit. The message has to say that."""

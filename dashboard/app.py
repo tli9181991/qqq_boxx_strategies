@@ -44,8 +44,8 @@ from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
-from qbs.finviz import (UniverseFilters, fetch_us_universe, load_universe_bars,
-                        sector_map)
+from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_us_universe,
+                        load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
@@ -190,28 +190,48 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
 def load_us_market(download_start: str, online: bool, force: bool, _token: int):
     """The broad US universe for the breadth tab: closes, volumes, sectors.
 
-    Returns `(closes, volumes, sectors, note, error)`. `error` is not fatal --
-    the caller falls back to the cached index universe and says so on screen,
-    because breadth computed over a truncated sample is wrong in a way that
-    looks entirely plausible.
+    Returns `(closes, volumes, sectors, note, error, fetched)`. `error` is not
+    fatal -- the caller falls back to the cached index universe and says so on
+    screen, because breadth computed over a truncated sample is wrong in a way
+    that looks entirely plausible. `fetched` says whether this call went to the
+    network, so the UI can tell "fresh" from "cached" rather than implying one.
+
+    Automatic refresh is gated to once a calendar day by `due_for_fetch`, and
+    the gate counts ATTEMPTS. Streamlit re-runs this script on every widget
+    interaction, and before the close the last bar is always yesterday's -- so
+    a data-based test would start a 2,400-name download on every rerun and
+    never stop. **Refresh now** ignores the gate.
     """
     filters = UniverseFilters()
-    uni, uni_err = fetch_us_universe(filters, refresh=force, offline=not online,
-                                     verbose=False)
+    if not online:
+        uni, uni_err = fetch_us_universe(filters, offline=True, verbose=False)
+        auto, why = False, "offline"
+    else:
+        auto, why = due_for_fetch()
+        auto = auto or force
+        # Stamp BEFORE the work, not after. A download that dies halfway must
+        # still count as today's attempt, or a broken feed retries on every
+        # rerun -- which is the loop this gate exists to prevent.
+        if auto:
+            record_fetch_attempt()
+        uni, uni_err = fetch_us_universe(filters, refresh=force, offline=False,
+                                         verbose=False)
     if uni is None or uni.empty:
-        return None, None, {}, filters.label, uni_err or "unknown failure"
+        return None, None, {}, filters.label, uni_err or "unknown failure", False
 
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
         tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False)
+        verbose=False, stale_after=1 if auto else None)
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
-            f"Finviz listed {len(tickers)} tickers but no prices loaded — {bars_err}")
+            f"Finviz listed {len(tickers)} tickers but no prices loaded — "
+            f"{bars_err}"), False
 
     # A partial fetch is usable; a silent one is not. Carry the warning up.
     warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
-    return closes, volumes, sector_map(uni), filters.label, warn
+    note = f"{filters.label} · {why}"
+    return closes, volumes, sector_map(uni), note, warn, auto
 
 
 EMA_SPANS = (10, 20, 50, 200)
@@ -659,9 +679,10 @@ with tab_market:
 
     mkt_closes = mkt_vols = None
     mkt_sectors: Dict[str, str] = {}
-    mkt_note, mkt_err = "", None
+    mkt_note, mkt_err, mkt_fetched = "", None, False
     if use_us:
-        mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err = load_us_market(
+        (mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err,
+         mkt_fetched) = load_us_market(
             download_start, bool(online), bool(force),
             st.session_state["refresh_token"])
 
@@ -670,6 +691,17 @@ with tab_market:
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
         breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols)
+        # Say which of the two happened. "Fetched just now" and "served from a
+        # cache built at some point" look identical on screen otherwise, and
+        # the difference is the whole reason for the auto-refresh.
+        m_behind = sessions_behind(m_uni.index.max())
+        age = ("current" if m_behind <= 0 else
+               f"{m_behind} session{'s' if m_behind != 1 else ''} behind")
+        _, why_not = due_for_fetch()
+        st.caption(
+            f"🌐 {m_uni.shape[1]:,} names · last bar "
+            f"{m_uni.index.max():%Y-%m-%d} ({age}) · "
+            + ("**fetched on this run**" if mkt_fetched else why_not))
         if mkt_err:                      # loaded, but not cleanly
             st.warning(f"**Partial US universe.** {mkt_err}", icon="⚠️")
     else:

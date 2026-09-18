@@ -970,6 +970,23 @@ only difference being that Finviz averages it and the leader rule reads the sing
 session. That is why the leg barely bites in the US-universe mode: anything that got
 into the universe already clears it on a normal day.
 
+**It refreshes itself, once a day.** On launch the app checks whether an automatic
+fetch has run today; if not, it pulls the screener list and re-downloads any price
+frames more than a session behind. The status line under the toggle says which
+happened — *fetched on this run*, or *already fetched today at HH:MM*.
+
+**The gate counts attempts, not data age**, and that distinction is the whole design.
+Streamlit re-runs the script on every widget interaction, and before the close the
+last bar is always yesterday's — so "is the data stale?" would answer *yes* on every
+rerun and start a 2,400-name download each time, all day. One attempt per calendar
+day, stamped in `data/universe/us_last_fetch.txt` **before** the work starts so a
+download that dies halfway still counts.
+
+The cost of stamping failures too: a fetch that fails at 09:00 will not retry by
+itself until tomorrow. That is deliberate — a silent retry loop against a broken feed
+is worse than a stale number with a button next to it — and **Refresh now** ignores
+the gate entirely.
+
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real
 download and the cache runs to tens of megabytes. Finviz is a scrape, not an API: it
