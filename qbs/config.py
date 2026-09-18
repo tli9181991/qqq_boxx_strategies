@@ -109,7 +109,7 @@ class MomentumParams:
     lookback_months: int = 6
     skip_months: int = 1          # 6-1 momentum: skip the most recent month
     n_hold: int = 6
-    exit_rank: int = 10           # hysteresis band; == n_hold means no band
+    exit_rank: int = 8            # hysteresis band; == n_hold means no band
     rebalance: str = "daily"      # "daily" | "ME" (month end) | "W-FRI"
     weighting: str = "equal"      # "equal" | "inv_vol"
     absolute_filter: bool = True  # a name must also beat the safe asset
