@@ -1680,6 +1680,54 @@ def test_leader_mask_turnover_leg_only_removes_names():
     assert with_vol.sum().sum() < without.sum().sum(), "a $1 turnover must exclude"
 
 
+def test_the_4pc_colour_bands_match_their_edges():
+    """Boundary values, both columns, because an off-by-one on a band edge is
+    invisible on screen -- the cell is simply the wrong shade."""
+    from qbs.breadth import pulse_cell
+
+    for value, want in ((0, "dark_red"), (50, "dark_red"), (51, "light_red"),
+                        (100, "light_red"), (101, "light_green"),
+                        (300, "light_green"), (301, "dark_green"),
+                        (9999, "dark_green")):
+        assert pulse_cell(value, "up") == want, f"up 4% at {value}"
+
+    for value, want in ((0, "dark_green"), (50, "dark_green"),
+                        (51, "light_green"), (100, "light_green"),
+                        (101, "light_red"), (200, "light_red"),
+                        (201, "dark_red"), (9999, "dark_red")):
+        assert pulse_cell(value, "down") == want, f"down 4% at {value}"
+
+
+def test_green_is_bullish_in_both_4pc_columns():
+    """The two run in opposite directions: a big up count is bullish, a big
+    down count is not. Getting that reversal backwards is the easy mistake and
+    would make a calm tape look like a falling one."""
+    from qbs.breadth import pulse_cell
+
+    assert pulse_cell(500, "up") == "dark_green"
+    assert pulse_cell(500, "down") == "dark_red"
+    assert pulse_cell(10, "up") == "dark_red"
+    assert pulse_cell(10, "down") == "dark_green"
+
+
+def test_a_missing_4pc_count_has_no_colour():
+    from qbs.breadth import pulse_cell
+
+    assert pulse_cell(float("nan"), "up") == "none"
+    assert pulse_cell(float("nan"), "down") == "none"
+
+
+def test_the_4pc_bands_follow_their_parameters():
+    """The UI reads the edges off BreadthParams rather than repeating them, so
+    retuning has to move the colours."""
+    from qbs.breadth import BreadthParams, pulse_cell
+
+    tight = BreadthParams(up4_bands=(10.0, 20.0, 30.0))
+    assert pulse_cell(35, "up", tight) == "dark_green", "35 clears a 30 top edge"
+    assert pulse_cell(35, "up") == "dark_red", \
+        "and is still in the bottom band under the default 50/100/300"
+
+
 def test_leader_rule_is_the_stated_definition():
     """A US stock or ADR over $5, trading more than 300k shares a day, up more
     than 28% on the quarter. Each leg is pinned separately so a name can only

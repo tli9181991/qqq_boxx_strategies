@@ -37,7 +37,7 @@ passed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,16 @@ class BreadthParams:
 
     # Colour thresholds, kept here so the UI never invents its own.
     pulse_strong: int = 300           # |count| at or above this reads as strong
+
+    # Daily-monitor colour bands, as upper edges: (dark, light, light) with
+    # everything above the last edge in the fourth band.
+    #
+    # Green means BULLISH on both columns, not "this is the up column". A day
+    # with 30 names down 4% is a good day, so it shades green exactly as a day
+    # with 400 names up 4% does. Colouring dn4 red at every level would make
+    # a calm tape look like a falling one.
+    up4_bands: Tuple[float, float, float] = (50.0, 100.0, 300.0)
+    dn4_bands: Tuple[float, float, float] = (50.0, 100.0, 200.0)
     ma_extreme_low_fast: float = 10.0
     ma_extreme_low_slow: float = 20.0
     ma_extreme_high_fast: float = 90.0
@@ -430,6 +440,27 @@ def ma_class(value: float, which: str, p: Optional[BreadthParams] = None) -> str
     if value >= 30.0:
         return "mid"
     return "low"
+
+
+PULSE_CELLS = ("dark_red", "light_red", "light_green", "dark_green")
+
+
+def pulse_cell(value: float, which: str, p: Optional[BreadthParams] = None) -> str:
+    """Which colour band a 4%-mover count falls in: dark_red .. dark_green.
+
+    `which` is "up" or "down", and the two run in OPPOSITE directions -- a big
+    up count is bullish, a big down count is not -- so the bands are read
+    ascending for "up" and descending for "down". One function rather than
+    two because getting the direction backwards on one of them is the easy
+    mistake, and here it is a single reversal that a test can pin.
+    """
+    p = p or BreadthParams()
+    if pd.isna(value):
+        return "none"
+    bands = p.up4_bands if which == "up" else p.dn4_bands
+    idx = sum(value > edge for edge in bands)      # 0..3
+    order = PULSE_CELLS if which == "up" else tuple(reversed(PULSE_CELLS))
+    return order[idx]
 
 
 def atr_class(value: float, p: Optional[BreadthParams] = None) -> str:

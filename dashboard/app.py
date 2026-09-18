@@ -38,8 +38,8 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
-                         momentum_label, momentum_profile, pulse_class,
-                         sector_breakdown)
+                         momentum_label, momentum_profile, pulse_cell,
+                         pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
@@ -59,6 +59,12 @@ DN, DN_STRONG = "#f0b2b2", "#b02525"
 CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
         "high": "#ddefe4", "extreme_high": "#a9d7bd", "none": "",
         "stretched": "#f6c9c9", "oversold": "#c9e6d5", "normal": ""}
+
+# The four-band scale for the daily monitor's 4%-mover columns. Green is
+# bullish on BOTH, so a quiet down-4% count shades green like a heavy up-4%
+# one -- `breadth.pulse_cell` owns which band a value lands in.
+PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
+              "light_red": DN, "dark_red": DN_STRONG, "none": ""}
 
 # Both counts come from the config rather than the string, for the same reason
 # the lookback does: they have each moved once already, and a header claiming
@@ -815,11 +821,9 @@ with tab_market:
 
     def _style(col: pd.Series):
         name = col.name
-        if name == "Up 4%":
-            return [f"background-color: {UP_STRONG if pulse_class(v,'up')=='up_strong' else UP}"
-                    for v in col]
-        if name == "Dn 4%":
-            return [f"background-color: {DN_STRONG if pulse_class(v,'down')=='down_strong' else DN}"
+        if name in ("Up 4%", "Dn 4%"):
+            which = "up" if name.startswith("Up") else "down"
+            return [f"background-color: {PULSE_CELL[pulse_cell(v, which)]}"
                     for v in col]
         if name in ("% > 20D", "% > 50D"):
             which_ma = "fast" if "20" in name else "slow"
@@ -834,11 +838,32 @@ with tab_market:
                        "MLI %": "{:+.2f}", "MLI adv%": "{:.1f}"}, na_rep="—"))
     st.dataframe(styled, hide_index=True, width="stretch",
                  height=min(720, 45 + 35 * len(disp)))
+    _bp = BreadthParams()
+    _u, _d = _bp.up4_bands, _bp.dn4_bands
     st.caption(
-        f"Green = names up 4% (dark ≥ {BreadthParams().pulse_strong}) · "
-        f"red = down 4% · moving-average columns shade red below 10/20% and "
-        "green above 90/80% · ATR shades red beyond ±5."
+        "**Green is bullish in both 4% columns**, not \u201cgreen means "
+        "up\u201d — a quiet down-4% count is a good day and shades green "
+        "like a heavy up-4% one. "
+        f"Up 4%: dark red ≤{_u[0]:.0f} · light red ≤{_u[1]:.0f} · light green "
+        f"≤{_u[2]:.0f} · dark green above. "
+        f"Dn 4%: dark green ≤{_d[0]:.0f} · light green ≤{_d[1]:.0f} · light "
+        f"red ≤{_d[2]:.0f} · dark red above. "
+        "Moving-average columns shade red below 10/20% and green above 90/80% · "
+        "ATR shades red beyond ±5. The bar chart above keeps the plain "
+        "up-is-green convention, since a signed bar already shows direction."
     )
+    # The bands are absolute counts, sized for the ~2,400-name US universe. On
+    # the 99-name fallback no session can reach 301 up, so the column goes
+    # uniformly dark red and reads as a crash that is not happening. Say so
+    # rather than let the colour be believed.
+    _sample = int(tbl["n_stocks"].iloc[-1]) if "n_stocks" in tbl else 0
+    if _sample and _sample < _u[2]:
+        st.warning(
+            f"**These colours are calibrated for the broad US universe.** The "
+            f"bands are absolute counts (dark green needs {_u[2]:.0f}+ names up "
+            f"4%), and this sample is **{_sample} names** — no session here can "
+            f"reach that, so Up 4% shades dark red throughout and means nothing. "
+            "Turn the US universe on above for the scale to apply.", icon="🎨")
 
     # ---- momentum leaders -------------------------------------------------
     st.divider()
