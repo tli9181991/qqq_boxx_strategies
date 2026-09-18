@@ -292,9 +292,9 @@ is derived from price or volume, which is what makes it rollable at all. Two are
 applied: market cap over $300m needs fundamentals (non-binding on the Nasdaq-100), and
 average volume over 200k needs share volume — pass `volumes=` to enable it. Both
 omissions are *permissive*, so they flatter this strategy rather than the other way
-round. The notebook's 20%-quarterly-return gate is off by default because the notebook
+round. The notebook's quarterly-return gate is off by default because the notebook
 itself applies it only to the sector-breakdown table, not to the list it ranks
-(`min_quarter_return=0.20` switches it on).
+(`min_quarter_return=0.28` switches it on, matching the momentum-leader rule).
 
 **It is ranked against the Nasdaq-100, not against Finviz's own output.** That is
 deliberate. The notebook screens the whole US market and gets ~530 names; running the
@@ -884,6 +884,35 @@ than an index summary. Two panels light up as a consequence:
   the universe.
 - **The turnover leg of the leader screen** — volume arrives in the same yfinance
   response as the closes, so the $5m/day test applies instead of being skipped.
+
+#### What counts as a high-momentum stock
+
+The momentum-leader group ("動力股") on that tab is three tests, all strictly
+greater-than, applied to every name in the universe on every date:
+
+| Leg | Threshold | Parameter |
+|---|---|---|
+| Any US stock or ADR, price | **> $5** | `leader_min_price` |
+| Dollar turnover (close × volume) | **> $5m/day** | `leader_min_turnover` |
+| Quarterly gain, over 63 sessions | **> 28%** | `leader_min_quarter_return` |
+
+Strictly greater-than on all three, which matters most on price: a stock sitting at
+exactly $5.00 is a common thing, and `>=` would admit names the universe screen itself
+excludes, so the two filters would disagree about the same name.
+
+The 28% was 20% until it was raised by hand. It is a **preference about how selective
+"high momentum" should be, not a measured optimum** — raising it shrinks the leader
+count and the sector table built on it, and nothing here claims the smaller group
+performs better. It lives in a diff for that reason.
+
+**One interaction to know about.** The universe filter (`Average Volume > 300K`) runs
+*before* the turnover test, and it is not implied by it. A name over $16.67 can clear
+$5m/day turnover on fewer than 300k shares — a $100 stock trading 200k shares is $20m
+a day — and the universe screen drops it before the leader rule ever sees it. The
+share-volume floor comes from the source notebook's own universe definition rather than
+from the leader rule, and it is kept because widening it multiplies an already
+minutes-long screener fetch. So the leader count is a slight **under**-estimate,
+concentrated in high-priced names.
 
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real

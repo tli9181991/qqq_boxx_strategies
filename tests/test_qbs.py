@@ -1591,6 +1591,81 @@ def test_leader_mask_turnover_leg_only_removes_names():
     assert with_vol.sum().sum() < without.sum().sum(), "a $1 turnover must exclude"
 
 
+def test_leader_rule_is_the_stated_definition():
+    """A US stock or ADR over $5, turning over more than $5m/day, up more than
+    28% on the quarter. Each leg is pinned separately so a name can only fail
+    for the reason the test is about."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    assert (p.leader_min_price, p.leader_min_turnover,
+            p.leader_min_quarter_return) == (5.0, 5_000_000.0, 0.28)
+
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 5)
+    n = len(idx)
+
+    def ramp(start, gain):
+        return np.linspace(start, start * (1.0 + gain), n)
+
+    # Quarterly gain is measured over `leader_quarter_days`, and the frames
+    # below span a few bars more, so the ramps are sized generously either
+    # side of 28% rather than exactly on it.
+    px = pd.DataFrame({
+        "STRONG": ramp(50.0, 0.60),     # clears every leg
+        "WEAK": ramp(50.0, 0.10),       # up, but nowhere near 28%
+        "CHEAP": ramp(2.0, 0.60),       # strong, under $5
+    }, index=idx)
+    vol = pd.DataFrame(1e6, index=idx, columns=px.columns)   # $50m/day on STRONG
+
+    last = leader_mask(px, volumes=vol).iloc[-1]
+    assert last["STRONG"], "clears price, turnover and the quarterly gain"
+    assert not last["WEAK"], "a 10% quarter is not high momentum"
+    assert not last["CHEAP"], "under $5 is out however strong the move"
+
+
+def test_the_quarterly_gate_is_28_percent_not_20():
+    """The gate moved from 20% to 28%, which is a real change in how selective
+    the leader group is -- a name in between must now be excluded."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    # +24% over exactly the lookback: inside the old gate, outside the new one.
+    px = pd.DataFrame({"MID": np.linspace(50.0, 62.0, n)}, index=idx)
+    vol = pd.DataFrame(1e6, index=idx, columns=["MID"])
+
+    assert not leader_mask(px, volumes=vol).iloc[-1]["MID"]
+    loose = BreadthParams(leader_min_quarter_return=0.20)
+    assert leader_mask(px, volumes=vol, p=loose).iloc[-1]["MID"], \
+        "the same name passes the old 20% gate, so the fixture is the gate's"
+
+
+def test_every_leader_leg_is_strictly_greater_than():
+    """Not pedantry on the price leg: a stock at exactly $5.00 is common, and
+    `>=` would admit names the Finviz universe screen ("Over $5") excludes, so
+    the two filters would disagree about the same name."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+
+    # Exactly $5.00 on the last bar, with a strong quarter and huge turnover.
+    at_price = pd.DataFrame({"EDGE": np.linspace(2.0, 5.0, n)}, index=idx)
+    vol = pd.DataFrame(1e7, index=idx, columns=["EDGE"])
+    assert at_price["EDGE"].iloc[-1] == 5.0, "the fixture must sit on the line"
+    assert not leader_mask(at_price, volumes=vol).iloc[-1]["EDGE"]
+
+    # Exactly $5m of turnover: 500k shares at $10.
+    flat = pd.DataFrame({"EDGE": np.linspace(5.0, 10.0, n)}, index=idx)
+    exact = pd.DataFrame(500_000.0, index=idx, columns=["EDGE"])
+    assert flat["EDGE"].iloc[-1] * 500_000.0 == 5_000_000.0
+    assert not leader_mask(flat, volumes=exact).iloc[-1]["EDGE"]
+    more = pd.DataFrame(500_001.0, index=idx, columns=["EDGE"])
+    assert leader_mask(flat, volumes=more).iloc[-1]["EDGE"], "one share over passes"
+
+
 def test_sector_breakdown_shares_and_excess_are_consistent():
     from qbs.breadth import sector_breakdown
 

@@ -31,6 +31,13 @@ What this costs, because it is not free
   Volume comes back in the same yfinance response as the closes, so keeping it
   costs no extra network -- only disk -- and it is what lets the momentum
   screen apply its $5m turnover test instead of skipping it.
+* **The 300k share floor is not implied by that turnover test**, and runs
+  before it. Above ~$16.67 a name can clear $5m/day on fewer than 300k shares
+  -- a $100 stock trading 200k shares is $20m a day -- and this filter drops
+  it before the leader rule sees it. The floor is the source notebook's own
+  universe definition, kept because loosening it multiplies an already
+  minutes-long fetch, so the leader count is a slight UNDER-estimate
+  concentrated in high-priced names.
 * **Finviz is a scrape, not an API.** It rate-limits, and the page layout is
   not a contract. Every entry point here returns None or raises a clear error
   rather than half a universe, because a breadth reading computed over a

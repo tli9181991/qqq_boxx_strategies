@@ -277,6 +277,22 @@ def fmt(v, spec="{:.1f}", dash="—"):
     return dash if v is None or (isinstance(v, float) and pd.isna(v)) else spec.format(v)
 
 
+def md(text: str) -> str:
+    """Escape `$` for Streamlit's markdown, which reads `$...$` as LaTeX.
+
+    Two dollar signs in one caption -- "close > $5 ... turnover > $5M/day" --
+    make everything between them a maths span: the dollars vanish and the text
+    renders in a serif italic. It looks like a styling quirk rather than a bug,
+    which is why it survived a review here, so every string that can carry a
+    price goes through this.
+
+    Only needed for markdown-rendered text (`caption`, `markdown`, `warning`).
+    `st.dataframe` shows cell values literally and must NOT be escaped, or the
+    backslashes appear in the table.
+    """
+    return text.replace("$", r"\$")
+
+
 # --------------------------------------------------------------------------
 # Sidebar
 # --------------------------------------------------------------------------
@@ -579,7 +595,7 @@ with tab_picks:
                                      "finding: a name can rank at the very top on "
                                      "momentum and still fail the proximity test, "
                                      "which is why the two screens rarely agree.")
-                        st.caption(note)
+                        st.caption(md(note))
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(
@@ -772,14 +788,15 @@ with tab_market:
     st.divider()
     st.markdown("#### Momentum leaders")
     p = BreadthParams()
-    note = (f"Rules: close ≥ ${p.leader_min_price:.0f} · "
-            f"quarterly gain ≥ {p.leader_min_quarter_return:.0%}")
+    note = (f"Rules: US stock or ADR · close > ${p.leader_min_price:.0f} · "
+            f"quarterly gain > {p.leader_min_quarter_return:.0%} "
+            f"({p.leader_quarter_days} sessions)")
     if breadth.has_volume:
-        note += f" · turnover ≥ ${p.leader_min_turnover/1e6:.0f}M/day ✅"
+        note += f" · turnover > ${p.leader_min_turnover/1e6:.0f}M/day ✅"
     else:
-        note += (f" · ⚠️ the turnover test (≥ ${p.leader_min_turnover/1e6:.0f}M/day) "
+        note += (f" · ⚠️ the turnover test (> ${p.leader_min_turnover/1e6:.0f}M/day) "
                  "cannot run without volume, so this leader count is an over-estimate")
-    st.caption(note)
+    st.caption(md(note))
 
     c = st.columns(3)
     prev_n = int(prev["mli_n"]) if prev is not None else None

@@ -171,7 +171,7 @@ class FinvizScreenParams:
     avg_volume_window: int = 50         # the notebook's Avg_Vol_50D
 
     # ---- the notebook's stage-2 gate, off by default --------------------
-    min_quarter_return: float | None = None   # 0.20 reproduces its 動力股 rule
+    min_quarter_return: float | None = None   # 0.28 reproduces its 動力股 rule
     min_turnover: float | None = None         # 5e6, same rule -- needs volumes=
 
     # ---- stage-3 ranking ------------------------------------------------

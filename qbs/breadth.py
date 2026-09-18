@@ -54,11 +54,15 @@ class BreadthParams:
     ema_span: int = 50                # index distance is measured from EMA(50)
     atr_window: int = 14              # ... in units of ATR(14)
 
-    # Momentum leaders ("動力股"): the finviz notebook's own definition.
+    # Momentum leaders ("動力股"). Three legs, all strictly greater-than:
+    # a US stock or ADR over $5, turning over more than $5m a day, up more
+    # than 28% on the quarter. The 28% was 20% until it was raised by hand --
+    # it is a preference about how selective "high momentum" should be, not a
+    # measured optimum, so it lives in a diff rather than being tuned.
     leader_min_price: float = 5.0
     leader_min_turnover: float = 5_000_000.0   # needs `volumes`
-    leader_quarter_days: int = 63
-    leader_min_quarter_return: float = 0.20
+    leader_quarter_days: int = 63              # ~one quarter of trading
+    leader_min_quarter_return: float = 0.28
 
     # Colour thresholds, kept here so the UI never invents its own.
     pulse_strong: int = 300           # |count| at or above this reads as strong
@@ -133,19 +137,25 @@ def leader_mask(
 ) -> pd.DataFrame:
     """date x ticker boolean: was this name a momentum leader that day?
 
-    The finviz notebook's `動力股` rule -- close at or above `leader_min_price`,
-    dollar turnover at or above `leader_min_turnover`, and a quarterly return
-    at or above `leader_min_quarter_return`. The turnover leg is skipped when
-    no volume is supplied, which makes the set strictly larger.
+    The finviz notebook's `動力股` rule -- close ABOVE `leader_min_price`,
+    dollar turnover ABOVE `leader_min_turnover`, and a quarterly return ABOVE
+    `leader_min_quarter_return`. The turnover leg is skipped when no volume is
+    supplied, which makes the set strictly larger.
+
+    Strictly greater-than on all three, matching both the stated definition
+    and Finviz's own "Over $5". It is not pedantry on the price leg: a stock
+    sitting at exactly $5.00 is a common thing, and `>=` would admit names the
+    universe screen itself excludes -- so the two filters would disagree about
+    the same name.
     """
     p = p or BreadthParams()
     px = closes.sort_index()
     qtr = px / px.shift(p.leader_quarter_days) - 1.0
 
-    ok = (px >= p.leader_min_price) & (qtr >= p.leader_min_quarter_return)
+    ok = (px > p.leader_min_price) & (qtr > p.leader_min_quarter_return)
     if volumes is not None:
         vol = volumes.reindex(index=px.index, columns=px.columns)
-        ok &= (px * vol) >= p.leader_min_turnover
+        ok &= (px * vol) > p.leader_min_turnover
     return ok.fillna(False)
 
 
@@ -550,14 +560,14 @@ def momentum_profile(
     # which this panel does not carry, so it is left out rather than guessed --
     # a name passing both rows below may still miss on turnover.
     rows.append({"Strategy": "Momentum leader",
-                 "Rule": f"close at or above ${p.leader_min_price:,.0f}",
+                 "Rule": f"close over ${p.leader_min_price:,.0f}",
                  "Value": last, "Fmt": "price",
-                 "Pass": bool(last >= p.leader_min_price)})
+                 "Pass": bool(last > p.leader_min_price)})
     rows.append({"Strategy": "Momentum leader",
                  "Rule": f"quarterly gain over {p.leader_min_quarter_return:.0%} "
                          f"({p.leader_quarter_days}d)",
                  "Value": leader_qtr, "Fmt": "pct",
-                 "Pass": bool(leader_qtr >= p.leader_min_quarter_return)
+                 "Pass": bool(leader_qtr > p.leader_min_quarter_return)
                  if pd.notna(leader_qtr) else None})
     gates = pd.DataFrame(rows)
     return {"returns": returns, "trend": trend, "gates": gates}
