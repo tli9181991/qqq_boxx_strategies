@@ -55,3 +55,7 @@ data/fundamentals/
 
 # API keys for the LLM analyst. `.env.example` is the tracked template.
 .env
+
+# The daily news read, cached per calendar day. Host-local and perishable --
+# a committed copy would show one machine's Tuesday as every checkout's today.
+data/sentiment/

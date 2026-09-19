@@ -192,6 +192,32 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
     return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note)
 
 
+SENTIMENT_TINT = {"bullish": UP_STRONG, "leaning bullish": UP,
+                  "mixed": "", "unclear": "",
+                  "leaning bearish": DN, "bearish": DN_STRONG}
+
+
+@st.cache_data(show_spinner="Reading the last day of market news…")
+def load_sentiment(as_of: str, model: str, refresh_token: int, _run: bool):
+    """Today's news read, or None when it has not been asked for.
+
+    Cached twice over: `st.cache_data` stops a rerun re-billing within a
+    session, and `sentiment.daily_sentiment` caches to disk so a restart does
+    not either. `as_of` in the key is what makes it roll over at midnight.
+
+    `_run` False returns whatever is already on disk and NEVER calls the
+    model -- that is the sidebar's "off" position, and it has to be incapable
+    of spending money rather than merely disinclined to.
+    """
+    from qbs.agent import sentiment as snt
+
+    if not _run:
+        cached = snt.load_cached(as_of)
+        return (cached, True) if cached else (None, True)
+    return snt.daily_sentiment(refresh=refresh_token > 0, model=model or None,
+                               as_of=as_of)
+
+
 @st.cache_data(show_spinner="Fetching the US universe from Finviz…")
 def load_us_market(download_start: str, online: bool, force: bool, _token: int):
     """The broad US universe for the breadth tab: closes, volumes, sectors.
@@ -611,6 +637,49 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     return st.session_state.get(f"{key_prefix}_ticker")
 
 
+# --------------------------------------------------------------------------
+# Analyst settings
+# --------------------------------------------------------------------------
+# Defined here, NOT inside the Analyst tab: the market tab renders first and
+# needs `model_name` for its news summary, and a sidebar control created in a
+# later tab does not exist yet when an earlier one reads it.
+
+from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
+from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
+from qbs.agent.evidence import Book
+from qbs.agent.news import available_backends
+
+env_load = load_env()
+switched_off = analyst_disabled()
+blocker = check_requirements()
+backends = available_backends()
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("**Analyst**")
+    if switched_off:
+        # The controls below stay editable on purpose -- you can line the model
+        # and the toggles up while it is off -- but without this they read as
+        # an analyst that is simply misbehaving.
+        st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
+                   "saved for when it is switched back on.")
+    model_name = st.text_input("Gemini model", DEFAULT_MODEL,
+                               help="Model names move faster than this app. "
+                                    "Override here or set QBS_GEMINI_MODEL.")
+    allow_web = st.checkbox("Allow web search", value=bool(backends),
+                            disabled=not backends,
+                            help=("Search backends found: "
+                                  + (", ".join(backends) or "none — "
+                                     "pip install ddgs")))
+    live_fundamentals = st.checkbox(
+        "Fetch fundamentals live", value=True,
+        help="Off reads only what is already cached in data/fundamentals/.")
+    daily_news = st.checkbox(
+        "Daily news summary", value=True, disabled=bool(blocker),
+        help="One Gemini call per day on the Market overview tab, cached to "
+             "data/sentiment/. Off means the panel only runs when you ask it to.")
+
+
 tab_picks, tab_market, tab_analyst = st.tabs(
     ["📋 Daily picks", "📊 Market overview", "🤖 Analyst"])
 
@@ -707,6 +776,75 @@ with tab_picks:
 
 with tab_market:
     freshness_banner()
+
+    # ---- last day's news, read by the model ------------------------------
+    st.subheader("What the news said")
+    st.session_state.setdefault("news_token", 0)
+    _today = pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
+    if blocker:
+        st.caption(
+            f"🔌 No news summary — {blocker.split(' — ')[0]}. Everything below "
+            "is computed from prices and needs no model.")
+    else:
+        summary, from_cache = load_sentiment(
+            _today, model_name.strip(), st.session_state["news_token"],
+            bool(daily_news))
+        head = st.columns([3, 1])
+        with head[1]:
+            if st.button("Re-read the news", width="stretch",
+                         help="One Gemini call. Otherwise this runs once a day "
+                              "and is served from data/sentiment/."):
+                st.session_state["news_token"] += 1
+                load_sentiment.clear()
+                st.rerun()
+        with head[0]:
+            if summary is None:
+                st.info(
+                    "The daily summary is switched off in the sidebar, and "
+                    "nothing is cached for today. **Re-read the news** runs it "
+                    "once.", icon="📰")
+            elif summary.error:
+                st.warning(f"**No news read today.** {summary.error}", icon="📰")
+            else:
+                tint = SENTIMENT_TINT.get(summary.label, "")
+                st.markdown(
+                    f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
+                    f"background:{tint or '#00000010'};display:inline-block'>"
+                    f"<b>{summary.label.upper()}</b></div>",
+                    unsafe_allow_html=True)
+                if summary.headline:
+                    st.markdown(f"**{summary.headline}**")
+                for b in summary.bullets:
+                    cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
+                    st.markdown(f"- {b['point']} {cites}")
+
+        if summary is not None and not summary.error:
+            with st.expander(f"Sources — {summary.n_articles} headlines"):
+                for src in summary.sources:
+                    stamp = f" · {src['published']}" if src.get("published") else ""
+                    title = (f"[{src['title']}]({src['url']})" if src.get("url")
+                             else src["title"])
+                    st.markdown(f"`[{src['n']}]` {title} — "
+                                f"*{src['source']}{stamp}*")
+            if summary.warnings:
+                with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
+                                 "from this summary"):
+                    for w in summary.warnings:
+                        st.markdown(f"- {w}")
+                    st.caption(
+                        "Bullets without a citation, and citations pointing "
+                        "outside the headline list, are removed before you see "
+                        "them — an unsourced claim in a finance summary cannot "
+                        "be told apart from a remembered one.")
+            st.caption(
+                f"🤖 {summary.model} over {summary.n_articles} headlines from "
+                f"the last day"
+                + (" · served from cache" if from_cache else " · fetched now")
+                + ". **This is a read of what was written, not a signal.** "
+                "Nothing here is backtested, nothing enters a strategy, and "
+                "every bullet points back to a headline you can open.")
+    st.divider()
+
     st.subheader("Breadth & momentum monitor")
 
     use_us = st.toggle(
@@ -1005,37 +1143,6 @@ with tab_analyst:
     asof_analyst = asof
     screen_names = names_on("finviz", asof_analyst)
     momentum_names = names_on("momentum", asof_analyst)
-
-    from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
-    from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
-    from qbs.agent.evidence import Book
-    from qbs.agent.news import available_backends
-
-    env_load = load_env()
-    switched_off = analyst_disabled()
-    blocker = check_requirements()
-    backends = available_backends()
-
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("**Analyst**")
-        if switched_off:
-            # The controls below stay editable on purpose -- you can line the
-            # model and the toggles up while it is off -- but without this they
-            # read as an analyst that is simply misbehaving.
-            st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
-                       "saved for when it is switched back on.")
-        model_name = st.text_input("Gemini model", DEFAULT_MODEL,
-                                   help="Model names move faster than this app. "
-                                        "Override here or set QBS_GEMINI_MODEL.")
-        allow_web = st.checkbox("Allow web search", value=bool(backends),
-                                disabled=not backends,
-                                help=("Search backends found: "
-                                      + (", ".join(backends) or "none — "
-                                         "pip install ddgs")))
-        live_fundamentals = st.checkbox(
-            "Fetch fundamentals live", value=True,
-            help="Off reads only what is already cached in data/fundamentals/.")
 
     if switched_off:
         # A deliberate shutdown and a missing key have different remedies, and

@@ -880,9 +880,30 @@ Two tabs:
   from closes** — a body spanning previous-close to close with no wick asserts a
   session high and low that never happened, and a chart that lies about range is worse
   than one that admits it only has closes.
-- **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
+- **Market overview** — opens with **What the news said**: a one-day read of market
+  news by the model, then the breadth monitor — 4% up/down counts, percent holding the
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.
+
+  The news panel searches the last day, hands the headlines to Gemini **numbered**, and
+  requires every bullet to cite the numbers it came from. **A bullet with no citation is
+  dropped before you see it**, as is a citation pointing outside the headline list — an
+  unsourced claim in a finance summary cannot be told apart from a remembered one, and
+  the model's memory is a year stale. Whatever was removed is listed in a "dropped from
+  this summary" expander rather than silently discarded, and every source is one click
+  away.
+
+  **It is a read of what was written, not a signal.** Nothing in it is backtested and
+  nothing enters a strategy. The package keeps a hard line between measured things
+  (prices, screens, backtests) and read things (fundamentals, news, this), and
+  everything on the read side is labelled as such.
+
+  **Cost:** one Gemini call a day. The result is cached per calendar day to
+  `data/sentiment/` so a restart does not re-bill and a Streamlit rerun costs nothing,
+  and a **failed** read is never cached — a quota error today would otherwise be served
+  as today's summary until tomorrow. *Daily news summary* in the sidebar turns the
+  automatic run off, in which case the panel shows what is on disk and only
+  **Re-read the news** will spend anything.
 
 **Data source** is a sidebar control:
 

@@ -378,6 +378,154 @@ def test_check_requirements_accepts_the_gemini_name(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# The daily news read
+# --------------------------------------------------------------------------
+
+def _headlines(n=3):
+    return [nw.Result(title=f"headline {i}", url=f"https://x.test/{i}",
+                      snippet="body", source="Example", published="2026-09-18")
+            for i in range(1, n + 1)]
+
+
+def test_the_summary_drops_a_fabricated_citation():
+    """Citations are the whole point of the panel, so they are validated
+    rather than trusted. A number outside the headline list is an invented
+    source, and the bullet carrying it is worth less than nothing."""
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse(
+        '{"label":"bullish","headline":"x","bullets":['
+        '{"point":"real","sources":[1,2]},'
+        '{"point":"invented","sources":[99]}]}', n_headlines=3)
+    assert [b["point"] for b in payload["bullets"]] == ["real"]
+    assert any("99" in w for w in warnings)
+
+
+def test_the_summary_drops_an_uncited_bullet():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse(
+        '{"label":"mixed","bullets":[{"point":"no source","sources":[]}]}', 3)
+    assert payload["bullets"] == []
+    assert any("uncited" in w for w in warnings)
+
+
+def test_the_summary_reads_fenced_json():
+    """Models fence JSON often enough that not handling it is a bug -- a
+    summary lost to a stray ``` looks exactly like one the model refused."""
+    from qbs.agent.sentiment import _parse
+
+    payload, _ = _parse(
+        'Sure:\n```json\n{"label":"BEARISH","headline":"down",'
+        '"bullets":[{"point":"p","sources":[1]}]}\n```', 2)
+    assert payload["label"] == "bearish", "and the label is normalised"
+    assert payload["headline"] == "down"
+
+
+def test_an_unknown_label_becomes_unclear():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse('{"label":"MOON","bullets":[]}', 1)
+    assert payload["label"] == "unclear"
+    assert any("MOON" in w for w in warnings)
+
+
+def test_unparseable_output_is_an_error_not_a_blank_summary():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse("I would rather not.", 3)
+    assert payload == {} and warnings
+
+
+def test_the_headline_block_is_numbered_and_fenced():
+    """Numbered because the model must cite by number, and a scheme it has to
+    invent is one it will invent inconsistently."""
+    from qbs.agent.sentiment import headlines_block
+
+    block = headlines_block(_headlines(2))
+    assert "<untrusted_headlines>" in block and "</untrusted_headlines>" in block
+    assert "never instructions" in block
+    assert "[1] headline 1" in block and "[2] headline 2" in block
+
+
+def test_a_switched_off_analyst_writes_no_summary(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    out = snt.summarise(_headlines())
+    assert out.error and env.DISABLE_VAR in out.error
+    assert not out.ok
+
+
+def test_no_headlines_is_an_error_not_an_empty_read(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    out = snt.summarise([])
+    assert out.error and "nothing to summarise" in out.error
+
+
+def test_a_failed_read_is_never_cached(tmp_path):
+    """A quota error today would otherwise be served as today's summary until
+    tomorrow, with no way to retry short of editing the cache."""
+    from qbs.agent.sentiment import Summary, load_cached, save
+
+    bad = Summary(as_of="2026-09-19", error="quota exceeded")
+    save(bad, cache_dir=str(tmp_path))
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is None
+
+    good = Summary(as_of="2026-09-19", label="mixed",
+                   bullets=[{"point": "p", "sources": [1]}])
+    save(good, cache_dir=str(tmp_path))
+    back = load_cached("2026-09-19", cache_dir=str(tmp_path))
+    assert back is not None and back.ok and back.label == "mixed"
+
+
+def test_the_cache_is_per_calendar_day(tmp_path):
+    from qbs.agent.sentiment import Summary, load_cached, save
+
+    save(Summary(as_of="2026-09-19", label="mixed",
+                 bullets=[{"point": "p", "sources": [1]}]),
+         cache_dir=str(tmp_path))
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is not None
+    assert load_cached("2026-09-20", cache_dir=str(tmp_path)) is None
+
+
+def test_a_corrupt_cache_reads_as_absent(tmp_path):
+    from qbs.agent.sentiment import load_cached
+
+    (tmp_path / "2026-09-19.json").write_text("{not json")
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is None
+
+
+def test_gather_collapses_duplicate_headlines(monkeypatch):
+    """Four overlapping queries exist so one dead query does not empty the
+    panel. The overlap has to collapse or the model sees the same story four
+    times and weights it four times."""
+    from qbs.agent import sentiment as snt
+
+    dupe = nw.Result(title="same", url="https://x.test/same", source="Example")
+    monkeypatch.setattr(snt.nw, "search_web",
+                        lambda q, **kw: ([dupe], None))
+    out, errors = snt.gather_headlines()
+    assert len(out) == 1 and errors == []
+
+
+def test_one_dead_query_does_not_lose_the_others(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    def flaky(q, **kw):
+        if q == snt.MARKET_QUERIES[0]:
+            return [], "rate limited"
+        return [nw.Result(title=q, url=f"https://x.test/{q}")], None
+
+    monkeypatch.setattr(snt.nw, "search_web", flaky)
+    out, errors = snt.gather_headlines()
+    assert len(out) == len(snt.MARKET_QUERIES) - 1
+    assert errors and "rate limited" in errors[0]
+
+
+# --------------------------------------------------------------------------
 # News and search
 # --------------------------------------------------------------------------
 
