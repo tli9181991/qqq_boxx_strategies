@@ -180,7 +180,18 @@ class PipelineConfig:
         "iron condor", "strike", "expiry", "assignment", "the bid", "the ask",
     ])
 
-    # ---- google drive ----------------------------------------------------
+    # ---- uploads ---------------------------------------------------------
+    # "rclone" authorises against rclone's own registered OAuth client, so
+    # there is no Cloud project, no consent screen to publish and no seven-day
+    # token expiry -- it just needs the rclone binary. "drive" uses the Drive
+    # API with an OAuth client you register yourself. See upload.py.
+    uploader: str = "rclone"
+    rclone_binary: str = "rclone"
+    rclone_remote: str = "gdrive"    # the name given in `rclone config`
+    rclone_base_path: str = "Patreon"
+    rclone_timeout: int = 7200
+
+    # ---- google drive (uploader = "drive" only) --------------------------
     # The folder uploads land in. An ID is exact; a name is found-or-created
     # under My Drive root. ID wins when both are set.
     drive_folder_id: str = ""
@@ -296,6 +307,12 @@ class PipelineConfig:
         cfg.upload_transcript = _env_bool(
             "PATREON_UPLOAD_TRANSCRIPT", cfg.upload_transcript)
 
+        cfg.uploader = _env_str("PATREON_UPLOADER", cfg.uploader)
+        cfg.rclone_binary = _env_str("PATREON_RCLONE", cfg.rclone_binary)
+        cfg.rclone_remote = _env_str("PATREON_RCLONE_REMOTE", cfg.rclone_remote)
+        cfg.rclone_base_path = _env_str(
+            "PATREON_RCLONE_BASE_PATH", cfg.rclone_base_path)
+
         cfg.drive_folder_id = _env_str("PATREON_DRIVE_FOLDER_ID", cfg.drive_folder_id)
         cfg.drive_folder_name = _env_str(
             "PATREON_DRIVE_FOLDER_NAME", cfg.drive_folder_name)
@@ -338,6 +355,12 @@ class PipelineConfig:
             problems.append(
                 "upload_media is off but transcribe is off too: nothing would "
                 "be produced")
+        if self.uploader not in ("rclone", "drive"):
+            problems.append(
+                f"uploader must be 'rclone' or 'drive', not {self.uploader!r}")
+        if self.uploader == "rclone" and not self.rclone_remote:
+            problems.append("rclone_remote is empty; name the remote you made "
+                            "with `rclone config`")
         if self.title_bytes < 20:
             problems.append("title_bytes below 20 makes filenames unreadable")
         if self.whisper_device == "cpu" and self.whisper_compute_type == "float16":

@@ -26,7 +26,7 @@ import sqlite3
 import time
 from typing import Any, Dict, Optional
 
-from . import download, drive, store, transcribe as transcribe_mod
+from . import download, store, transcribe as transcribe_mod, upload
 from .config import PipelineConfig
 
 log = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ def _describe(job: sqlite3.Row, res: download.DownloadResult,
 
 
 def process_job(cfg: PipelineConfig, conn: sqlite3.Connection,
-                job: sqlite3.Row, svc) -> str:
+                job: sqlite3.Row, uploader: "upload._Backend") -> str:
     """Run one job end to end. Returns its resulting state.
 
     Raises AuthError upward -- that is the one failure the caller must handle
@@ -115,24 +115,21 @@ def process_job(cfg: PipelineConfig, conn: sqlite3.Connection,
                         job_id, type(exc).__name__, exc)
 
     try:
-        folder_id = drive.target_folder(svc, cfg, res.creator)
+        dest = uploader.destination(res.creator)
         meta: Dict[str, Any] = {}
         transcript_meta: Dict[str, Any] = {}
 
         if cfg.upload_media:
-            meta = drive.upload(svc, res.media_path, folder_id,
-                                chunk_mb=cfg.drive_chunk_mb,
-                                description=_describe(job, res, tr))
+            meta = uploader.send(res.media_path, dest,
+                                 description=_describe(job, res, tr))
         if tr and cfg.upload_transcript:
             for path in tr.paths:
-                got = drive.upload(svc, path, folder_id,
-                                   chunk_mb=cfg.drive_chunk_mb,
-                                   description=_describe(job, res, tr))
+                got = uploader.send(path, dest,
+                                    description=_describe(job, res, tr))
                 if path == tr.txt_path:
                     transcript_meta = got
         if cfg.upload_info_json and res.info_path:
-            drive.upload(svc, res.info_path, folder_id,
-                         chunk_mb=cfg.drive_chunk_mb)
+            uploader.send(res.info_path, dest)
 
         # With upload_media off, the transcript is the artefact, so it is what
         # `status` should link to.
@@ -168,10 +165,14 @@ def run(cfg: PipelineConfig, *, once: bool = False,
     db_path = cfg.resolved_db_path()
     os.makedirs(cfg.resolved_staging_dir(), exist_ok=True)
 
+    # Checked once here rather than per job: a missing rclone remote or an
+    # unusable Drive token is a setup mistake, and failing every job in turn
+    # would bury that under retries instead of stating it once.
     try:
-        svc = drive.service(cfg)
-    except drive.DriveError as exc:
-        log.error("Drive is not usable: %s", exc)
+        uploader = upload.backend(cfg)
+        uploader.check()
+    except upload.UploadError as exc:
+        log.error("uploads are not usable (%s backend): %s", cfg.uploader, exc)
         return EXIT_CONFIG
 
     processed = 0
@@ -191,7 +192,7 @@ def run(cfg: PipelineConfig, *, once: bool = False,
                 continue
 
             try:
-                process_job(cfg, conn, job, svc)
+                process_job(cfg, conn, job, uploader)
             except download.AuthError as exc:
                 store.requeue(conn, int(job["id"]))
                 store.set_flag(conn, AUTH_FLAG, str(exc))

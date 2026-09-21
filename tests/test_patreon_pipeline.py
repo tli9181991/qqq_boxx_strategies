@@ -16,7 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from patreon_pipeline import download, mail, store, transcribe
+from patreon_pipeline import download, mail, rclone, store, transcribe, upload
 from patreon_pipeline.config import PipelineConfig
 
 
@@ -296,6 +296,53 @@ def test_default_vocabulary_is_populated():
     cfg = PipelineConfig()
     prompt = transcribe.build_initial_prompt(cfg.whisper_vocabulary)
     assert prompt and "QQQ" in prompt and "0DTE" in prompt
+
+
+# ----------------------------------------------------------------------
+# Uploads
+# ----------------------------------------------------------------------
+
+def test_rclone_is_the_default_backend():
+    """Chosen because it needs no Cloud project, no consent screen and has no
+    seven-day token expiry."""
+    assert PipelineConfig().uploader == "rclone"
+    assert upload.backend(PipelineConfig()).name == "rclone"
+
+
+def test_drive_backend_is_still_selectable():
+    assert upload.backend(PipelineConfig(uploader="drive")).name == "drive"
+
+
+def test_unknown_uploader_is_refused():
+    try:
+        upload.backend(PipelineConfig(uploader="dropbox"))
+    except upload.UploadError as exc:
+        assert "dropbox" in str(exc)
+    else:
+        raise AssertionError("an unknown uploader should not be accepted")
+
+
+def test_rclone_destination_nests_by_creator():
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon")
+    assert rclone.destination(cfg, "Some Creator") == "gdrive:Patreon/Some Creator"
+
+
+def test_rclone_destination_without_creator_subfolder():
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon",
+                         drive_subfolder_per_creator=False)
+    assert rclone.destination(cfg, "Some Creator") == "gdrive:Patreon"
+
+
+def test_rclone_destination_sanitises_separators_in_a_creator_name():
+    """A slash in a creator name would silently nest an extra remote folder."""
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon")
+    assert rclone.destination(cfg, "A/B") == "gdrive:Patreon/A-B"
+
+
+def test_validate_rejects_a_bad_uploader_and_an_empty_remote():
+    assert any("uploader" in p for p in PipelineConfig(uploader="nope").validate())
+    assert any("rclone_remote" in p
+               for p in PipelineConfig(rclone_remote="").validate())
 
 
 # ----------------------------------------------------------------------

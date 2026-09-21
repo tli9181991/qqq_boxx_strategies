@@ -29,6 +29,7 @@ Scheduled Tasks below cover the same ground. Go native.
 ```powershell
 winget install Python.Python.3.12
 winget install Gyan.FFmpeg          # both stages need it
+winget install Rclone.Rclone        # how files reach Drive
 winget install Mozilla.Firefox
 ```
 
@@ -62,7 +63,10 @@ Then the five things the installer cannot do for you:
 2. Edit `deploy\windows\patreon.env` — Gmail app password, probe URL.
 3. Edit `C:\ProgramData\PatreonPipeline\config.json` — campaign URLs, Whisper
    vocabulary.
-4. `.\run.ps1 auth` — the one-time Google Drive consent flow.
+4. `rclone config` — the one-time Google Drive authorisation. rclone carries
+   its own registered OAuth client, so there is no Google Cloud project to
+   create and no consent screen to publish. `.\run.ps1 auth` prints the exact
+   answers to give its prompts.
 5. Stop the machine sleeping (below).
 
 ## The Windows-specific traps
