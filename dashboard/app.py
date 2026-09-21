@@ -44,12 +44,14 @@ from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
-from qbs.config import BreakoutParams, Config, FinvizScreenParams
+from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
+                        MomentumParams)
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_us_universe,
                         load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.screens import finviz_momentum_screen
+from qbs.shadow import parse_watchlist, watchlist_rows
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
 
@@ -187,6 +189,58 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
         out[key] = pd.DataFrame(rows).set_index("date")
 
     return out, volume_applied
+
+
+@st.cache_data(show_spinner="Loading watchlist prices…")
+def load_watch_prices(tickers: tuple, download_start: str, online: bool,
+                      through: str, _token: int):
+    """Closes for watched names that are NOT in the ranking universe.
+
+    Returns `(frame, errors)`. Each name is fetched on its own and a failure
+    is reported by name rather than raised: a typo in a watchlist is the
+    common case, and it should cost that one row, not the panel.
+
+    The cache is read first and re-downloaded only when it ends before
+    `through` (the universe's last bar). A watched name a week behind the
+    book would be ranked on a week-old price against today's constituents,
+    which is a comparison of two different days dressed up as one.
+    """
+    rows: Dict[str, pd.Series] = {}
+    errors: Dict[str, str] = {}
+    last = pd.Timestamp(through)
+    for t in tickers:
+        s, err = None, None
+        try:
+            s = load_prices([t], start=download_start, offline=True)[t]
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        if online and (s is None or s.index.max() < last):
+            try:
+                s = load_prices([t], start=download_start, refresh=True,
+                                offline=False)[t]
+                err = None
+            except Exception as exc:  # noqa: BLE001
+                if s is None:
+                    err = f"{type(exc).__name__}: {exc}"
+        if s is None:
+            errors[t] = err or "no data"
+        else:
+            rows[t] = s
+    return (pd.DataFrame(rows) if rows else pd.DataFrame()), errors
+
+
+@st.cache_data(show_spinner="Ranking the watchlist…")
+def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _watch: pd.DataFrame,
+               names: str, n_hold: int, exit_rank: int, asof: pd.Timestamp):
+    """`watchlist_rows` behind a cache.
+
+    `names` is in the signature only to be hashed -- the frames are passed
+    with a leading underscore, so without it the cache key would not change
+    when the watchlist does and editing the box would show the old ranking.
+    """
+    return watchlist_rows(_uni, _safe, _watch,
+                          MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
+                          asof=asof)
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -382,6 +436,21 @@ n_screen = st.sidebar.number_input(
     help="How many names the high-momentum screen ranks down to. On the "
          "Nasdaq-100 universe fewer than this usually qualify, so the column "
          "shows everyone who passed.")
+
+# Loaded here, not with the Analyst settings further down, because the
+# default below reads QBS_WATCHLIST out of the environment and this box is
+# rendered first. The load is cached per file, so the later call is free.
+from qbs.agent.env import load_env as _load_env
+_load_env()
+watch_raw = st.sidebar.text_input(
+    "Watchlist", os.environ.get("QBS_WATCHLIST", ""),
+    help="Names to rank beside the book without letting the book buy them — "
+         "comma or space separated. Anything outside the index is "
+         "interpolated into the constituents' ranking. Same variable the "
+         "live runner reads: QBS_WATCHLIST.")
+# The runner's own parser, not a second one that agrees with it today: the
+# box and QBS_WATCHLIST must mean the same thing by construction.
+WATCHLIST = parse_watchlist(watch_raw)
 
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
 # app force-refreshed on EVERY start -- re-downloading the whole universe
@@ -788,6 +857,97 @@ with tab_picks:
         f"{', '.join(sorted(common)) if common else 'no overlap'} "
         f"({len(common)} of {len(picks['momentum']) or '—'} momentum names)"
     )
+
+    # ---- watchlist: where a name places, without the book buying it -----
+    st.divider()
+    st.markdown("#### Watchlist rank")
+    if not WATCHLIST:
+        st.caption(md(
+            "Nothing watched. Put tickers in the sidebar box (or set "
+            "`QBS_WATCHLIST`) to see where they place in the ranking the book "
+            "acts on. A name outside the index is interpolated into that "
+            "ranking without joining it."))
+    else:
+        outsiders = tuple(t for t in WATCHLIST if t not in uni.columns)
+        watch_px, watch_err = load_watch_prices(
+            outsiders, download_start, bool(online), f"{LAST_BAR:%Y-%m-%d}",
+            st.session_state["refresh_token"])
+
+        # Constituents are read from the universe frame that was ranked, not
+        # re-downloaded: the row has to report the rank the book acted on,
+        # and a second copy of the same prices is how the two drift apart.
+        watch_cols: Dict[str, pd.Series] = {}
+        for t in WATCHLIST:
+            if t in uni.columns:
+                watch_cols[t] = uni[t]
+            elif t in watch_px.columns:
+                watch_cols[t] = watch_px[t].reindex(uni.index).ffill()
+
+        if watch_err:
+            # The remedy depends on the mode. Telling someone to go online
+            # when they already are, and the download is what failed, sends
+            # them to fix the wrong thing.
+            remedy = ("Check the spelling — a name the provider does not "
+                      "know cannot be ranked."
+                      if online else
+                      "Offline mode reads only the CSV cache in `data/`. "
+                      "Switch **Source** to Online to fetch a name for the "
+                      "first time.")
+            st.warning(md("No prices for " + ", ".join(
+                f"**{t}** ({e})" for t, e in watch_err.items())
+                + ". " + remedy), icon="⚠️")
+
+        rows = (watch_rows(uni, px["BOXX"], pd.DataFrame(watch_cols),
+                           ",".join(WATCHLIST), int(n_hold), int(exit_rank),
+                           asof)
+                if watch_cols else [])
+        if not rows:
+            st.info("Nothing on the watchlist could be ranked on this date.")
+        else:
+            wf = pd.DataFrame(rows)
+            # NaN sorts last: a name with too little history is unranked, not
+            # top of the list.
+            wf = wf.sort_values("rank", na_position="last").reset_index(drop=True)
+            show_w = pd.DataFrame({
+                "Ticker": wf["symbol"],
+                "Rank": [fmt(r, "{:.0f}") for r in wf["rank"]],
+                "Placed": ["in index" if c else "interpolated"
+                           for c in wf["constituent"]],
+                "Score": [fmt(v, "{:+.3f}") for v in wf["score"]],
+                f"Book cutoff (#{int(n_hold)})":
+                    [fmt(v, "{:+.3f}") for v in wf["book_cutoff"]],
+                f"Band cutoff (#{int(exit_rank)})":
+                    [fmt(v, "{:+.3f}") for v in wf["band_cutoff"]],
+                "Beats the book": ["✅" if b else "—" for b in wf["beats_book"]],
+            })
+            beats = list(wf["beats_book"])
+            st.dataframe(
+                show_w.style.apply(
+                    lambda _col: [f"background-color: {UP}" if b else ""
+                                  for b in beats],
+                    subset=["Rank"]),
+                hide_index=True, width="stretch",
+                height=min(420, 38 + 35 * len(show_w)))
+            n_out = int((~wf["constituent"]).sum())
+            # Said only when there is an interpolated row to say it about.
+            # "the 0 outsiders are interpolated" explains a distinction the
+            # table is not currently making.
+            outsider_note = (
+                f" The {n_out} interpolated "
+                f"{'row shows' if n_out == 1 else 'rows show'} where a "
+                f"non-constituent would sit, so a rank inside the top "
+                f"{int(n_hold)} means the book *would* hold it **if it were "
+                "a constituent** — not that the book should."
+                if n_out else "")
+            st.caption(md(
+                f"Ranked on {asof:%Y-%m-%d} against the {uni.shape[1]} "
+                "constituents alone, so two watched names never shift each "
+                "other's row, and nothing here changes a holding. A "
+                "constituent shows the rank it already has."
+                + outsider_note
+                + " A blank rank means the name was filtered out (too little "
+                "history, or it lost to BOXX over the same window), not that "
+                "it placed last."))
 
     st.divider()
     st.markdown("#### Selection history")
