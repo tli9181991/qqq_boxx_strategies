@@ -416,11 +416,13 @@ be closed rather than stranded.
 
 ### The CSV logs in `var/`
 
-Four files, so the run log can be read with `cat` and no tooling:
+Six files, so the run log can be read with `cat` and no tooling:
 
 | file | what | how it is written |
 |---|---|---|
 | `ranking_log.csv` | the top 25 of each day's ranking, with rank, score and whether it is held | appended, one block per date |
+| `shadow_log.csv` | what each candidate ranking rule *would* hold, and where it disagrees with the live book | appended, one block per date |
+| `watchlist_log.csv` | where a watched non-constituent would have ranked, against the book's own cutoffs | appended, one block per date |
 | `trade_log.csv` | every trading event — the same rows `report` prints | rewritten from the database each run |
 | `strategy_book.csv` | today's book: strategy shares beside the account's and yours | rewritten each run |
 | `strategy_trades.csv` | the position ledger, when `position_source=ledger` | appended from IB's fills |
@@ -431,6 +433,52 @@ once the ranking has moved on. It is keyed on the date, so the twice-daily
 preflight and any re-run after a failure cannot duplicate a day. `QBS_RANKING_TOP`
 sets the depth (default 25 — the book holds 6 and exits past 10, so 25 shows
 the names queued behind them and a rotation becomes visible before it happens).
+
+`shadow_log.csv` accumulates for the same reason, and exists because six years
+of cached history cannot settle a question that has already been asked of it
+sixty times. A candidate ranking rule is scored beside the live book every day,
+holding nothing and sending no orders, so that in a year there are two return
+streams to compare out of sample. The `live_held` column marks the names the
+real book also holds, which makes the divergence a filter rather than a script.
+
+The candidate under observation is `z(6-1) + w * z(turn)`, where `turn` is the
+last month's return rate minus the prior quarter's — the "this name has only
+just turned up" tilt. `QBS_SHADOW_WEIGHTS` sets which `w` values are scored
+(default `0.5 1.25 2.0`); empty turns the log off. It is computed in `preflight`
+and `signal`, never in `trade`: it is a few seconds of arithmetic that cannot
+change an order, and the phase racing the MOC cutoff should not be carrying it.
+
+`watchlist_log.csv` answers "is this stock stronger than what we hold?" for
+names the book may not be able to buy. `QBS_WATCHLIST=TSM,GOOGL` scores each
+name's 6-1 momentum every day and reports where it places in the constituents'
+ranking, beside the score of the last name in the book and the last name inside
+the band:
+
+```
+watch TSM:   rank 4 if it were a constituent, 6-1 momentum +131.2% (book needs +120.4%, band +90.5%)
+watch GOOGL: rank 38, 6-1 momentum +15.7% (book needs +120.4%, band +90.5%)
+```
+
+The two lines differ because the two names do. GOOGL **is** in the index, so it
+is already ranked and the log reports the rank the book acts on — the same
+number `ranking_log.csv` has for it that day. TSM is not, so it is interpolated
+into that ranking: the place it would take among the constituents, with nothing
+else moved. The `constituent` column says which kind a row is.
+
+Each name is placed against the constituents alone, never against the other
+watched names, so adding a name to the list cannot change what any other row
+reports.
+
+A blank rank means the name was filtered out rather than ranked low — too
+little history, or it lost to BOXX over the same window. That is written as a
+blank rather than a large number, because "rank 99" would read as a weak name
+instead of an excluded one.
+
+Watched non-constituents are **not buyable**. They are ranked in a copy of the
+universe; the book is computed from the index constituents and never sees them.
+Do not try to get the same effect with `QBS_EXTRA_TICKERS` — that list is for
+prices the strategy itself needs, and anything in it is a name the ranker is
+entitled to put in the book.
 
 The others are views of the database and rebuild themselves, which is what
 stops them drifting from what they claim to show.

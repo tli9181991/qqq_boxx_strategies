@@ -1717,3 +1717,222 @@ def test_a_disabled_stop_does_not_demand_a_benchmark():
                            max_staleness_days=10_000, min_coverage=0.5,
                            now=frame.index[-1])
     assert book.halted is False
+
+
+# --------------------------------------------------------------------------
+# The shadow log
+# --------------------------------------------------------------------------
+
+def test_the_shadow_log_marks_where_the_candidate_disagrees(tmp_path):
+    """The divergence is the whole product, so it is a column, not a join."""
+    path = str(tmp_path / "shadow_log.csv")
+    rows = [dict(weight=1.25, slot=1, symbol="MRVL", rank=1),
+            dict(weight=1.25, slot=2, symbol="QCOM", rank=6)]
+
+    assert st.append_shadow_csv(path, "2026-09-16", rows,
+                                live_held=["MRVL", "PANW"]) == 2
+
+    import csv as _csv
+    got = list(_csv.DictReader(open(path)))
+    assert [r["symbol"] for r in got] == ["MRVL", "QCOM"]
+    assert got[0]["live_held"] == "yes", "the live book holds MRVL too"
+    assert got[1]["live_held"] == "", "QCOM is where the candidate differs"
+    assert got[0]["weight"] == "1.25" and got[0]["rank"] == "1"
+
+
+def test_relogging_the_same_shadow_day_is_a_no_op(tmp_path):
+    path = str(tmp_path / "shadow_log.csv")
+    rows = [dict(weight=2.0, slot=1, symbol="MU", rank=1)]
+    st.append_shadow_csv(path, "2026-09-16", rows)
+    assert st.append_shadow_csv(path, "2026-09-16", rows) == 0
+
+    import csv as _csv
+    assert len(list(_csv.DictReader(open(path)))) == 1
+
+
+def test_the_shadow_book_cannot_reach_an_order():
+    """The guarantee the whole design rests on: it is logged, never traded.
+
+    An order list built from a book carrying shadow picks must be identical to
+    one built from the same book without them -- so a candidate rule cannot buy
+    anything however wrong it is.
+    """
+    from qbs.live.orders import build_orders
+    import dataclasses
+
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
+
+    plain = compute_targets(cfg, frame, requested=list(uni.columns),
+                            now=frame.index[-1], shadow_weights=())
+    shadowed = compute_targets(cfg, frame, requested=list(uni.columns),
+                               now=frame.index[-1], shadow_weights=(1.25, 2.0))
+
+    assert shadowed.shadow, "the fixture should produce shadow picks to begin with"
+    assert not plain.shadow
+    # Every field that decides an order is untouched by the candidate rules.
+    for f in ("weights", "prices", "scalar", "raw_holdings", "universe", "halted"):
+        assert getattr(plain, f) == getattr(shadowed, f), f
+
+    held = {t: 10 for t in plain.raw_holdings[:2]}
+    guards = (40_000.0, 1.60, 12)
+    a, ta = build_orders(plain.weights, plain.prices, held, 100_000.0, *guards,
+                         universe=plain.universe)
+    b, tb = build_orders(shadowed.weights, shadowed.prices, held, 100_000.0, *guards,
+                         universe=shadowed.universe)
+    assert [dataclasses.astuple(o) for o in a] == [dataclasses.astuple(o) for o in b]
+    assert ta == tb
+
+
+# --------------------------------------------------------------------------
+# The watchlist, and the universe it is kept out of
+# --------------------------------------------------------------------------
+
+def _watch_fixture():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
+    return cfg, frame, list(uni.columns)
+
+
+def test_only_requested_names_are_rankable():
+    """A column in the frame is not a licence to buy it.
+
+    The frame carries the safe asset and the benchmark, and once the watchlist
+    exists it carries names that are deliberately not constituents. Ranking
+    'everything except the safe asset' made every one of them a candidate the
+    book could take a slot in.
+    """
+    cfg, frame, names = _watch_fixture()
+    book = compute_targets(cfg, frame, requested=names, now=frame.index[-1],
+                           record_ranks=99)
+    assert cfg.dd_stop_benchmark not in book.universe
+    assert cfg.dd_stop_benchmark not in [r["symbol"] for r in book.ranking]
+    assert cfg.dd_stop_benchmark not in book.weights
+    assert set(book.raw_holdings) <= set(names)
+
+
+def test_a_watched_name_is_ranked_but_never_held():
+    cfg, frame, names = _watch_fixture()
+    watched = cfg.dd_stop_benchmark          # a real non-constituent in the frame
+
+    plain = compute_targets(cfg, frame, requested=names, now=frame.index[-1])
+    book = compute_targets(cfg, frame, requested=names, now=frame.index[-1],
+                           watch_names=[watched])
+
+    assert [r["symbol"] for r in book.watchlist] == [watched]
+    assert not plain.watchlist
+    # Watching a name changes nothing about the book that holds it.
+    assert plain.weights == book.weights
+    assert plain.raw_holdings == book.raw_holdings
+    assert watched not in book.universe and watched not in book.weights
+
+    row = book.watchlist[0]
+    # A cutoff is the score of the name in that slot, so it exists only when
+    # the slot is filled. Reporting a number for a slot nobody occupies would
+    # claim a hurdle the watched name does not actually have to clear.
+    qualifying = len([r for r in book.ranking if r["rank"]])
+    assert (row["book_cutoff"] == row["book_cutoff"]) == \
+        (qualifying >= cfg.momentum.n_hold)
+    if row["book_cutoff"] == row["book_cutoff"] and row["band_cutoff"] == row["band_cutoff"]:
+        assert row["book_cutoff"] >= row["band_cutoff"], "the band must be easier"
+    if row["rank"] == row["rank"]:
+        assert row["beats_book"] == (row["rank"] <= cfg.momentum.n_hold)
+
+
+def test_a_filtered_out_watch_name_is_unranked_not_ranked_last(tmp_path):
+    """Losing to cash is not the same as placing last, and the log must say so."""
+    from qbs.shadow import watchlist_rows
+
+    cfg, frame, names = _watch_fixture()
+    safe = frame[cfg.momentum.safe_asset]
+    uni = frame[names]
+    # A name that only ever falls cannot clear the absolute filter.
+    falling = pd.DataFrame(
+        {"DOG": 100 * 0.999 ** np.arange(len(frame))}, index=frame.index)
+    rows = watchlist_rows(uni, safe, falling, cfg.momentum)
+
+    assert len(rows) == 1 and rows[0]["symbol"] == "DOG"
+    assert rows[0]["rank"] != rows[0]["rank"], "a filtered name must not get a rank"
+    assert rows[0]["beats_book"] is False
+
+    path = str(tmp_path / "watchlist_log.csv")
+    assert st.append_watchlist_csv(path, "2026-09-16", rows) == 1
+    import csv as _csv
+    got = list(_csv.DictReader(open(path)))
+    assert got[0]["rank"] == "", "an excluded name must not read as a weak one"
+    assert got[0]["beats_book"] == ""
+    # And the day is keyed, like every other appended log.
+    assert st.append_watchlist_csv(path, "2026-09-16", rows) == 0
+
+
+def test_a_constituent_on_the_watchlist_reports_its_standing_rank():
+    """A watchlist is a list and will mix the two kinds.
+
+    GOOGL is in the index and TSM is not. Dropping the constituents would look
+    like the feature silently failing on half the list; interpolating them
+    would produce a number that disagrees with ranking_log.csv for the same
+    name on the same day.
+    """
+    from qbs.shadow import watchlist_rows
+    from qbs.strategies import cross_sectional_momentum
+
+    cfg, frame, names = _watch_fixture()
+    uni, safe = frame[names], frame[cfg.momentum.safe_asset]
+
+    live = cross_sectional_momentum(uni, safe, cfg.momentum, record_ranks=99)
+    dt = live.weights.index[-1]
+    standing = {t: r for t, r, _ in live.rank_log[dt]}
+    assert standing, "the fixture must rank something for this test to mean anything"
+    inside = max(standing, key=standing.get)        # a name that really is ranked
+
+    outside = pd.DataFrame(
+        {"TSMX": 100 * 1.004 ** np.arange(len(frame))}, index=frame.index)
+    rows = {r["symbol"]: r for r in
+            watchlist_rows(uni, safe, uni[[inside]].join(outside), cfg.momentum)}
+
+    assert set(rows) == {inside, "TSMX"}
+    assert rows[inside]["constituent"] and not rows["TSMX"]["constituent"]
+    assert rows[inside]["rank"] == standing[inside], \
+        "a constituent must report the rank the book actually acts on"
+    # The outsider is interpolated into the same ranking, and placing it there
+    # must not have pushed the constituent off its own rung.
+    assert rows["TSMX"]["rank"] == 1, "the fixture outsider should top the list"
+    assert rows[inside]["rank"] == standing[inside]
+
+
+def test_watched_names_are_placed_independently_of_each_other():
+    """Adding a name to the list must not move what another row reports."""
+    from qbs.shadow import watchlist_rows
+
+    cfg, frame, names = _watch_fixture()
+    uni, safe = frame[names], frame[cfg.momentum.safe_asset]
+
+    # Two outsiders that both clear the absolute filter, one clearly stronger,
+    # so a joint ranking would visibly push the weaker one down a place.
+    outs = pd.DataFrame({
+        "ROCKET": 100 * 1.004 ** np.arange(len(frame)),
+        "STEADY": 100 * 1.002 ** np.arange(len(frame)),
+    }, index=frame.index)
+
+    alone = {r["symbol"]: r["rank"] for r in
+             watchlist_rows(uni, safe, outs[["STEADY"]], cfg.momentum)}
+    rows = watchlist_rows(uni, safe, outs, cfg.momentum)
+    together = {r["symbol"]: r["rank"] for r in rows}
+
+    assert together["ROCKET"] == together["ROCKET"], "ROCKET should be ranked"
+    assert alone["STEADY"] == alone["STEADY"], "STEADY should be ranked"
+    assert together["ROCKET"] < together["STEADY"], "the fixture should outrank it"
+    assert together["STEADY"] == alone["STEADY"], \
+        "one outsider's momentum has nothing to do with another's rank"
+    # And the cutoffs stay the constituents' own, whoever is being watched.
+    assert len({r["book_cutoff"] for r in rows}) == 1
