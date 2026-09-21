@@ -1180,7 +1180,19 @@ check, and nothing is billed. **Everything that does not need the model keeps wo
 `python -m qbs.agent --report ...`. That is the point of a switch rather than an
 uninstall.
 
-Only an explicit off-word re-enables it — `0`, `false`, `no`, `off`, `none`,
+**There is a narrower switch too.** `QBS_DISABLE_CHAT=1` stops only the Analyst tab's
+chat and **leaves the news read running** — which is what you want when bringing one
+feature up at a time, or when the chat is the token-heavy half and the daily summary is
+not. It is enforced in `build_analyst`/`analyse` rather than in `build_model`, because
+the news read goes through `build_model` and has to survive it. The master switch wins
+and is reported as the reason, so someone who set `QBS_DISABLE_ANALYST` is told *that*
+rather than handed a message about a switch they never touched.
+
+`--check` reports the two separately, and its exit code means **broken**, not
+*switched off* — a deliberate shutdown is a working configuration, and a script asking
+"is this install OK?" should not be told no because you turned a feature off on purpose.
+
+Only an explicit off-word re-enables either — `0`, `false`, `no`, `off`, `none`,
 `disabled`. **Any other non-empty value switches it off.** That is deliberately not
 `qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
 as false: for a flag whose job is to stop spending money, an unrecognised value has to

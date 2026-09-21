@@ -345,6 +345,73 @@ def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
     assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
 
 
+def test_the_chat_switch_leaves_the_news_read_running(monkeypatch):
+    """The point of having two switches: bring one feature up at a time. A
+    chat-only shutdown must not silence the daily read."""
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert env.chat_disabled() and env.DISABLE_CHAT_VAR in env.chat_disabled()
+    assert env.analyst_disabled() is None, "the news read answers to the master"
+
+
+def test_the_master_switch_outranks_the_chat_switch(monkeypatch):
+    """Someone who set QBS_DISABLE_ANALYST needs to be told THAT, not handed a
+    message about a chat switch they never touched."""
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
+
+    reason = env.chat_disabled()
+    assert reason and env.DISABLE_VAR in reason
+    assert env.DISABLE_CHAT_VAR not in reason
+
+
+def test_the_chat_switch_fails_safe_like_the_master(monkeypatch):
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    for value in ("", "0", "false", "off", "none", "disabled"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled() is None, value
+    for value in ("1", "true", "yes", "disable", "temporarily"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled(), value
+
+
+def test_the_two_roles_are_checked_separately(monkeypatch):
+    from qbs.agent import analyst
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert analyst.check_requirements(role="summary") is None, "news is ready"
+    chat = analyst.check_requirements(role="chat")
+    assert chat and env.DISABLE_CHAT_VAR in chat
+
+
+def test_a_chat_switched_off_still_summarises(monkeypatch):
+    """`build_model` must NOT answer to the chat switch -- the news read goes
+    through it, and enforcing there would take both features down together."""
+    from qbs.agent import analyst, sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+
+    reached = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        reached["model"] = model
+        raise RuntimeError("far enough -- the switch did not stop us")
+
+    monkeypatch.setattr(analyst, "build_model", spy)
+    out = snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert reached, "the chat switch blocked the news read"
+    assert env.DISABLE_CHAT_VAR not in (out.error or "")
+
+    # And the chat itself is stopped.
+    assert analyst.analyse("anything").disabled
+
+
 def test_either_google_key_name_resolves():
     """Google's own docs use both names, and people copy whichever they read.
     Accepting one and ignoring the other reports a missing key that is

@@ -53,12 +53,13 @@ def main(argv=None) -> int:
     if args.check:
         from .analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
                               _default_thinking_budget, check_requirements)
-        from .env import (DISABLE_VAR, KNOWN_KEYS, analyst_disabled, load_env,
+        from .env import (DISABLE_CHAT_VAR, DISABLE_VAR, KNOWN_KEYS,
+                          analyst_disabled, chat_disabled, load_env,
                           resolve_google_key)
         from .news import available_backends
         loaded = load_env()
         off = analyst_disabled()
-        missing = check_requirements()
+        missing = check_requirements(role="chat")
         print(f".env:            {loaded.summary()}")
         # Key names and set/unset only. Printing a secret to a terminal puts
         # it in the scrollback and the shell history of whoever ran --check.
@@ -76,15 +77,24 @@ def main(argv=None) -> int:
         # The switch gets its own line and its own word. "NOT ready" reads as
         # a misconfiguration and sends someone hunting for one; "disabled on
         # purpose" tells them they already know the cause.
-        state = os.environ.get(DISABLE_VAR)
-        print(f"{DISABLE_VAR}: {state!r}" if state else
-              f"{DISABLE_VAR}: unset (the analyst may call Gemini)")
-        if off:
-            print("analyst:         DISABLED on purpose — "
-                  f"unset {DISABLE_VAR} to turn it back on")
-        else:
-            print(f"analyst:         {'ready' if not missing else 'NOT ready — ' + missing}")
-        return 0 if not missing else 1
+        for var in (DISABLE_VAR, DISABLE_CHAT_VAR):
+            state = os.environ.get(var)
+            print(f"{var}: {state!r}" if state else f"{var}: unset")
+        chat_off = chat_disabled()
+        # The two features answer to different switches, so they are reported
+        # separately -- "the analyst is off" would be wrong for a run where
+        # only the chat is.
+        print(f"news read:       {'DISABLED — ' + off if off else 'ready'}")
+        print("chat:            "
+              + ("DISABLED on purpose" if chat_off else
+                 "ready" if not missing else "NOT ready — " + missing))
+        # Non-zero means BROKEN, not "switched off". A deliberate shutdown is
+        # a working configuration, and a script asking "is this install OK?"
+        # should not be told no because someone turned a feature off on
+        # purpose. `role="summary"` is the config-only check: it answers to
+        # the master switch alone, so `and not off` leaves real problems.
+        problem = check_requirements(role="summary")
+        return 1 if (problem and not off) else 0
 
     if args.models:
         return _models()

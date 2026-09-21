@@ -35,6 +35,12 @@ this package without uninstalling anything. `check_requirements` reports it,
 -- so nothing reaches the API even from a caller that skipped the check.
 Everything that does not need the model keeps working.
 
+`QBS_DISABLE_CHAT=1` is the narrower one: it stops this chat and leaves the
+news read running, which is what you want when bringing one feature up at a
+time. It is enforced in `build_analyst` and `analyse` rather than in
+`build_model`, because the news read goes through `build_model` and must
+survive it.
+
 Requirements
 ------------
 `pip install -r requirements-agent.txt` and a Google AI Studio key, either
@@ -50,7 +56,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .env import analyst_disabled, load_env, resolve_google_key
+from .env import (analyst_disabled, chat_disabled, load_env,
+                  resolve_google_key)
 
 # Two roles, two models, because they are not the same job.
 #
@@ -186,8 +193,11 @@ class Answer:
         return self.text
 
 
-def check_requirements() -> Optional[str]:
-    """What is missing before an agent can run, or None if nothing is.
+def check_requirements(role: str = "chat") -> Optional[str]:
+    """What is missing before `role` can run, or None if nothing is.
+
+    `role` is "chat" (the Analyst tab, also stopped by QBS_DISABLE_CHAT) or
+    "summary" (the news read, stopped only by the master switch).
 
     Returned rather than raised so a UI can render the remedy next to a
     disabled button instead of catching an exception to read its message.
@@ -197,7 +207,10 @@ def check_requirements() -> Optional[str]:
     # different remedies, and "put a key in .env" is actively wrong advice
     # for someone who turned the analyst off on purpose.
     load_env()
-    off = analyst_disabled()
+    # `role` picks WHICH switch applies. The news read only cares about the
+    # master switch; the chat is also stopped by its own. One function, so a
+    # caller cannot accidentally ask about the wrong one.
+    off = chat_disabled() if role == "chat" else analyst_disabled()
     if off:
         return off
     try:
@@ -263,7 +276,7 @@ def build_analyst(
     **tool_kwargs,
 ):
     """A compiled tool-calling agent. Raises with a remedy if unusable."""
-    missing = check_requirements()
+    missing = check_requirements(role="chat")
     if missing:
         raise RuntimeError(f"Cannot build the analyst: {missing}")
     from langchain.agents import create_agent
@@ -306,9 +319,12 @@ def analyse(
     name = model or DEFAULT_MODEL
     # Checked before building anything: a switched-off analyst should not
     # spend a second loading a universe it is never going to reason about.
-    off = analyst_disabled()
+    # The chat switch, not the master one -- this is the chat. `chat_disabled`
+    # reports the master switch when that is what is set, so the message names
+    # the thing actually switched off.
+    off = chat_disabled()
     if off:
-        return Answer(text=f"The analyst is disabled — {off}", model=name,
+        return Answer(text=f"The chat is disabled — {off}", model=name,
                       error=off, disabled=True)
     try:
         agent = agent or build_analyst(model=name,

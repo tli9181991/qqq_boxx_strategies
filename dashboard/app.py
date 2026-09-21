@@ -651,25 +651,34 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
                                _default_thinking_budget, analyse,
                                check_requirements)
-from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
+from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_VAR, analyst_disabled,
+                           chat_disabled, load_env)
 from qbs.agent.evidence import Book
 from qbs.agent.news import available_backends
 from qbs.agent.sentiment import parse_published as snt_parse_published
 
 env_load = load_env()
 switched_off = analyst_disabled()
-blocker = check_requirements()
+chat_off = chat_disabled()
+# Two blockers, because the two features can be switched off independently:
+# the chat has its own kill switch and the news read does not answer to it.
+chat_blocker = check_requirements(role="chat")
+news_blocker = check_requirements(role="summary")
+blocker = chat_blocker                    # the Analyst tab's own gate
 backends = available_backends()
 
 with st.sidebar:
     st.markdown("---")
     st.markdown("**Analyst**")
+    # The controls below stay editable on purpose -- you can line the model and
+    # the toggles up while something is off -- but without this they read as an
+    # analyst that is simply misbehaving.
     if switched_off:
-        # The controls below stay editable on purpose -- you can line the model
-        # and the toggles up while it is off -- but without this they read as
-        # an analyst that is simply misbehaving.
-        st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
-                   "saved for when it is switched back on.")
+        st.caption(f"⏸️ everything switched off by `{DISABLE_VAR}`. These "
+                   "settings are saved for when it is switched back on.")
+    elif chat_off:
+        st.caption(f"⏸️ chat only, switched off by `{DISABLE_CHAT_VAR}`. "
+                   "The news read still runs.")
     # Two models, because they are not the same job: the chat reasons over
     # tool output turn after turn (~17x the news panel's token usage), while
     # the news read is one call a day. Cheap-and-thinking for the first,
@@ -700,7 +709,7 @@ with st.sidebar:
         "Fetch fundamentals live", value=True,
         help="Off reads only what is already cached in data/fundamentals/.")
     daily_news = st.checkbox(
-        "News sentiment analysis", value=True, disabled=bool(blocker),
+        "News sentiment analysis", value=True, disabled=bool(news_blocker),
         help="One Gemini call per day on the News tab, cached to "
              "data/sentiment/. Off still shows the headlines — only the "
              "model's read of them goes away.")
@@ -1106,7 +1115,7 @@ with tab_news:
     # The model is optional here, and that is the point of this tab: the
     # headlines are worth reading with no key and no spend. `run_llm` gates
     # only the read on top.
-    run_llm = bool(daily_news) and not blocker
+    run_llm = bool(daily_news) and not news_blocker
 
     top = st.columns([3, 1])
     with top[1]:
@@ -1125,7 +1134,7 @@ with tab_news:
     with top[0]:
         if not run_llm:
             why = ("switched off in the sidebar" if not daily_news
-                   else blocker.split(" — ")[0])
+                   else news_blocker.split(" — ")[0])
             st.info(
                 f"**Headlines only — no sentiment analysis** ({why}). "
                 "Everything below is the news itself, which needs no model.",
@@ -1255,6 +1264,23 @@ with tab_analyst:
             "Streamlit reads the environment once at start-up, so **restart "
             "the app** after changing this — a rerun alone will not pick it up."
         )
+    elif chat_off:
+        # A chat switched off on purpose is not a misconfiguration, and the
+        # "install this, paste a key there" advice below would send someone to
+        # fix something that is not broken.
+        st.info(
+            f"**The chat is switched off.** `{DISABLE_CHAT_VAR}` is set, so "
+            "this tab makes no Gemini call. **The News tab's sentiment read "
+            "is unaffected and still runs** — that is what this switch is "
+            "for, bringing one feature up at a time.", icon="⏸️")
+        st.markdown(
+            "```bash\n"
+            f"unset {DISABLE_CHAT_VAR}          # or set it to 0\n"
+            "python -m qbs.agent --check\n"
+            "```")
+        st.caption(
+            "Streamlit reads the environment once at start-up, so **restart "
+            "the app** after changing this — a rerun alone will not pick it up.")
     elif blocker:
         st.warning(
             f"**The analyst is not configured.** {blocker}\n\n"
