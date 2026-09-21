@@ -1,0 +1,15 @@
+[Unit]
+Description=Patreon campaign sweep, every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:20:00
+RandomizedDelaySec=600
+
+# Persistent=true, unlike the trading timers. A missed sweep is worth catching
+# up on: the whole job of this unit is to find posts the email trigger missed,
+# and a box that was off overnight is exactly when that happens.
+Persistent=true
+Unit=patreon-sweep.service
+
+[Install]
+WantedBy=timers.target

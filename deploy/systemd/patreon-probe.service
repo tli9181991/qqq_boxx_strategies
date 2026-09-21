@@ -1,0 +1,25 @@
+[Unit]
+Description=Patreon pipeline: session health check
+Documentation=file:/opt/qbs/docs/PATREON_PIPELINE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=patreon
+Group=patreon
+WorkingDirectory=/opt/qbs
+EnvironmentFile=/etc/patreon/patreon.env
+ExecStart=/bin/sh -c '/opt/qbs/.venv/bin/python -m patreon_pipeline.runner probe "$PATREON_PROBE_URL"'
+ProtectHome=false
+Restart=no
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patreon-probe
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/patreon

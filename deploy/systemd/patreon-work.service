@@ -1,0 +1,49 @@
+[Unit]
+Description=Patreon pipeline: download queue worker
+Documentation=file:/opt/qbs/docs/PATREON_PIPELINE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=patreon
+Group=patreon
+WorkingDirectory=/opt/qbs
+EnvironmentFile=/etc/patreon/patreon.env
+ExecStart=/opt/qbs/.venv/bin/python -m patreon_pipeline.runner work
+
+# ProtectHome=false, unlike the watcher: yt-dlp reads cookies out of a browser
+# profile under the service user's home directory. If you use an exported
+# cookies file instead, set this back to true and point PATREON_COOKIES_FILE
+# at a path under /etc/patreon.
+ProtectHome=false
+
+# A healthy worker never exits -- it blocks on an empty queue. So any exit is
+# a failure of some kind, and five minutes is the right pause before trying
+# again. Exit code 3 specifically means the Patreon session expired; the
+# restart then costs one failed probe every five minutes until you log back
+# in, at which point it resumes on its own with nothing lost.
+Restart=always
+RestartSec=300
+
+# No timeout. One post can legitimately take two hours to download on a home
+# connection and another hour to transcribe; both stages have their own
+# ceilings (download_timeout, transcribe_timeout).
+#
+# Whisper is the memory-hungry part: large-v3-turbo at int8 wants roughly 1.5
+# GB resident, and the model is loaded once and kept for the life of the
+# process. On a 4 GB box that is fine alongside everything else; on a 2 GB box,
+# drop whisper_model to "small" or set transcribe to false.
+TimeoutStartSec=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patreon-work
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/patreon
+
+[Install]
+WantedBy=multi-user.target
