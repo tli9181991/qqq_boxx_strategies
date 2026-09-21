@@ -855,6 +855,103 @@ def test_analyse_without_a_key_returns_an_answer_not_an_exception(monkeypatch):
     assert answer.tool_calls == []
 
 
+def test_the_two_roles_get_two_models():
+    """The chat and the news read are different jobs with different volumes:
+    ~1.2M tokens a month against ~73k. One default for both would price the
+    cheap one like the expensive one, or vice versa."""
+    from qbs.agent.analyst import DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL
+
+    assert DEFAULT_MODEL != DEFAULT_SUMMARY_MODEL
+    assert "flash" in DEFAULT_MODEL, "the chat is the token-heavy one"
+    assert "pro" in DEFAULT_SUMMARY_MODEL, "the daily read can afford it"
+
+
+def test_one_variable_can_point_both_roles_at_one_model(monkeypatch):
+    """Running a single model everywhere should be one variable, not two --
+    and setting both must still split them."""
+    import importlib
+    from qbs.agent import analyst
+
+    def reload_with(**env_vars):
+        for k in ("QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env_vars.items():
+            monkeypatch.setenv(k, v)
+        return importlib.reload(analyst)
+
+    one = reload_with(QBS_GEMINI_MODEL="some-new-model")
+    assert one.DEFAULT_MODEL == one.DEFAULT_SUMMARY_MODEL == "some-new-model"
+
+    both = reload_with(QBS_GEMINI_MODEL="chatty", QBS_SUMMARY_MODEL="thinky")
+    assert (both.DEFAULT_MODEL, both.DEFAULT_SUMMARY_MODEL) == ("chatty", "thinky")
+
+    plain = reload_with()
+    assert plain.DEFAULT_MODEL != plain.DEFAULT_SUMMARY_MODEL, \
+        "with nothing set, the built-in split stands"
+    importlib.reload(analyst)          # leave the module as the suite found it
+
+
+def test_the_thinking_budget_reads_its_env_var(monkeypatch):
+    from qbs.agent.analyst import _default_thinking_budget
+
+    monkeypatch.delenv("QBS_THINKING_BUDGET", raising=False)
+    assert _default_thinking_budget() == -1, "dynamic unless told otherwise"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "0")
+    assert _default_thinking_budget() == 0, "0 must survive -- it means OFF"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "2048")
+    assert _default_thinking_budget() == 2048
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "lots")
+    assert _default_thinking_budget() == -1, "junk falls back, never raises"
+
+
+def test_the_budget_is_sent_to_the_chat_model(monkeypatch):
+    """`0` is a real value meaning "no thinking", which is why the sentinel is
+    the string "default" and not None -- collapsing them would make one of
+    "send nothing" and "use the configured budget" unreachable."""
+    pytest.importorskip("langchain_google_genai")
+    import langchain_google_genai as ggenai
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, **kwargs):
+            seen.clear()
+            seen.update(kwargs)
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "x")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(ggenai, "ChatGoogleGenerativeAI", Spy)
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=1024)
+    assert seen["thinking_budget"] == 1024
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=0)
+    assert seen["thinking_budget"] == 0, "0 must be SENT, not treated as unset"
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=None)
+    assert "thinking_budget" not in seen, "None sends nothing at all"
+
+
+def test_the_news_read_uses_the_summary_model_without_thinking(monkeypatch):
+    """Extraction into a fixed JSON shape is not multi-step reasoning, and
+    paying for thinking tokens to restate headlines buys nothing."""
+    from qbs.agent import analyst, sentiment as snt
+
+    seen = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        seen["model"] = model
+        seen["thinking_budget"] = thinking_budget
+        raise RuntimeError("stop here -- the call itself is not the point")
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(analyst, "build_model", spy)
+    snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert seen["model"] == analyst.DEFAULT_SUMMARY_MODEL
+    assert seen["thinking_budget"] is None
+
+
 def test_the_prompt_names_the_lookback_the_ranker_actually_uses():
     """A prompt that hard-codes 12-1 teaches the model a fact about this lab
     that stopped being true in a diff it cannot see."""

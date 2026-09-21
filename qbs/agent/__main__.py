@@ -14,6 +14,9 @@ from the environment, which wins. `--check` says which, without printing it.
 
 `QBS_DISABLE_ANALYST=1` switches Gemini off without uninstalling anything.
 `--report` and everything else in this package carry on working.
+
+`--models` asks the API which model IDs your key can serve, which is the only
+reliable way to settle whether a name you read somewhere actually exists.
 """
 
 from __future__ import annotations
@@ -41,12 +44,15 @@ def main(argv=None) -> int:
                     help="allow the price cache to refresh from the network")
     ap.add_argument("--check", action="store_true",
                     help="report whether the analyst can run, then exit")
+    ap.add_argument("--models", action="store_true",
+                    help="list the model IDs your key can actually serve")
     ap.add_argument("--quiet", action="store_true",
                     help="print the answer only, without the tool trace")
     args = ap.parse_args(argv)
 
     if args.check:
-        from .analyst import DEFAULT_MODEL, check_requirements
+        from .analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
+                              _default_thinking_budget, check_requirements)
         from .env import (DISABLE_VAR, KNOWN_KEYS, analyst_disabled, load_env,
                           resolve_google_key)
         from .news import available_backends
@@ -59,7 +65,13 @@ def main(argv=None) -> int:
         present = [k for k in KNOWN_KEYS if os.environ.get(k)]
         print(f"keys set:        {', '.join(present) or 'none'}")
         print(f"google key:      {'found' if resolve_google_key() else 'MISSING'}")
-        print(f"model:           {DEFAULT_MODEL}")
+        budget = _default_thinking_budget()
+        print(f"chat model:      {DEFAULT_MODEL}"
+              + (f" · thinking budget {budget}"
+                 + (" (dynamic)" if budget == -1 else
+                    " (off)" if budget == 0 else "")
+                 if budget is not None else " · no thinking budget sent"))
+        print(f"summary model:   {DEFAULT_SUMMARY_MODEL} (news read, no thinking)")
         print(f"search backends: {', '.join(available_backends()) or 'none'}")
         # The switch gets its own line and its own word. "NOT ready" reads as
         # a misconfiguration and sends someone hunting for one; "disabled on
@@ -73,6 +85,9 @@ def main(argv=None) -> int:
         else:
             print(f"analyst:         {'ready' if not missing else 'NOT ready — ' + missing}")
         return 0 if not missing else 1
+
+    if args.models:
+        return _models()
 
     if args.report:
         return _report(args)
@@ -88,6 +103,58 @@ def main(argv=None) -> int:
         print("Tools called: " + ", ".join(answer.tools_used), file=sys.stderr)
     print(answer.text)
     return 1 if answer.error else 0
+
+
+def _models() -> int:
+    """What this key can serve, straight from the API.
+
+    Model names move faster than any file in this repo, and guessing one is
+    how you get a 404 three layers down inside LangChain. This asks the
+    source: no memory, no docs, no table that went stale.
+    """
+    from .env import load_env, resolve_google_key
+
+    load_env()
+    key = resolve_google_key()
+    if not key:
+        print("No API key. Put GOOGLE_API_KEY in .env or export it.",
+              file=sys.stderr)
+        return 1
+    try:
+        from google import genai
+    except ImportError as exc:
+        print(f"google-genai is not installed ({exc}); it ships with "
+              f"langchain-google-genai — pip install -r requirements-agent.txt",
+              file=sys.stderr)
+        return 1
+
+    try:
+        models = list(genai.Client(api_key=key).models.list())
+    except Exception as exc:                      # noqa: BLE001
+        print(f"Could not list models: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+
+    from .analyst import DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL
+
+    configured = {DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL}
+    names = []
+    for m in models:
+        name = str(getattr(m, "name", m)).replace("models/", "")
+        actions = getattr(m, "supported_actions", None) or []
+        if actions and "generateContent" not in actions:
+            continue                              # embeddings and the like
+        names.append(name)
+
+    for name in sorted(names):
+        mark = "  <- configured" if name in configured else ""
+        print(f"  {name}{mark}")
+    print(f"\n{len(names)} models generate content with this key.")
+    for want in sorted(configured):
+        if want not in names:
+            print(f"WARNING: {want} is configured but NOT in that list — "
+                  f"calls using it will fail.", file=sys.stderr)
+    return 0
 
 
 def _report(args) -> int:

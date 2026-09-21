@@ -648,7 +648,9 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 # needs `model_name` for its news summary, and a sidebar control created in a
 # later tab does not exist yet when an earlier one reads it.
 
-from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
+from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
+                               _default_thinking_budget, analyse,
+                               check_requirements)
 from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
 from qbs.agent.evidence import Book
 from qbs.agent.news import available_backends
@@ -668,9 +670,27 @@ with st.sidebar:
         # an analyst that is simply misbehaving.
         st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
                    "saved for when it is switched back on.")
-    model_name = st.text_input("Gemini model", DEFAULT_MODEL,
-                               help="Model names move faster than this app. "
-                                    "Override here or set QBS_GEMINI_MODEL.")
+    # Two models, because they are not the same job: the chat reasons over
+    # tool output turn after turn (~17x the news panel's token usage), while
+    # the news read is one call a day. Cheap-and-thinking for the first,
+    # strong for the second.
+    model_name = st.text_input("Chat model", DEFAULT_MODEL,
+                               help="The Analyst tab's chat. Reasons over tool "
+                                    "output every turn, so it is the expensive "
+                                    "one. Override here or set QBS_GEMINI_MODEL.")
+    thinking = st.number_input(
+        "Thinking budget", min_value=-1, max_value=32768,
+        value=int(_default_thinking_budget() or -1), step=512,
+        help="Chat model only. −1 lets it decide, 0 turns thinking off, a "
+             "positive number caps it in tokens. The accepted range is "
+             "model-specific — the API rejects a bad one, this app does not "
+             "second-guess it. Or set QBS_THINKING_BUDGET.")
+    summary_model = st.text_input(
+        "News summary model", DEFAULT_SUMMARY_MODEL,
+        help="The News tab. One call a day over ~30 headlines, so the stronger "
+             "model costs pennies a month. No thinking budget is sent — this "
+             "is extraction into a fixed shape, not multi-step reasoning. "
+             "Or set QBS_SUMMARY_MODEL.")
     allow_web = st.checkbox("Allow web search", value=bool(backends),
                             disabled=not backends,
                             help=("Search backends found: "
@@ -1098,7 +1118,7 @@ with tab_news:
             st.rerun()
 
     feed, summary, from_cache = load_news(
-        _today, NEWS_HOURS, model_name.strip(),
+        _today, NEWS_HOURS, summary_model.strip(),
         st.session_state["news_token"], run_llm)
 
     # ---- the read, when there is a model to do it ------------------------
@@ -1333,6 +1353,7 @@ with tab_analyst:
             with st.spinner(f"Asking {model_name}…"):
                 answer = analyse(
                     asked, model=model_name.strip() or None, history=history,
+                    thinking_budget=int(thinking),
                     book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
                     offline_fundamentals=not live_fundamentals)
 
