@@ -397,8 +397,11 @@ def compute_targets(
                         "is unaffected", type(exc).__name__, exc)
 
     watchlist: List[Dict] = []
-    wanted_watch = [t for t in watch_names if t in prices.columns
-                    and t not in uni.columns]
+    # Constituents stay on the list: a watchlist is a list, and dropping the
+    # names that happen to be in the index would look like the feature failing
+    # on half of them. They are reported at their standing rank rather than
+    # interpolated into one.
+    wanted_watch = [t for t in watch_names if t in prices.columns]
     if wanted_watch:
         from ..shadow import watchlist_rows
         watchlist = watchlist_rows(uni, prices[safe], prices[wanted_watch],
@@ -410,8 +413,10 @@ def compute_targets(
                 return f"{label} {100 * v:+.1f}%" if v == v else f"{label} unfilled"
             place = (f"rank {r['rank']:.0f}" if r["rank"] == r["rank"]
                      else "unranked (lost to the safe asset, or too little history)")
-            log.info("watch %s: %s, 6-1 momentum %+.1f%% (%s, %s)",
-                     r["symbol"], place, 100 * r["score"],
+            log.info("watch %s: %s%s, 6-1 momentum %+.1f%% (%s, %s)",
+                     r["symbol"], place,
+                     "" if r["constituent"] else " if it were a constituent",
+                     100 * r["score"],
                      _cut(r["book_cutoff"], "book needs"),
                      _cut(r["band_cutoff"], "band"))
 

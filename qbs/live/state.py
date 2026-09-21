@@ -226,8 +226,8 @@ def write_book_csv(path: str,
 
 RANKING_CSV_COLUMNS = ["asof", "rank", "symbol", "score", "held"]
 SHADOW_CSV_COLUMNS = ["asof", "weight", "slot", "symbol", "rank", "live_held"]
-WATCHLIST_CSV_COLUMNS = ["asof", "symbol", "rank", "score", "book_cutoff",
-                         "band_cutoff", "beats_book"]
+WATCHLIST_CSV_COLUMNS = ["asof", "symbol", "constituent", "rank", "score",
+                         "book_cutoff", "band_cutoff", "beats_book"]
 
 
 def append_watchlist_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> int:
@@ -258,6 +258,9 @@ def append_watchlist_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> in
             w.writerow({
                 "asof": asof,
                 "symbol": r.get("symbol", ""),
+                # Whether the book could actually buy it, which is what
+                # separates a standing rank from an interpolated one.
+                "constituent": "yes" if r.get("constituent") else "",
                 "rank": _num(r.get("rank"), ".0f"),
                 "score": _num(r.get("score"), ".6f"),
                 "book_cutoff": _num(r.get("book_cutoff"), ".6f"),

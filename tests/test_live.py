@@ -1873,3 +1873,66 @@ def test_a_filtered_out_watch_name_is_unranked_not_ranked_last(tmp_path):
     assert got[0]["beats_book"] == ""
     # And the day is keyed, like every other appended log.
     assert st.append_watchlist_csv(path, "2026-09-16", rows) == 0
+
+
+def test_a_constituent_on_the_watchlist_reports_its_standing_rank():
+    """A watchlist is a list and will mix the two kinds.
+
+    GOOGL is in the index and TSM is not. Dropping the constituents would look
+    like the feature silently failing on half the list; interpolating them
+    would produce a number that disagrees with ranking_log.csv for the same
+    name on the same day.
+    """
+    from qbs.shadow import watchlist_rows
+    from qbs.strategies import cross_sectional_momentum
+
+    cfg, frame, names = _watch_fixture()
+    uni, safe = frame[names], frame[cfg.momentum.safe_asset]
+
+    live = cross_sectional_momentum(uni, safe, cfg.momentum, record_ranks=99)
+    dt = live.weights.index[-1]
+    standing = {t: r for t, r, _ in live.rank_log[dt]}
+    assert standing, "the fixture must rank something for this test to mean anything"
+    inside = max(standing, key=standing.get)        # a name that really is ranked
+
+    outside = pd.DataFrame(
+        {"TSMX": 100 * 1.004 ** np.arange(len(frame))}, index=frame.index)
+    rows = {r["symbol"]: r for r in
+            watchlist_rows(uni, safe, uni[[inside]].join(outside), cfg.momentum)}
+
+    assert set(rows) == {inside, "TSMX"}
+    assert rows[inside]["constituent"] and not rows["TSMX"]["constituent"]
+    assert rows[inside]["rank"] == standing[inside], \
+        "a constituent must report the rank the book actually acts on"
+    # The outsider is interpolated into the same ranking, and placing it there
+    # must not have pushed the constituent off its own rung.
+    assert rows["TSMX"]["rank"] == 1, "the fixture outsider should top the list"
+    assert rows[inside]["rank"] == standing[inside]
+
+
+def test_watched_names_are_placed_independently_of_each_other():
+    """Adding a name to the list must not move what another row reports."""
+    from qbs.shadow import watchlist_rows
+
+    cfg, frame, names = _watch_fixture()
+    uni, safe = frame[names], frame[cfg.momentum.safe_asset]
+
+    # Two outsiders that both clear the absolute filter, one clearly stronger,
+    # so a joint ranking would visibly push the weaker one down a place.
+    outs = pd.DataFrame({
+        "ROCKET": 100 * 1.004 ** np.arange(len(frame)),
+        "STEADY": 100 * 1.002 ** np.arange(len(frame)),
+    }, index=frame.index)
+
+    alone = {r["symbol"]: r["rank"] for r in
+             watchlist_rows(uni, safe, outs[["STEADY"]], cfg.momentum)}
+    rows = watchlist_rows(uni, safe, outs, cfg.momentum)
+    together = {r["symbol"]: r["rank"] for r in rows}
+
+    assert together["ROCKET"] == together["ROCKET"], "ROCKET should be ranked"
+    assert alone["STEADY"] == alone["STEADY"], "STEADY should be ranked"
+    assert together["ROCKET"] < together["STEADY"], "the fixture should outrank it"
+    assert together["STEADY"] == alone["STEADY"], \
+        "one outsider's momentum has nothing to do with another's rank"
+    # And the cutoffs stay the constituents' own, whoever is being watched.
+    assert len({r["book_cutoff"] for r in rows}) == 1

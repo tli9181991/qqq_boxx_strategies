@@ -118,32 +118,40 @@ def watchlist_rows(
     params: Optional[MomentumParams] = None,
     asof: Optional[pd.Timestamp] = None,
 ) -> List[Dict]:
-    """Where a name outside the ranking universe would place, if it were in it.
+    """Where each watched name places in the constituents' 6-1 ranking.
 
-    For watching a stock the book cannot buy -- TSM is the case this was built
-    for: a semiconductor the whole book is correlated with, and not a Nasdaq-100
-    constituent. The question "is TSM stronger than what we hold?" is a real
-    one, and answering it by adding TSM to `extra_tickers` would have answered
-    a different question, because until this release anything in the price
-    frame was a name the ranker could put in the book.
+    For reading a stock against the book without letting the book buy it. TSM
+    is the case this was built for: a semiconductor the whole book is
+    correlated with, and not a Nasdaq-100 constituent. Answering "is TSM
+    stronger than what we hold?" by adding TSM to `extra_tickers` would answer
+    a different question -- anything in the price frame used to be a name the
+    ranker could put in the book.
 
-    So the watch names are ranked in a *copy* of the universe. The live book is
-    computed from the requested constituents and never sees them. What comes
-    back is each name's 6-1 momentum, the rank it would have taken, and the two
-    scores that make that rank mean something: the last name in the book and
-    the last name inside the band.
+    A watchlist is a list, and a list will mix the two kinds:
 
-    A rank of 7 does not mean the book should hold it. It means the book would
-    hold it if it were a constituent, which is a different claim, and the
-    reason this is a log rather than a signal.
+    * A **constituent** (GOOGL) is already ranked. Its rank is reported as it
+      stands in the ranking the book acts on -- no interpolation, because none
+      is needed and inventing one would disagree with `ranking_log.csv`.
+    * An **outsider** (TSM) is interpolated into that same ranking: the place
+      it would take among the constituents, and nothing else moves.
+
+    Each name is placed against the constituents alone, never against the other
+    watched names. Two outsiders on the list must not shift each other's
+    reported rank -- each row answers one question, and one outsider's momentum
+    has nothing to do with another's.
+
+    A rank of 7 does not mean the book should hold it. For an outsider it means
+    the book would hold it if it were a constituent, which is a different
+    claim, and the reason this is a log rather than a signal.
     """
     p = params or MomentumParams()
-    names = [c for c in watch.columns if c not in universe.columns]
+    names = list(watch.columns)
     if not names:
         return []
+    outsiders = [t for t in names if t not in universe.columns]
 
     try:
-        frame = universe.join(watch[names], how="left")
+        frame = universe.join(watch[outsiders], how="left") if outsiders else universe
         sig = cross_sectional_momentum(frame, safe_prices, p,
                                        record_ranks=frame.shape[1])
         dt = asof or sig.weights.index[-1]
@@ -152,23 +160,40 @@ def watchlist_rows(
         log.warning("watchlist could not be scored (%s: %s)", type(exc).__name__, exc)
         return []
 
-    # The scores that give a rank its meaning: pass these and the book holds
-    # you, fail `band` and the book sells you.
-    scores = [sc for _, _, sc in ranked]
-    book_cut = scores[p.n_hold - 1] if len(scores) >= p.n_hold else float("nan")
-    band_cut = scores[p.exit_rank - 1] if len(scores) >= p.exit_rank else float("nan")
+    # The constituents' own ranking, in order, with the outsiders taken back
+    # out. Every rank and cutoff below is measured against this, so adding a
+    # name to the watchlist cannot change what any other row reports.
+    outsider_set = set(outsiders)
+    base = [(t, sc) for t, _, sc in ranked if t not in outsider_set]
+    base_scores = [sc for _, sc in base]
 
-    placed = {t: (r, sc) for t, r, sc in ranked}
+    # A cutoff is the score of the name in that slot, so it exists only when
+    # the slot is filled: pass `book` and the book holds you, fail `band` and
+    # the book sells you.
+    book_cut = base_scores[p.n_hold - 1] if len(base_scores) >= p.n_hold else float("nan")
+    band_cut = base_scores[p.exit_rank - 1] if len(base_scores) >= p.exit_rank else float("nan")
+
+    placed = {t: sc for t, _, sc in ranked}
     rows: List[Dict] = []
     for t in names:
-        rank, score = placed.get(t, (float("nan"), float("nan")))
+        score = placed.get(t, float("nan"))
+        if score != score:
+            # Absent from the ranking means filtered out, not placed last: too
+            # little history, or it lost to the safe asset over the same
+            # window. Reporting that as "rank 99" would read as a weak name
+            # rather than an excluded one.
+            rank = float("nan")
+        else:
+            # Its own score is in `base` when it is a constituent and absent
+            # when it is not, so counting what strictly outranks it gives the
+            # standing rank in the first case and the interpolated one in the
+            # second, from the same expression.
+            rank = float(1 + sum(1 for other, sc in base
+                                 if other != t and sc > score))
         rows.append(dict(
             symbol=t, rank=rank, score=score,
             book_cutoff=book_cut, band_cutoff=band_cut,
-            # Absent from the ranking means it was filtered out, not that it
-            # placed last: too little history, or it lost to the safe asset.
-            # Reporting that as "rank 99" would read as a weak name rather than
-            # an excluded one.
+            constituent=t not in outsider_set,
             beats_book=bool(rank == rank and rank <= p.n_hold),
         ))
     return rows

@@ -448,25 +448,37 @@ just turned up" tilt. `QBS_SHADOW_WEIGHTS` sets which `w` values are scored
 and `signal`, never in `trade`: it is a few seconds of arithmetic that cannot
 change an order, and the phase racing the MOC cutoff should not be carrying it.
 
-`watchlist_log.csv` answers "is this stock stronger than what we hold?" for a
-name the book cannot buy. `QBS_WATCHLIST=TSM` scores TSM's 6-1 momentum every
-day and reports the rank it would have taken, beside the score of the last name
-in the book and the last name inside the band:
+`watchlist_log.csv` answers "is this stock stronger than what we hold?" for
+names the book may not be able to buy. `QBS_WATCHLIST=TSM,GOOGL` scores each
+name's 6-1 momentum every day and reports where it places in the constituents'
+ranking, beside the score of the last name in the book and the last name inside
+the band:
 
 ```
-watch TSM: rank 4, 6-1 momentum +131.2% (book needs +120.4%, band +90.5%)
+watch TSM:   rank 4 if it were a constituent, 6-1 momentum +131.2% (book needs +120.4%, band +90.5%)
+watch GOOGL: rank 38, 6-1 momentum +15.7% (book needs +120.4%, band +90.5%)
 ```
+
+The two lines differ because the two names do. GOOGL **is** in the index, so it
+is already ranked and the log reports the rank the book acts on — the same
+number `ranking_log.csv` has for it that day. TSM is not, so it is interpolated
+into that ranking: the place it would take among the constituents, with nothing
+else moved. The `constituent` column says which kind a row is.
+
+Each name is placed against the constituents alone, never against the other
+watched names, so adding a name to the list cannot change what any other row
+reports.
 
 A blank rank means the name was filtered out rather than ranked low — too
 little history, or it lost to BOXX over the same window. That is written as a
 blank rather than a large number, because "rank 99" would read as a weak name
 instead of an excluded one.
 
-Watched names are **not buyable**. They are ranked in a copy of the universe;
-the book is computed from the index constituents and never sees them. Do not
-try to get the same effect with `QBS_EXTRA_TICKERS` — that list is for prices
-the strategy itself needs, and anything in it is a name the ranker is entitled
-to put in the book.
+Watched non-constituents are **not buyable**. They are ranked in a copy of the
+universe; the book is computed from the index constituents and never sees them.
+Do not try to get the same effect with `QBS_EXTRA_TICKERS` — that list is for
+prices the strategy itself needs, and anything in it is a name the ranker is
+entitled to put in the book.
 
 The others are views of the database and rebuild themselves, which is what
 stops them drifting from what they claim to show.
