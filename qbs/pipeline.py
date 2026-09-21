@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
@@ -195,8 +195,26 @@ def run(
         # universe would be today's screener result applied to history --
         # i.e. names chosen for having gone up. See the README.
         if with_finviz:
+            # The screen's volume leg runs when the cache has volumes and is
+            # opted out EXPLICITLY when it does not -- the screen raises on a
+            # leg it cannot apply rather than skipping one, so this has to be
+            # a decision, not an omission. Without it the backtest is more
+            # permissive than the live definition, and `volume_filter_applied`
+            # on the returned signal records which happened.
+            from .universe import load_universe_volumes
+
+            fin_vols = load_universe_volumes(list(uni.columns))
+            if fin_vols is not None and not fin_vols.empty:
+                fin_vols = fin_vols.reindex(index=uni.index).ffill()
+                screen = cfg.finviz
+            else:
+                fin_vols, screen = None, replace(cfg.finviz, min_volume=None)
+                print("[finviz] WARNING: no cached volumes, so the screen's "
+                      "300k-share leg is NOT applied -- it is more permissive "
+                      "than the live definition. Re-download the universe "
+                      "(run_backtest.py --refresh) to enable it.")
             signals["finviz"] = finviz_momentum_screen(
-                uni, prices[SAFE_ASSET], cfg.finviz)
+                uni, prices[SAFE_ASSET], screen, volumes=fin_vols)
 
     # ---- backtest everything on identical assumptions -------------------
     results: Dict[str, BacktestResult] = {}

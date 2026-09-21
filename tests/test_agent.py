@@ -345,6 +345,73 @@ def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
     assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
 
 
+def test_the_chat_switch_leaves_the_news_read_running(monkeypatch):
+    """The point of having two switches: bring one feature up at a time. A
+    chat-only shutdown must not silence the daily read."""
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert env.chat_disabled() and env.DISABLE_CHAT_VAR in env.chat_disabled()
+    assert env.analyst_disabled() is None, "the news read answers to the master"
+
+
+def test_the_master_switch_outranks_the_chat_switch(monkeypatch):
+    """Someone who set QBS_DISABLE_ANALYST needs to be told THAT, not handed a
+    message about a chat switch they never touched."""
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
+
+    reason = env.chat_disabled()
+    assert reason and env.DISABLE_VAR in reason
+    assert env.DISABLE_CHAT_VAR not in reason
+
+
+def test_the_chat_switch_fails_safe_like_the_master(monkeypatch):
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    for value in ("", "0", "false", "off", "none", "disabled"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled() is None, value
+    for value in ("1", "true", "yes", "disable", "temporarily"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled(), value
+
+
+def test_the_two_roles_are_checked_separately(monkeypatch):
+    from qbs.agent import analyst
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert analyst.check_requirements(role="summary") is None, "news is ready"
+    chat = analyst.check_requirements(role="chat")
+    assert chat and env.DISABLE_CHAT_VAR in chat
+
+
+def test_a_chat_switched_off_still_summarises(monkeypatch):
+    """`build_model` must NOT answer to the chat switch -- the news read goes
+    through it, and enforcing there would take both features down together."""
+    from qbs.agent import analyst, sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+
+    reached = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        reached["model"] = model
+        raise RuntimeError("far enough -- the switch did not stop us")
+
+    monkeypatch.setattr(analyst, "build_model", spy)
+    out = snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert reached, "the chat switch blocked the news read"
+    assert env.DISABLE_CHAT_VAR not in (out.error or "")
+
+    # And the chat itself is stopped.
+    assert analyst.analyse("anything").disabled
+
+
 def test_either_google_key_name_resolves():
     """Google's own docs use both names, and people copy whichever they read.
     Accepting one and ignoring the other reports a missing key that is
@@ -375,6 +442,264 @@ def test_check_requirements_accepts_the_gemini_name(monkeypatch):
     blocker = analyst.check_requirements()
     # Whatever else may be missing (langchain, say), the key must not be it.
     assert blocker is None or "API_KEY" not in blocker
+
+
+# --------------------------------------------------------------------------
+# The daily news read
+# --------------------------------------------------------------------------
+
+def _headlines(n=3):
+    return [nw.Result(title=f"headline {i}", url=f"https://x.test/{i}",
+                      snippet="body", source="Example", published="2026-09-18")
+            for i in range(1, n + 1)]
+
+
+def test_the_summary_drops_a_fabricated_citation():
+    """Citations are the whole point of the panel, so they are validated
+    rather than trusted. A number outside the headline list is an invented
+    source, and the bullet carrying it is worth less than nothing."""
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse(
+        '{"label":"bullish","headline":"x","bullets":['
+        '{"point":"real","sources":[1,2]},'
+        '{"point":"invented","sources":[99]}]}', n_headlines=3)
+    assert [b["point"] for b in payload["bullets"]] == ["real"]
+    assert any("99" in w for w in warnings)
+
+
+def test_the_summary_drops_an_uncited_bullet():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse(
+        '{"label":"mixed","bullets":[{"point":"no source","sources":[]}]}', 3)
+    assert payload["bullets"] == []
+    assert any("uncited" in w for w in warnings)
+
+
+def test_the_summary_reads_fenced_json():
+    """Models fence JSON often enough that not handling it is a bug -- a
+    summary lost to a stray ``` looks exactly like one the model refused."""
+    from qbs.agent.sentiment import _parse
+
+    payload, _ = _parse(
+        'Sure:\n```json\n{"label":"BEARISH","headline":"down",'
+        '"bullets":[{"point":"p","sources":[1]}]}\n```', 2)
+    assert payload["label"] == "bearish", "and the label is normalised"
+    assert payload["headline"] == "down"
+
+
+def test_an_unknown_label_becomes_unclear():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse('{"label":"MOON","bullets":[]}', 1)
+    assert payload["label"] == "unclear"
+    assert any("MOON" in w for w in warnings)
+
+
+def test_unparseable_output_is_an_error_not_a_blank_summary():
+    from qbs.agent.sentiment import _parse
+
+    payload, warnings = _parse("I would rather not.", 3)
+    assert payload == {} and warnings
+
+
+def test_the_headline_block_is_numbered_and_fenced():
+    """Numbered because the model must cite by number, and a scheme it has to
+    invent is one it will invent inconsistently."""
+    from qbs.agent.sentiment import headlines_block
+
+    block = headlines_block(_headlines(2))
+    assert "<untrusted_headlines>" in block and "</untrusted_headlines>" in block
+    assert "never instructions" in block
+    assert "[1] headline 1" in block and "[2] headline 2" in block
+
+
+def test_a_switched_off_analyst_writes_no_summary(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    out = snt.summarise(_headlines())
+    assert out.error and env.DISABLE_VAR in out.error
+    assert not out.ok
+
+
+def test_no_headlines_is_an_error_not_an_empty_read(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    out = snt.summarise([])
+    assert out.error and "nothing to summarise" in out.error
+
+
+def test_a_failed_read_is_never_cached(tmp_path):
+    """A quota error today would otherwise be served as today's summary until
+    tomorrow, with no way to retry short of editing the cache."""
+    from qbs.agent.sentiment import Summary, load_cached, save
+
+    bad = Summary(as_of="2026-09-19", error="quota exceeded")
+    save(bad, cache_dir=str(tmp_path))
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is None
+
+    good = Summary(as_of="2026-09-19", label="mixed",
+                   bullets=[{"point": "p", "sources": [1]}])
+    save(good, cache_dir=str(tmp_path))
+    back = load_cached("2026-09-19", cache_dir=str(tmp_path))
+    assert back is not None and back.ok and back.label == "mixed"
+
+
+def test_the_cache_is_per_calendar_day(tmp_path):
+    from qbs.agent.sentiment import Summary, load_cached, save
+
+    save(Summary(as_of="2026-09-19", label="mixed",
+                 bullets=[{"point": "p", "sources": [1]}]),
+         cache_dir=str(tmp_path))
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is not None
+    assert load_cached("2026-09-20", cache_dir=str(tmp_path)) is None
+
+
+def test_a_corrupt_cache_reads_as_absent(tmp_path):
+    from qbs.agent.sentiment import load_cached
+
+    (tmp_path / "2026-09-19.json").write_text("{not json")
+    assert load_cached("2026-09-19", cache_dir=str(tmp_path)) is None
+
+
+def test_gather_collapses_duplicate_headlines(monkeypatch):
+    """Four overlapping queries exist so one dead query does not empty the
+    feed. The overlap has to collapse or the model sees the same story four
+    times and weights it four times."""
+    from qbs.agent import sentiment as snt
+
+    dupe = nw.Result(title="same", url="https://x.test/same", source="Example")
+    monkeypatch.setattr(snt.nw, "search_web", lambda q, **kw: ([dupe], None))
+    feed = snt.fetch_news()
+    assert feed.total == 1 and feed.errors == []
+
+
+def test_one_dead_query_does_not_lose_the_others(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    def flaky(q, **kw):
+        if q == snt.MARKET_QUERIES[0]:
+            return [], "rate limited"
+        return [nw.Result(title=q, url=f"https://x.test/{q}")], None
+
+    monkeypatch.setattr(snt.nw, "search_web", flaky)
+    feed = snt.fetch_news()
+    assert feed.total == len(snt.MARKET_QUERIES) - 1
+    assert feed.errors and "rate limited" in feed.errors[0]
+
+
+def _stamped(monkeypatch, snt, items):
+    monkeypatch.setattr(
+        snt.nw, "search_web",
+        lambda q, **kw: ([nw.Result(title=t, url=f"https://x.test/{t}",
+                                    published=p, source="Example")
+                          for t, p in items], None))
+
+
+def test_the_window_is_applied_here_not_by_the_backend(monkeypatch):
+    """DuckDuckGo's narrowest time filter is one DAY and Tavily's is whole
+    days, so a 12-hour read has to filter on each headline's own timestamp."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("fresh", (now - pd.Timedelta(hours=2)).isoformat()),
+        ("edge", (now - pd.Timedelta(hours=11)).isoformat()),
+        ("stale", (now - pd.Timedelta(hours=20)).isoformat()),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert [r.title for r in feed.headlines] == ["fresh", "edge"]
+    assert feed.n_dated == 2 and feed.n_dropped == 1
+
+
+def test_an_undated_headline_is_kept_and_counted(monkeypatch):
+    """Most web results carry no timestamp, so dropping them would empty the
+    panel. They are kept -- and counted, so the window's real coverage is
+    visible rather than implied."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("dated", (now - pd.Timedelta(hours=1)).isoformat()),
+        ("undated", ""),
+        ("unparseable", "yesterday-ish"),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert feed.total == 3
+    assert feed.n_dated == 1 and feed.n_undated == 2 and feed.n_dropped == 0
+
+
+def test_headlines_come_back_newest_first_with_undated_last(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("undated", ""),
+        ("older", (now - pd.Timedelta(hours=6)).isoformat()),
+        ("newest", (now - pd.Timedelta(minutes=5)).isoformat()),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert [r.title for r in feed.headlines] == ["newest", "older", "undated"]
+
+
+def test_parse_published_says_none_rather_than_guessing():
+    from qbs.agent.sentiment import parse_published
+
+    assert parse_published("2026-09-21T10:00:00") is not None
+    assert parse_published("2026-09-21T10:00:00+00:00") is not None, "tz-aware"
+    for junk in (None, "", "None", "yesterday-ish", object()):
+        assert parse_published(junk) is None
+
+
+def test_the_fingerprint_tracks_the_story_set(monkeypatch):
+    """A cached read can then be shown as current or as superseded, rather
+    than merely as old."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a", now.isoformat())])
+    first = snt.fetch_news(hours=12, now=now).fingerprint()
+    assert snt.fetch_news(hours=12, now=now).fingerprint() == first
+
+    _stamped(monkeypatch, snt, [("a", now.isoformat()), ("b", now.isoformat())])
+    assert snt.fetch_news(hours=12, now=now).fingerprint() != first
+
+
+def test_headlines_are_returned_with_no_model_at_all(monkeypatch, tmp_path):
+    """The point of the tab: the news is worth showing with no key, no model
+    and no spend. `summarise_it=False` must not be able to reach the API."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a story", now.isoformat())])
+
+    def explode(*a, **k):
+        raise AssertionError("the model must not be called")
+
+    monkeypatch.setattr(snt, "summarise", explode)
+    feed, summary, cached = snt.read_news(summarise_it=False,
+                                          cache_dir=str(tmp_path))
+    assert feed.total == 1 and summary is None and cached
+
+
+def test_switching_the_read_off_still_serves_a_paid_for_summary(monkeypatch, tmp_path):
+    """Turning the switch off should not blank a read that has already been
+    paid for."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a story", now.isoformat())])
+    as_of = now.strftime("%Y-%m-%d")
+    snt.save(snt.Summary(as_of=as_of, label="mixed",
+                         bullets=[{"point": "p", "sources": [1]}]),
+             cache_dir=str(tmp_path))
+
+    _, summary, _ = snt.read_news(summarise_it=False, cache_dir=str(tmp_path),
+                                  as_of=as_of)
+    assert summary is not None and summary.label == "mixed"
 
 
 # --------------------------------------------------------------------------
@@ -597,6 +922,103 @@ def test_analyse_without_a_key_returns_an_answer_not_an_exception(monkeypatch):
     assert answer.tool_calls == []
 
 
+def test_the_two_roles_get_two_models():
+    """The chat and the news read are different jobs with different volumes:
+    ~1.2M tokens a month against ~73k. One default for both would price the
+    cheap one like the expensive one, or vice versa."""
+    from qbs.agent.analyst import DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL
+
+    assert DEFAULT_MODEL != DEFAULT_SUMMARY_MODEL
+    assert "flash" in DEFAULT_MODEL, "the chat is the token-heavy one"
+    assert "pro" in DEFAULT_SUMMARY_MODEL, "the daily read can afford it"
+
+
+def test_one_variable_can_point_both_roles_at_one_model(monkeypatch):
+    """Running a single model everywhere should be one variable, not two --
+    and setting both must still split them."""
+    import importlib
+    from qbs.agent import analyst
+
+    def reload_with(**env_vars):
+        for k in ("QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env_vars.items():
+            monkeypatch.setenv(k, v)
+        return importlib.reload(analyst)
+
+    one = reload_with(QBS_GEMINI_MODEL="some-new-model")
+    assert one.DEFAULT_MODEL == one.DEFAULT_SUMMARY_MODEL == "some-new-model"
+
+    both = reload_with(QBS_GEMINI_MODEL="chatty", QBS_SUMMARY_MODEL="thinky")
+    assert (both.DEFAULT_MODEL, both.DEFAULT_SUMMARY_MODEL) == ("chatty", "thinky")
+
+    plain = reload_with()
+    assert plain.DEFAULT_MODEL != plain.DEFAULT_SUMMARY_MODEL, \
+        "with nothing set, the built-in split stands"
+    importlib.reload(analyst)          # leave the module as the suite found it
+
+
+def test_the_thinking_budget_reads_its_env_var(monkeypatch):
+    from qbs.agent.analyst import _default_thinking_budget
+
+    monkeypatch.delenv("QBS_THINKING_BUDGET", raising=False)
+    assert _default_thinking_budget() == -1, "dynamic unless told otherwise"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "0")
+    assert _default_thinking_budget() == 0, "0 must survive -- it means OFF"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "2048")
+    assert _default_thinking_budget() == 2048
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "lots")
+    assert _default_thinking_budget() == -1, "junk falls back, never raises"
+
+
+def test_the_budget_is_sent_to_the_chat_model(monkeypatch):
+    """`0` is a real value meaning "no thinking", which is why the sentinel is
+    the string "default" and not None -- collapsing them would make one of
+    "send nothing" and "use the configured budget" unreachable."""
+    pytest.importorskip("langchain_google_genai")
+    import langchain_google_genai as ggenai
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, **kwargs):
+            seen.clear()
+            seen.update(kwargs)
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "x")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(ggenai, "ChatGoogleGenerativeAI", Spy)
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=1024)
+    assert seen["thinking_budget"] == 1024
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=0)
+    assert seen["thinking_budget"] == 0, "0 must be SENT, not treated as unset"
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=None)
+    assert "thinking_budget" not in seen, "None sends nothing at all"
+
+
+def test_the_news_read_uses_the_summary_model_without_thinking(monkeypatch):
+    """Extraction into a fixed JSON shape is not multi-step reasoning, and
+    paying for thinking tokens to restate headlines buys nothing."""
+    from qbs.agent import analyst, sentiment as snt
+
+    seen = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        seen["model"] = model
+        seen["thinking_budget"] = thinking_budget
+        raise RuntimeError("stop here -- the call itself is not the point")
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(analyst, "build_model", spy)
+    snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert seen["model"] == analyst.DEFAULT_SUMMARY_MODEL
+    assert seen["thinking_budget"] is None
+
+
 def test_the_prompt_names_the_lookback_the_ranker_actually_uses():
     """A prompt that hard-codes 12-1 teaches the model a fact about this lab
     that stopped being true in a diff it cannot see."""
@@ -703,6 +1125,74 @@ def test_the_agent_passes_arguments_through_to_the_tool():
     call = _tool_calls(state)[0]
     assert call["args"] == {"ticker": ticker}
     assert ticker in call["result"]
+
+
+def test_the_chat_replays_prior_turns():
+    """Without history "what about its fundamentals?" has nothing to refer to.
+    The whole transcript is re-sent on every message, so this pins that the
+    earlier turns actually reach the model."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="noted")]}
+
+    answer = analyst.analyse(
+        "and its fundamentals?", agent=Recorder(),
+        history=[{"role": "user", "content": "profile MU"},
+                 {"role": "assistant", "content": "MU ranks 96"}])
+    assert answer.text == "noted"
+    roles = [m["role"] for m in seen["messages"]]
+    texts = [m["content"] for m in seen["messages"]]
+    assert roles == ["user", "assistant", "user"]
+    assert texts[-1] == "and its fundamentals?", "the new question goes last"
+    assert "profile MU" in texts[0]
+
+
+def test_the_chat_history_is_capped():
+    """Every turn re-sends the transcript, so an unbounded history grows the
+    bill and the latency on every message and eventually overruns context."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="ok")]}
+
+    long_history = [{"role": "user", "content": f"q{i}"} for i in range(50)]
+    analyst.analyse("latest", agent=Recorder(), history=long_history,
+                    max_history=4)
+    assert len(seen["messages"]) == 5, "4 kept plus the new question"
+    assert seen["messages"][0]["content"] == "q46", "the OLDEST turns are dropped"
+
+
+def test_the_chat_drops_empty_turns():
+    """A blank message would otherwise reach the API as an empty user turn,
+    which some providers reject outright."""
+    pytest.importorskip("langchain")
+    from langchain_core.messages import AIMessage
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Recorder:
+        def invoke(self, state, config=None):
+            seen["messages"] = state["messages"]
+            return {"messages": [AIMessage(content="ok")]}
+
+    analyst.analyse("real question", agent=Recorder(),
+                    history=[{"role": "user", "content": ""},
+                             {"role": "assistant", "content": "kept"}])
+    assert [m["content"] for m in seen["messages"]] == ["kept", "real question"]
 
 
 def test_final_text_handles_geminis_content_parts():

@@ -2,12 +2,17 @@
 
     streamlit run dashboard/app.py
 
-Two tabs:
+Four tabs:
 
-* **Daily picks** -- what each of the three selection strategies held on each
-  day, with the entries and exits that changed it.
+* **Daily picks** -- what each of the two selection strategies held on each
+  day, with the entries and exits that changed it. The momentum book ranks the
+  universe and is always invested; the high-momentum screen applies an
+  absolute bar and can hold almost nothing.
 * **Market overview** -- the breadth monitor: 4% movers, percent holding the
   moving averages, index stretch in ATR units, and the momentum-leader group.
+* **News & sentiment** -- the last 12 hours of market headlines, always; plus
+  a model's read of them when one is configured and switched on.
+* **Analyst** -- the price panel again, and a chat over the lab's own tools.
 
 READ THE BANNER AT THE TOP OF THE MARKET TAB
 --------------------------------------------
@@ -36,14 +41,14 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
-                         momentum_label, momentum_profile, pulse_class,
-                         sector_breakdown)
+                         ma_fast_cell, momentum_label, momentum_profile,
+                         pulse_cell, pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import BreakoutParams, Config, FinvizScreenParams
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
-from qbs.finviz import (UniverseFilters, fetch_us_universe, load_universe_bars,
-                        sector_map)
+from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_us_universe,
+                        load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.screens import finviz_momentum_screen
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
@@ -58,13 +63,18 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
         "high": "#ddefe4", "extreme_high": "#a9d7bd", "none": "",
         "stretched": "#f6c9c9", "oversold": "#c9e6d5", "normal": ""}
 
+# The four-band scale for the daily monitor's 4%-mover columns. Green is
+# bullish on BOTH, so a quiet down-4% count shades green like a heavy up-4%
+# one -- `breadth.pulse_cell` owns which band a value lands in.
+PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
+              "light_red": DN, "dark_red": DN_STRONG, "none": ""}
+
+# Both counts come from the config rather than the string, for the same reason
+# the lookback does: they have each moved once already, and a header claiming
+# the old value is a quiet lie on every screenshot.
 STRATEGY_LABELS = {
-    # The lookback comes from the config, not from this string: it has moved
-    # from 12-1 to 6-1 once already, and a tab header claiming the old one is
-    # a quiet lie on every screenshot.
-    "momentum": f"Top-6 NDX momentum ({momentum_label()})",
-    "finviz": "Top-6 Finviz screen",
-    "breakout": "Weekly breakout watchlist",
+    "momentum": f"Top-{Config().momentum.n_hold} NDX momentum ({momentum_label()})",
+    "finviz": f"Top-{FinvizScreenParams().n_hold} high momentum screen",
 }
 PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
                 "up": f"Up 4% < {BreadthParams().pulse_strong}",
@@ -137,16 +147,30 @@ def load_data(download_start: str, online: bool, force: bool, _token: int):
 
 @st.cache_data(show_spinner="Building selections…")
 def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
-                     exit_rank: int, n_watch: int) -> Dict[str, pd.DataFrame]:
-    """Daily holdings for each strategy, as date x (tickers, buys, sells)."""
-    from qbs.breakout import finviz_watchlists
+                     exit_rank: int, n_screen: int) -> Dict[str, pd.DataFrame]:
+    """Daily holdings for each strategy, plus whether the volume leg ran.
+
+    Returns `(frames, volume_applied)`. The screen RAISES on a volume leg it
+    cannot apply rather than skipping one, so this either supplies volumes or
+    opts out explicitly -- and the caller has to be told which, because
+    without the leg the screen is more permissive than its own definition.
+    """
     from qbs.config import MomentumParams
+    from qbs.universe import load_universe_volumes
 
     out: Dict[str, pd.DataFrame] = {}
 
     mom = cross_sectional_momentum(
         _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
-    fin = finviz_momentum_screen(_uni, _safe, FinvizScreenParams(n_hold=n_hold))
+
+    vols = load_universe_volumes(list(_uni.columns))
+    volume_applied = vols is not None and not vols.empty
+    screen = FinvizScreenParams(n_hold=n_screen)
+    if volume_applied:
+        vols = vols.reindex(index=_uni.index).ffill()
+    else:
+        vols, screen = None, FinvizScreenParams(n_hold=n_screen, min_volume=None)
+    fin = finviz_momentum_screen(_uni, _safe, screen, volumes=vols)
 
     for key, sig in (("momentum", mom), ("finviz", fin)):
         ev = sig.events
@@ -162,18 +186,7 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
             })
         out[key] = pd.DataFrame(rows).set_index("date")
 
-    # The breakout strategy selects weekly, so its "daily" view is the
-    # watchlist standing for that week -- not a held book.
-    wl = finviz_watchlists(_uni, _safe, n_watch=n_watch)
-    rows, current = [], ""
-    for d in _uni.index:
-        if d in wl:
-            current = ", ".join(wl[d])
-        rows.append({"date": d, "holdings": current,
-                     "n": len(current.split(", ")) if current else 0,
-                     "buys": "", "sells": ""})
-    out["breakout"] = pd.DataFrame(rows).set_index("date")
-    return out
+    return out, volume_applied
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -182,32 +195,79 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
     return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note)
 
 
+SENTIMENT_TINT = {"bullish": UP_STRONG, "leaning bullish": UP,
+                  "mixed": "", "unclear": "",
+                  "leaning bearish": DN, "bearish": DN_STRONG}
+
+
+@st.cache_data(ttl=1800, show_spinner="Fetching the last 12 hours of news…")
+def load_news(as_of: str, hours: int, model: str, refresh_token: int,
+              _summarise: bool):
+    """`(feed, summary, from_cache)` for the news tab.
+
+    The feed is always fetched; the summary only when `_summarise` is set.
+    That split is the whole design -- the headlines are worth showing with no
+    model, no key and no money.
+
+    Cached three ways, because each stops a different kind of waste. The
+    30-minute TTL stops a rerun re-searching. `sentiment.read_news` caches the
+    SUMMARY to disk, so a restart does not re-bill. And `_summarise` False
+    cannot reach the model at all -- the sidebar's off position has to be
+    incapable of spending, not merely disinclined to.
+    """
+    from qbs.agent import sentiment as snt
+
+    return snt.read_news(hours=hours, summarise_it=_summarise,
+                         refresh=refresh_token > 0, model=model or None,
+                         as_of=as_of)
+
+
 @st.cache_data(show_spinner="Fetching the US universe from Finviz…")
 def load_us_market(download_start: str, online: bool, force: bool, _token: int):
     """The broad US universe for the breadth tab: closes, volumes, sectors.
 
-    Returns `(closes, volumes, sectors, note, error)`. `error` is not fatal --
-    the caller falls back to the cached index universe and says so on screen,
-    because breadth computed over a truncated sample is wrong in a way that
-    looks entirely plausible.
+    Returns `(closes, volumes, sectors, note, error, fetched)`. `error` is not
+    fatal -- the caller falls back to the cached index universe and says so on
+    screen, because breadth computed over a truncated sample is wrong in a way
+    that looks entirely plausible. `fetched` says whether this call went to the
+    network, so the UI can tell "fresh" from "cached" rather than implying one.
+
+    Automatic refresh is gated to once a calendar day by `due_for_fetch`, and
+    the gate counts ATTEMPTS. Streamlit re-runs this script on every widget
+    interaction, and before the close the last bar is always yesterday's -- so
+    a data-based test would start a 2,400-name download on every rerun and
+    never stop. **Refresh now** ignores the gate.
     """
     filters = UniverseFilters()
-    uni, uni_err = fetch_us_universe(filters, refresh=force, offline=not online,
-                                     verbose=False)
+    if not online:
+        uni, uni_err = fetch_us_universe(filters, offline=True, verbose=False)
+        auto, why = False, "offline"
+    else:
+        auto, why = due_for_fetch()
+        auto = auto or force
+        # Stamp BEFORE the work, not after. A download that dies halfway must
+        # still count as today's attempt, or a broken feed retries on every
+        # rerun -- which is the loop this gate exists to prevent.
+        if auto:
+            record_fetch_attempt()
+        uni, uni_err = fetch_us_universe(filters, refresh=force, offline=False,
+                                         verbose=False)
     if uni is None or uni.empty:
-        return None, None, {}, filters.label, uni_err or "unknown failure"
+        return None, None, {}, filters.label, uni_err or "unknown failure", False
 
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
         tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False)
+        verbose=False, stale_after=1 if auto else None)
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
-            f"Finviz listed {len(tickers)} tickers but no prices loaded — {bars_err}")
+            f"Finviz listed {len(tickers)} tickers but no prices loaded — "
+            f"{bars_err}"), False
 
     # A partial fetch is usable; a silent one is not. Carry the warning up.
     warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
-    return closes, volumes, sector_map(uni), filters.label, warn
+    note = f"{filters.label} · {why}"
+    return closes, volumes, sector_map(uni), note, warn, auto
 
 
 EMA_SPANS = (10, 20, 50, 200)
@@ -317,7 +377,11 @@ download_start = st.sidebar.text_input("Data start", cfg.download_start)
 n_hold = st.sidebar.number_input("Names held (n_hold)", 1, 20, cfg.momentum.n_hold)
 exit_rank = st.sidebar.number_input("Exit rank (band)", int(n_hold), 50,
                                     max(cfg.momentum.exit_rank, int(n_hold)))
-n_watch = st.sidebar.number_input("Breakout watchlist size", 5, 50, 20)
+n_screen = st.sidebar.number_input(
+    "High-momentum screen size", 5, 100, FinvizScreenParams().n_hold,
+    help="How many names the high-momentum screen ranks down to. On the "
+         "Nasdaq-100 universe fewer than this usually qualify, so the column "
+         "shows everyone who passed.")
 
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
 # app force-refreshed on EVERY start -- re-downloading the whole universe
@@ -370,11 +434,290 @@ st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
-selections = build_selections(uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_watch))
+selections, SCREEN_VOLUME_APPLIED = build_selections(
+    uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
 
-tab_picks, tab_market, tab_analyst = st.tabs(
-    ["📋 Daily picks", "📊 Market overview", "🤖 Analyst"])
+def names_on(key: str, when) -> list:
+    """The tickers a strategy held on a date, from the prebuilt selections.
+
+    Read from `selections` rather than from whatever the picks tab happened to
+    leave in a local: Streamlit runs the script top to bottom, so that would
+    work today and break the moment the tabs are reordered.
+    """
+    frame = selections.get(key)
+    if frame is None or when not in frame.index:
+        return []
+    raw = frame.loc[when, "holdings"]
+    return [t for t in str(raw).split(", ") if t]
+
+
+def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
+                default_ticker: Optional[str] = None):
+    """The price / levels / momentum panel, so two tabs can show one panel.
+
+    Extracted rather than copied: it is ~180 lines of chart, level and gate
+    logic, and a second copy would drift from the first the moment either is
+    touched. `key_prefix` namespaces the Streamlit widget keys, which must be
+    unique across the whole app even when the widgets are identical.
+
+    `options` is the ticker list for the combo box, already in the order the
+    caller wants it -- this function does not decide what is interesting.
+    """
+    st.markdown("**Price & levels**")
+    if not options:
+        st.info("No name to chart.")
+        return None
+    index = options.index(default_ticker) if default_ticker in options else 0
+    c1, c2, c3 = st.columns([2, 1, 1])
+    ticker = c1.selectbox(
+        "Ticker", options, index=index, key=f"{key_prefix}_ticker",
+        help="Today's picks come first, then the rest of the universe.")
+    months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
+                          format_func=lambda m: f"{m}m", key=f"{key_prefix}_win")
+    n_lvl = c3.number_input("Levels", 0, 30, 8, key=f"{key_prefix}_levels",
+                            help="Nearest N support/resistance levels "
+                                 "to the last price. 0 hides them.")
+    frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
+    if frames is None:
+        st.info(f"No price history for {ticker} up to this date.")
+    else:
+        price, ema_long, lvl, last, n_levels, has_overhead = frames
+
+        # Candles need real Open/High/Low. When they cannot be had the
+        # chart falls back to a close line and says so, rather than
+        # drawing a wickless body per bar off the close series -- that
+        # would assert a session high and low that never happened.
+        ohlc = ohlc_for(ticker, download_start, bool(online),
+                        st.session_state["refresh_token"])
+        bars = None
+        if ohlc is not None and not ohlc.empty:
+            win = ohlc.loc[:asof].tail(int(months * 21))
+            if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
+                bars = win.reset_index()
+                bars.columns = [str(c).lower() for c in bars.columns]
+
+        yscale = alt.Scale(zero=False, nice=True)
+        if bars is not None:
+            body_colour = alt.condition(
+                "datum.open <= datum.close",
+                alt.value(CANDLE_UP), alt.value(CANDLE_DN))
+            cbase = alt.Chart(bars).encode(
+                x=alt.X("date:T", title=None), color=body_colour,
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("open:Q", format=".2f"),
+                         alt.Tooltip("high:Q", format=".2f"),
+                         alt.Tooltip("low:Q", format=".2f"),
+                         alt.Tooltip("close:Q", format=".2f")])
+            wick = cbase.mark_rule(size=1).encode(
+                y=alt.Y("low:Q", title=None, scale=yscale),
+                y2=alt.Y2("high:Q"))
+            body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
+                y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
+            line = wick + body
+        else:
+            line = alt.Chart(price).mark_line(
+                color="#0b0b0b", size=1.7).encode(
+                x=alt.X("date:T", title=None),
+                y=alt.Y("close:Q", title=None, scale=yscale),
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("close:Q", title="Close", format=".2f")])
+        emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
+            x="date:T",
+            y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
+            color=alt.Color("ema:N", title=None, scale=alt.Scale(
+                domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
+                legend=alt.Legend(orient="top", direction="horizontal")),
+            tooltip=[alt.Tooltip("ema:N", title="Line"),
+                     alt.Tooltip("value:Q", title="Value", format=".2f")])
+        layers = [line, emas]
+        if not lvl.empty:
+            rules = alt.Chart(lvl).mark_rule(
+                strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
+                y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
+                color=alt.Color("kind:N", title=None, scale=alt.Scale(
+                    domain=["Resistance", "Support"],
+                    range=["#d03b3b", "#0ca30c"]),
+                    legend=alt.Legend(orient="top", direction="horizontal")),
+                tooltip=[alt.Tooltip("kind:N", title="Level"),
+                         alt.Tooltip("level:Q", title="Price", format=".2f")])
+            layers.append(rules)
+        st.altair_chart(
+            alt.layer(*layers).resolve_scale(color="independent")
+            .properties(height=430), use_container_width=True)
+        if bars is None:
+            st.caption(
+                "📉 Close line, not candles — no Open/High/Low for "
+                f"**{ticker}**. The universe cache holds closes only; "
+                "switch **Source** to Online so the panel can fetch "
+                "real OHLC for the selected name. Candles are never "
+                "drawn from closes, because a wickless body would "
+                "assert a high and low that never happened."
+            )
+
+        above = [f"EMA {n}" for n in EMA_SPANS
+                 if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
+                 and last > ema_long[ema_long["ema"] == f"EMA {n}"]["value"].iloc[-1]]
+        st.caption(
+            f"**{ticker}** {last:,.2f} · above "
+            f"{', '.join(above) if above else 'none'} · "
+            f"showing {len(lvl)} of {n_levels} levels in view"
+        )
+        if not has_overhead:
+            st.warning(
+                "**No resistance overhead in this window.** The name has "
+                "already cleared every level its chart shows, so there "
+                "is nothing above it to break through — it is in price "
+                "discovery.",
+                icon="⚠️")
+        st.caption(
+            "Levels are re-derived from history **up to the selected date "
+            "only** — the same causal rule the breakout strategy uses, so "
+            "the chart never shows a level the strategy could not have seen."
+        )
+
+        # ---- the numbers behind the picture -----------------------
+        # Same params the picks table above was screened with, so the
+        # gate rows report the screen actually running, not a default.
+        prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
+                                screen=FinvizScreenParams(n_hold=int(n_hold)))
+        if not prof["returns"].empty:
+            st.markdown("###### Momentum")
+            ret = prof["returns"].copy()
+            st.dataframe(
+                ret.style.format({"Return": "{:+.1%}",
+                                  "Universe median": "{:+.1%}",
+                                  "Rank": "{:.0f}"}, na_rep="—")
+                .background_gradient(subset=["Rank"], cmap="RdYlGn",
+                                     vmin=1, vmax=99),
+                hide_index=True, width="stretch",
+                height=45 + 35 * len(ret))
+            st.caption(
+                "**Rank is a percentile within this universe on this date**, "
+                "1–99. A twelve-month return means nothing on its own — the "
+                "question a momentum strategy asks is relative, so the number "
+                "only counts next to what every other candidate did. "
+                "*Universe median* is that comparison in one column."
+            )
+
+            tr = prof["trend"].copy()
+            tr["Value"] = [
+                ("—" if pd.isna(v) else
+                 f"{v:+.2f} ATR" if u == "ATR" else f"{v:+.1%}")
+                for v, u in zip(tr["Value"], tr["Unit"])]
+            st.dataframe(tr[["Measure", "Value"]], hide_index=True,
+                         width="stretch", height=45 + 35 * len(tr))
+
+            st.markdown("###### Which strategies would take it, and why")
+            g = prof["gates"].copy()
+            # `off` is a distance below the high, so it never carries
+            # a "+" -- 17.6% there means 17.6% WORSE than the high.
+            g["Reading"] = [
+                ("—" if pd.isna(v) else
+                 f"${v:,.2f}" if f == "price" else
+                 f"{v:.1%} off high" if f == "off" else f"{v:+.1%}")
+                for v, f in zip(g["Value"], g["Fmt"])]
+            g["✓"] = ["—" if x is None else ("✅" if x else "❌")
+                      for x in g["Pass"]]
+            st.dataframe(g[["Strategy", "Rule", "Reading", "✓"]],
+                         hide_index=True, width="stretch",
+                         height=45 + 35 * len(g))
+            failed = g[g["Pass"] == False]          # noqa: E712
+            if not failed.empty:
+                note = ("Blocked by: "
+                        + "; ".join(f"**{r.Strategy}** — {r.Rule} "
+                                    f"({r.Reading})"
+                                    for r in failed.itertuples()) + ".")
+                # Only claim the overlap finding when it is the
+                # proximity rule doing the blocking -- that is the
+                # specific disagreement it describes.
+                if any("high" in r.Rule and r.Strategy == "Finviz screen"
+                       for r in failed.itertuples()):
+                    note += (" This is the per-name version of the overlap "
+                             "finding: a name can rank at the very top on "
+                             "momentum and still fail the proximity test, "
+                             "which is why the two screens rarely agree.")
+                st.caption(md(note))
+    return st.session_state.get(f"{key_prefix}_ticker")
+
+
+# --------------------------------------------------------------------------
+# Analyst settings
+# --------------------------------------------------------------------------
+# Defined here, NOT inside the Analyst tab: the market tab renders first and
+# needs `model_name` for its news summary, and a sidebar control created in a
+# later tab does not exist yet when an earlier one reads it.
+
+from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
+                               _default_thinking_budget, analyse,
+                               check_requirements)
+from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_VAR, analyst_disabled,
+                           chat_disabled, load_env)
+from qbs.agent.evidence import Book
+from qbs.agent.news import available_backends
+from qbs.agent.sentiment import parse_published as snt_parse_published
+
+env_load = load_env()
+switched_off = analyst_disabled()
+chat_off = chat_disabled()
+# Two blockers, because the two features can be switched off independently:
+# the chat has its own kill switch and the news read does not answer to it.
+chat_blocker = check_requirements(role="chat")
+news_blocker = check_requirements(role="summary")
+blocker = chat_blocker                    # the Analyst tab's own gate
+backends = available_backends()
+
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("**Analyst**")
+    # The controls below stay editable on purpose -- you can line the model and
+    # the toggles up while something is off -- but without this they read as an
+    # analyst that is simply misbehaving.
+    if switched_off:
+        st.caption(f"⏸️ everything switched off by `{DISABLE_VAR}`. These "
+                   "settings are saved for when it is switched back on.")
+    elif chat_off:
+        st.caption(f"⏸️ chat only, switched off by `{DISABLE_CHAT_VAR}`. "
+                   "The news read still runs.")
+    # Two models, because they are not the same job: the chat reasons over
+    # tool output turn after turn (~17x the news panel's token usage), while
+    # the news read is one call a day. Cheap-and-thinking for the first,
+    # strong for the second.
+    model_name = st.text_input("Chat model", DEFAULT_MODEL,
+                               help="The Analyst tab's chat. Reasons over tool "
+                                    "output every turn, so it is the expensive "
+                                    "one. Override here or set QBS_GEMINI_MODEL.")
+    thinking = st.number_input(
+        "Thinking budget", min_value=-1, max_value=32768,
+        value=int(_default_thinking_budget() or -1), step=512,
+        help="Chat model only. −1 lets it decide, 0 turns thinking off, a "
+             "positive number caps it in tokens. The accepted range is "
+             "model-specific — the API rejects a bad one, this app does not "
+             "second-guess it. Or set QBS_THINKING_BUDGET.")
+    summary_model = st.text_input(
+        "News summary model", DEFAULT_SUMMARY_MODEL,
+        help="The News tab. One call a day over ~30 headlines, so the stronger "
+             "model costs pennies a month. No thinking budget is sent — this "
+             "is extraction into a fixed shape, not multi-step reasoning. "
+             "Or set QBS_SUMMARY_MODEL.")
+    allow_web = st.checkbox("Allow web search", value=bool(backends),
+                            disabled=not backends,
+                            help=("Search backends found: "
+                                  + (", ".join(backends) or "none — "
+                                     "pip install ddgs")))
+    live_fundamentals = st.checkbox(
+        "Fetch fundamentals live", value=True,
+        help="Off reads only what is already cached in data/fundamentals/.")
+    daily_news = st.checkbox(
+        "News sentiment analysis", value=True, disabled=bool(news_blocker),
+        help="One Gemini call per day on the News tab, cached to "
+             "data/sentiment/. Off still shows the headlines — only the "
+             "model's read of them goes away.")
+
+
+tab_picks, tab_market, tab_news, tab_analyst = st.tabs(
+    ["📋 Daily picks", "📊 Market overview", "📰 News & sentiment",
+     "🤖 Analyst"])
 
 
 # ==========================================================================
@@ -384,7 +727,7 @@ tab_picks, tab_market, tab_analyst = st.tabs(
 with tab_picks:
     freshness_banner()
     st.subheader("Daily picks")
-    st.caption(f"Three selection strategies · universe {UNIVERSE_NOTE} · "
+    st.caption(f"{len(STRATEGY_LABELS)} selection strategies · universe {UNIVERSE_NOTE} · "
                f"data through {LAST_BAR:%Y-%m-%d} ({SRC})")
 
     dates = [d for d in selections["momentum"].index
@@ -392,9 +735,9 @@ with tab_picks:
     asof = st.select_slider("Date", options=dates, value=dates[-1],
                             format_func=lambda d: f"{d:%Y-%m-%d}")
 
-    cols = st.columns([1, 1, 1, 2.6])
+    cols = st.columns([1, 1, 2.6])
     picks: Dict[str, set] = {}
-    for col, key in zip(cols[:3], ("momentum", "finviz", "breakout")):
+    for col, key in zip(cols[:2], ("momentum", "finviz")):
         frame = selections[key]
         row = frame.loc[asof] if asof in frame.index else None
         raw = row["holdings"] if row is not None and row["holdings"] else ""
@@ -402,15 +745,29 @@ with tab_picks:
         picks[key] = set(names)
         with col:
             st.markdown(f"**{STRATEGY_LABELS[key]}**")
-            st.metric("Watchlist size" if key == "breakout" else "Names held",
-                      len(names))
-            if key == "breakout":
-                st.caption("A watchlist, not a book — a name is only bought "
-                           "once a breakout confirms.")
+            st.metric("Names held", len(names))
+            if key == "finviz":
+                # Say it here rather than leaving someone to wonder why a
+                # "top-20" shows 6 names.
+                short = len(names) < int(n_screen)
+                p_scr = FinvizScreenParams()
+                vol_note = (
+                    f"volume > {p_scr.min_volume/1e3:,.0f}k shares/day ✅"
+                    if SCREEN_VOLUME_APPLIED else
+                    f"**the volume leg (> {p_scr.min_volume/1e3:,.0f}k "
+                    "shares/day) is not applied** — no volumes in this cache, "
+                    "so the screen is more permissive than its own definition")
+                st.caption(md(
+                    (f"{len(names)} of {int(n_screen)} slots — fewer names "
+                     "cleared the filter than the screen ranks down to. "
+                     if short else "")
+                    + f"Filter: close > ${p_scr.min_price:.0f} · "
+                    f"quarterly gain > {p_scr.min_quarter_return:.0%} · "
+                    + vol_note))
             if names:
                 st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
                              width="stretch",
-                             height=min(250, 38 + 35 * len(names)))
+                             height=min(420, 38 + 35 * len(names)))
             else:
                 st.info("Nothing held — fully in cash.")
             if row is not None and row["buys"]:
@@ -419,188 +776,17 @@ with tab_picks:
                 st.caption(f"🔴 Sold: {row['sells']}")
 
     # ---- right-hand panel: price, EMAs and the levels that matter ---------
-    with cols[3]:
-        st.markdown("**Price & levels**")
+    with cols[2]:
         universe_names = list(uni.columns)
         picked = sorted(set().union(*picks.values()))
         options = picked + [t for t in universe_names if t not in picked]
-        if not options:
-            st.info("No name to chart.")
-        else:
-            c1, c2, c3 = st.columns([2, 1, 1])
-            ticker = c1.selectbox(
-                "Ticker", options, index=0, key="chart_ticker",
-                help="Today's picks come first, then the rest of the universe.")
-            months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
-                                  format_func=lambda m: f"{m}m", key="chart_win")
-            n_lvl = c3.number_input("Levels", 0, 30, 8, key="chart_levels",
-                                    help="Nearest N support/resistance levels "
-                                         "to the last price. 0 hides them.")
-            frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
-            if frames is None:
-                st.info(f"No price history for {ticker} up to this date.")
-            else:
-                price, ema_long, lvl, last, n_levels, has_overhead = frames
-
-                # Candles need real Open/High/Low. When they cannot be had the
-                # chart falls back to a close line and says so, rather than
-                # drawing a wickless body per bar off the close series -- that
-                # would assert a session high and low that never happened.
-                ohlc = ohlc_for(ticker, download_start, bool(online),
-                                st.session_state["refresh_token"])
-                bars = None
-                if ohlc is not None and not ohlc.empty:
-                    win = ohlc.loc[:asof].tail(int(months * 21))
-                    if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
-                        bars = win.reset_index()
-                        bars.columns = [str(c).lower() for c in bars.columns]
-
-                yscale = alt.Scale(zero=False, nice=True)
-                if bars is not None:
-                    body_colour = alt.condition(
-                        "datum.open <= datum.close",
-                        alt.value(CANDLE_UP), alt.value(CANDLE_DN))
-                    cbase = alt.Chart(bars).encode(
-                        x=alt.X("date:T", title=None), color=body_colour,
-                        tooltip=[alt.Tooltip("date:T", title="Date"),
-                                 alt.Tooltip("open:Q", format=".2f"),
-                                 alt.Tooltip("high:Q", format=".2f"),
-                                 alt.Tooltip("low:Q", format=".2f"),
-                                 alt.Tooltip("close:Q", format=".2f")])
-                    wick = cbase.mark_rule(size=1).encode(
-                        y=alt.Y("low:Q", title=None, scale=yscale),
-                        y2=alt.Y2("high:Q"))
-                    body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
-                        y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
-                    line = wick + body
-                else:
-                    line = alt.Chart(price).mark_line(
-                        color="#0b0b0b", size=1.7).encode(
-                        x=alt.X("date:T", title=None),
-                        y=alt.Y("close:Q", title=None, scale=yscale),
-                        tooltip=[alt.Tooltip("date:T", title="Date"),
-                                 alt.Tooltip("close:Q", title="Close", format=".2f")])
-                emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
-                    x="date:T",
-                    y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
-                    color=alt.Color("ema:N", title=None, scale=alt.Scale(
-                        domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
-                        legend=alt.Legend(orient="top", direction="horizontal")),
-                    tooltip=[alt.Tooltip("ema:N", title="Line"),
-                             alt.Tooltip("value:Q", title="Value", format=".2f")])
-                layers = [line, emas]
-                if not lvl.empty:
-                    rules = alt.Chart(lvl).mark_rule(
-                        strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
-                        y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
-                        color=alt.Color("kind:N", title=None, scale=alt.Scale(
-                            domain=["Resistance", "Support"],
-                            range=["#d03b3b", "#0ca30c"]),
-                            legend=alt.Legend(orient="top", direction="horizontal")),
-                        tooltip=[alt.Tooltip("kind:N", title="Level"),
-                                 alt.Tooltip("level:Q", title="Price", format=".2f")])
-                    layers.append(rules)
-                st.altair_chart(
-                    alt.layer(*layers).resolve_scale(color="independent")
-                    .properties(height=430), use_container_width=True)
-                if bars is None:
-                    st.caption(
-                        "📉 Close line, not candles — no Open/High/Low for "
-                        f"**{ticker}**. The universe cache holds closes only; "
-                        "switch **Source** to Online so the panel can fetch "
-                        "real OHLC for the selected name. Candles are never "
-                        "drawn from closes, because a wickless body would "
-                        "assert a high and low that never happened."
-                    )
-
-                above = [f"EMA {n}" for n in EMA_SPANS
-                         if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
-                         and last > ema_long[ema_long["ema"] == f"EMA {n}"]["value"].iloc[-1]]
-                st.caption(
-                    f"**{ticker}** {last:,.2f} · above "
-                    f"{', '.join(above) if above else 'none'} · "
-                    f"showing {len(lvl)} of {n_levels} levels in view"
-                )
-                if not has_overhead:
-                    st.warning(
-                        "**No resistance overhead in this window.** The name has "
-                        "already cleared every level its chart shows, so a "
-                        "breakout entry has nothing to fire on. This is the state "
-                        "52% of Finviz picks are in — see the funnel notebook.",
-                        icon="⚠️")
-                st.caption(
-                    "Levels are re-derived from history **up to the selected date "
-                    "only** — the same causal rule the breakout strategy uses, so "
-                    "the chart never shows a level the strategy could not have seen."
-                )
-
-                # ---- the numbers behind the picture -----------------------
-                # Same params the picks table above was screened with, so the
-                # gate rows report the screen actually running, not a default.
-                prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
-                                        screen=FinvizScreenParams(n_hold=int(n_hold)))
-                if not prof["returns"].empty:
-                    st.markdown("###### Momentum")
-                    ret = prof["returns"].copy()
-                    st.dataframe(
-                        ret.style.format({"Return": "{:+.1%}",
-                                          "Universe median": "{:+.1%}",
-                                          "Rank": "{:.0f}"}, na_rep="—")
-                        .background_gradient(subset=["Rank"], cmap="RdYlGn",
-                                             vmin=1, vmax=99),
-                        hide_index=True, width="stretch",
-                        height=45 + 35 * len(ret))
-                    st.caption(
-                        "**Rank is a percentile within this universe on this date**, "
-                        "1–99. A twelve-month return means nothing on its own — the "
-                        "question a momentum strategy asks is relative, so the number "
-                        "only counts next to what every other candidate did. "
-                        "*Universe median* is that comparison in one column."
-                    )
-
-                    tr = prof["trend"].copy()
-                    tr["Value"] = [
-                        ("—" if pd.isna(v) else
-                         f"{v:+.2f} ATR" if u == "ATR" else f"{v:+.1%}")
-                        for v, u in zip(tr["Value"], tr["Unit"])]
-                    st.dataframe(tr[["Measure", "Value"]], hide_index=True,
-                                 width="stretch", height=45 + 35 * len(tr))
-
-                    st.markdown("###### Which strategies would take it, and why")
-                    g = prof["gates"].copy()
-                    # `off` is a distance below the high, so it never carries
-                    # a "+" -- 17.6% there means 17.6% WORSE than the high.
-                    g["Reading"] = [
-                        ("—" if pd.isna(v) else
-                         f"${v:,.2f}" if f == "price" else
-                         f"{v:.1%} off high" if f == "off" else f"{v:+.1%}")
-                        for v, f in zip(g["Value"], g["Fmt"])]
-                    g["✓"] = ["—" if x is None else ("✅" if x else "❌")
-                              for x in g["Pass"]]
-                    st.dataframe(g[["Strategy", "Rule", "Reading", "✓"]],
-                                 hide_index=True, width="stretch",
-                                 height=45 + 35 * len(g))
-                    failed = g[g["Pass"] == False]          # noqa: E712
-                    if not failed.empty:
-                        note = ("Blocked by: "
-                                + "; ".join(f"**{r.Strategy}** — {r.Rule} "
-                                            f"({r.Reading})"
-                                            for r in failed.itertuples()) + ".")
-                        # Only claim the overlap finding when it is the
-                        # proximity rule doing the blocking -- that is the
-                        # specific disagreement it describes.
-                        if any("high" in r.Rule and r.Strategy == "Finviz screen"
-                               for r in failed.itertuples()):
-                            note += (" This is the per-name version of the overlap "
-                                     "finding: a name can rank at the very top on "
-                                     "momentum and still fail the proximity test, "
-                                     "which is why the two screens rarely agree.")
-                        st.caption(md(note))
+        price_panel(uni, px, asof, options, int(n_hold), "picks")
 
     common = picks["momentum"] & picks["finviz"]
     st.markdown(
-        f"**Momentum ∩ Finviz:** {', '.join(sorted(common)) if common else 'no overlap'} "
-        f"({len(common)}/{len(picks['momentum']) or '—'})"
+        f"**Held by both books:** "
+        f"{', '.join(sorted(common)) if common else 'no overlap'} "
+        f"({len(common)} of {len(picks['momentum']) or '—'} momentum names)"
     )
 
     st.divider()
@@ -626,6 +812,8 @@ with tab_picks:
 
 with tab_market:
     freshness_banner()
+
+
     st.subheader("Breadth & momentum monitor")
 
     use_us = st.toggle(
@@ -635,9 +823,10 @@ with tab_market:
 
     mkt_closes = mkt_vols = None
     mkt_sectors: Dict[str, str] = {}
-    mkt_note, mkt_err = "", None
+    mkt_note, mkt_err, mkt_fetched = "", None, False
     if use_us:
-        mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err = load_us_market(
+        (mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err,
+         mkt_fetched) = load_us_market(
             download_start, bool(online), bool(force),
             st.session_state["refresh_token"])
 
@@ -646,6 +835,17 @@ with tab_market:
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
         breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols)
+        # Say which of the two happened. "Fetched just now" and "served from a
+        # cache built at some point" look identical on screen otherwise, and
+        # the difference is the whole reason for the auto-refresh.
+        m_behind = sessions_behind(m_uni.index.max())
+        age = ("current" if m_behind <= 0 else
+               f"{m_behind} session{'s' if m_behind != 1 else ''} behind")
+        _, why_not = due_for_fetch()
+        st.caption(
+            f"🌐 {m_uni.shape[1]:,} names · last bar "
+            f"{m_uni.index.max():%Y-%m-%d} ({age}) · "
+            + ("**fetched on this run**" if mkt_fetched else why_not))
         if mkt_err:                      # loaded, but not cleanly
             st.warning(f"**Partial US universe.** {mkt_err}", icon="⚠️")
     else:
@@ -759,15 +959,18 @@ with tab_market:
 
     def _style(col: pd.Series):
         name = col.name
-        if name == "Up 4%":
-            return [f"background-color: {UP_STRONG if pulse_class(v,'up')=='up_strong' else UP}"
+        if name in ("Up 4%", "Dn 4%"):
+            which = "up" if name.startswith("Up") else "down"
+            return [f"background-color: {PULSE_CELL[pulse_cell(v, which)]}"
                     for v in col]
-        if name == "Dn 4%":
-            return [f"background-color: {DN_STRONG if pulse_class(v,'down')=='down_strong' else DN}"
-                    for v in col]
-        if name in ("% > 20D", "% > 50D"):
-            which_ma = "fast" if "20" in name else "slow"
-            return [f"background-color: {CELL[ma_class(v, which_ma)]}" for v in col]
+        if name == "% > 20D":
+            # `enumerate` over the column, not the index: `disp` is built
+            # newest-first, so position 0 IS the latest session. Reading the
+            # date instead would break the moment the sort order changed.
+            return [f"background-color: {PULSE_CELL[ma_fast_cell(v, i)]}"
+                    for i, v in enumerate(col)]
+        if name == "% > 50D":
+            return [f"background-color: {CELL[ma_class(v, 'slow')]}" for v in col]
         if name == "QQQ ATR":
             return [f"background-color: {CELL[atr_class(v)]}" for v in col]
         return ["" for _ in col]
@@ -778,11 +981,35 @@ with tab_market:
                        "MLI %": "{:+.2f}", "MLI adv%": "{:.1f}"}, na_rep="—"))
     st.dataframe(styled, hide_index=True, width="stretch",
                  height=min(720, 45 + 35 * len(disp)))
+    _bp = BreadthParams()
+    _u, _d = _bp.up4_bands, _bp.dn4_bands
     st.caption(
-        f"Green = names up 4% (dark ≥ {BreadthParams().pulse_strong}) · "
-        f"red = down 4% · moving-average columns shade red below 10/20% and "
-        "green above 90/80% · ATR shades red beyond ±5."
+        "**Green is bullish in both 4% columns**, not \u201cgreen means "
+        "up\u201d — a quiet down-4% count is a good day and shades green "
+        "like a heavy up-4% one. "
+        f"Up 4%: dark red ≤{_u[0]:.0f} · light red ≤{_u[1]:.0f} · light green "
+        f"≤{_u[2]:.0f} · dark green above. "
+        f"Dn 4%: dark green ≤{_d[0]:.0f} · light green ≤{_d[1]:.0f} · light "
+        f"red ≤{_d[2]:.0f} · dark red above. "
+        f"**% > 20D** is shaded on the **last {_bp.ma_fast_recent} sessions "
+        f"only** — green above {_bp.ma_fast_green:.0f}%, red at or below. It "
+        "reads the tape now, and a shaded year of it is wallpaper. "
+        "% > 50D keeps the full-history scale: red below 20%, green above 80%. "
+        "ATR shades red beyond ±5. The bar chart above keeps the plain "
+        "up-is-green convention, since a signed bar already shows direction."
     )
+    # The bands are absolute counts, sized for the ~2,400-name US universe. On
+    # the 99-name fallback no session can reach 301 up, so the column goes
+    # uniformly dark red and reads as a crash that is not happening. Say so
+    # rather than let the colour be believed.
+    _sample = int(tbl["n_stocks"].iloc[-1]) if "n_stocks" in tbl else 0
+    if _sample and _sample < _u[2]:
+        st.warning(
+            f"**These colours are calibrated for the broad US universe.** The "
+            f"bands are absolute counts (dark green needs {_u[2]:.0f}+ names up "
+            f"4%), and this sample is **{_sample} names** — no session here can "
+            f"reach that, so Up 4% shades dark red throughout and means nothing. "
+            "Turn the US universe on above for the scale to apply.", icon="🎨")
 
     # ---- momentum leaders -------------------------------------------------
     st.divider()
@@ -876,40 +1103,147 @@ with tab_market:
 # checks a number against the call it came from, which is the only thing that
 # separates a research note from a fluent guess.
 
+with tab_news:
+    freshness_banner()
+    st.subheader("News & sentiment")
+
+    st.session_state.setdefault("news_token", 0)
+    _now = pd.Timestamp.now("UTC").tz_convert(None)
+    _today = _now.strftime("%Y-%m-%d")
+    NEWS_HOURS = 12
+
+    # The model is optional here, and that is the point of this tab: the
+    # headlines are worth reading with no key and no spend. `run_llm` gates
+    # only the read on top.
+    run_llm = bool(daily_news) and not news_blocker
+
+    top = st.columns([3, 1])
+    with top[1]:
+        if st.button("Refresh news", width="stretch",
+                     help="Re-search now. Also re-reads with the model when "
+                          "the sentiment analysis is on."):
+            st.session_state["news_token"] += 1
+            load_news.clear()
+            st.rerun()
+
+    feed, summary, from_cache = load_news(
+        _today, NEWS_HOURS, summary_model.strip(),
+        st.session_state["news_token"], run_llm)
+
+    # ---- the read, when there is a model to do it ------------------------
+    with top[0]:
+        if not run_llm:
+            why = ("switched off in the sidebar" if not daily_news
+                   else news_blocker.split(" — ")[0])
+            st.info(
+                f"**Headlines only — no sentiment analysis** ({why}). "
+                "Everything below is the news itself, which needs no model.",
+                icon="📰")
+        elif summary is None or summary.error:
+            st.warning(
+                f"**No sentiment read.** "
+                f"{summary.error if summary else 'not run yet'}", icon="📰")
+        else:
+            tint = SENTIMENT_TINT.get(summary.label, "")
+            st.markdown(
+                f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
+                f"background:{tint or '#00000010'};display:inline-block'>"
+                f"<b>{summary.label.upper()}</b></div>",
+                unsafe_allow_html=True)
+            if summary.headline:
+                st.markdown(f"**{summary.headline}**")
+            for b in summary.bullets:
+                cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
+                st.markdown(f"- {b['point']} {cites}")
+
+    if run_llm and summary is not None and not summary.error:
+        # A cached read of a DIFFERENT set of stories is still what the model
+        # said -- but saying so beats letting it pass as current.
+        if summary.fingerprint and summary.fingerprint != feed.fingerprint():
+            st.caption(
+                "🔁 This read covers an earlier set of stories than the "
+                "headlines below — the feed has moved on since. "
+                "**Refresh news** re-reads it.")
+        if summary.warnings:
+            with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
+                             "from this summary"):
+                for w in summary.warnings:
+                    st.markdown(f"- {w}")
+                st.caption(
+                    "Bullets without a citation, and citations pointing "
+                    "outside the headline list, are removed before you see "
+                    "them — an unsourced claim in a finance summary cannot be "
+                    "told apart from a remembered one.")
+        st.caption(
+            f"🤖 {summary.model} over {summary.n_articles} headlines"
+            + (" · served from cache" if from_cache else " · read just now")
+            + ". **This is a read of what was written, not a signal.** Nothing "
+            "here is backtested and nothing enters a strategy; every bullet "
+            "points back to a numbered headline below.")
+
+    st.divider()
+
+    # ---- the headlines, always ------------------------------------------
+    st.markdown(f"#### Headlines — last {feed.hours} hours")
+    if not feed.headlines:
+        st.warning(
+            "**No headlines came back.** "
+            + ("; ".join(feed.errors) if feed.errors else
+               "the search returned nothing for any query."), icon="🔍")
+        st.caption(
+            "Run `python -m qbs.agent --check` in this app's environment to "
+            "see which search backends resolve. With none installed, "
+            "`pip install ddgs` adds the keyless one.")
+    else:
+        # Say what the window really cost. The backends' narrowest filter is
+        # one DAY, so the 12-hour window is applied here on each headline's
+        # own timestamp -- and a headline without one cannot be checked.
+        bits = [f"**{feed.total}** stories",
+                f"{feed.n_dated} timestamped inside the window"]
+        if feed.n_undated:
+            bits.append(f"**{feed.n_undated} undated** (kept, but the window "
+                        f"could not be checked)")
+        if feed.n_dropped:
+            bits.append(f"{feed.n_dropped} older than {feed.hours}h, dropped")
+        st.caption(" · ".join(bits))
+
+        for i, r in enumerate(feed.headlines, 1):
+            when = snt_parse_published(r.published)
+            age = ""
+            if when is not None:
+                mins = max(0, int((_now - when).total_seconds() // 60))
+                age = (f"{mins}m ago" if mins < 60 else
+                       f"{mins // 60}h {mins % 60:02d}m ago")
+            title = f"[{r.title}]({r.url})" if r.url else r.title
+            st.markdown(f"`[{i}]` **{title}**")
+            meta = " · ".join(x for x in (r.source, age or "no timestamp") if x)
+            st.caption(meta + ("" if age else
+                               " — this one could not be checked against the "
+                               "12-hour window"))
+            if r.snippet:
+                st.caption(r.snippet)
+
+        if feed.errors:
+            with st.expander(f"⚠️ {len(feed.errors)} search query "
+                             "returned an error"):
+                for e in feed.errors:
+                    st.markdown(f"- {e}")
+                st.caption(
+                    "Queries overlap on purpose, so one failing leaves a "
+                    "thinner feed rather than an empty one.")
+        st.caption(f"Fetched {feed.fetched_at.replace('T', ' ')} UTC · "
+                   "re-searched at most every 30 minutes.")
+
+
 with tab_analyst:
     freshness_banner()
     st.subheader("Ask the analyst")
 
-    from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
-    from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
-    from qbs.agent.evidence import Book
-    from qbs.agent.news import available_backends
-
-    env_load = load_env()
-    switched_off = analyst_disabled()
-    blocker = check_requirements()
-    backends = available_backends()
-
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("**Analyst**")
-        if switched_off:
-            # The controls below stay editable on purpose -- you can line the
-            # model and the toggles up while it is off -- but without this they
-            # read as an analyst that is simply misbehaving.
-            st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
-                       "saved for when it is switched back on.")
-        model_name = st.text_input("Gemini model", DEFAULT_MODEL,
-                                   help="Model names move faster than this app. "
-                                        "Override here or set QBS_GEMINI_MODEL.")
-        allow_web = st.checkbox("Allow web search", value=bool(backends),
-                                disabled=not backends,
-                                help=("Search backends found: "
-                                      + (", ".join(backends) or "none — "
-                                         "pip install ddgs")))
-        live_fundamentals = st.checkbox(
-            "Fetch fundamentals live", value=True,
-            help="Off reads only what is already cached in data/fundamentals/.")
+    # The picks tab's date slider drives this tab too -- two sliders for one
+    # date is a way to have the chart and the chat disagree about "today".
+    asof_analyst = asof
+    screen_names = names_on("finviz", asof_analyst)
+    momentum_names = names_on("momentum", asof_analyst)
 
     if switched_off:
         # A deliberate shutdown and a missing key have different remedies, and
@@ -930,6 +1264,23 @@ with tab_analyst:
             "Streamlit reads the environment once at start-up, so **restart "
             "the app** after changing this — a rerun alone will not pick it up."
         )
+    elif chat_off:
+        # A chat switched off on purpose is not a misconfiguration, and the
+        # "install this, paste a key there" advice below would send someone to
+        # fix something that is not broken.
+        st.info(
+            f"**The chat is switched off.** `{DISABLE_CHAT_VAR}` is set, so "
+            "this tab makes no Gemini call. **The News tab's sentiment read "
+            "is unaffected and still runs** — that is what this switch is "
+            "for, bringing one feature up at a time.", icon="⏸️")
+        st.markdown(
+            "```bash\n"
+            f"unset {DISABLE_CHAT_VAR}          # or set it to 0\n"
+            "python -m qbs.agent --check\n"
+            "```")
+        st.caption(
+            "Streamlit reads the environment once at start-up, so **restart "
+            "the app** after changing this — a rerun alone will not pick it up.")
     elif blocker:
         st.warning(
             f"**The analyst is not configured.** {blocker}\n\n"
@@ -958,56 +1309,100 @@ with tab_analyst:
         "under each answer so you can check the figures against their source."
     )
 
-    EXAMPLES = [
-        "Why is the momentum book holding names the Finviz screen rejects?",
-        "Profile the top momentum pick and say what would take it out of the book.",
-        "Is the market broad or narrow right now, and what does that imply "
-        "for a breakout strategy?",
-        "Pull fundamentals and recent news for the strongest pick, and say "
-        "where they disagree with the price signal.",
-    ]
-    picked = st.selectbox("Start from an example, or write your own", 
-                          ["— write my own —"] + EXAMPLES)
-    default_q = "" if picked.startswith("—") else picked
-    question = st.text_area("Question", value=default_q, height=90,
-                            placeholder="Ask about the picks, a name, breadth, "
-                                        "or the backtest results…")
+    a_cols = st.columns([1.35, 1])
 
-    ask = st.button("Analyse", type="primary", disabled=bool(blocker) or not question.strip())
+    # ---- left: the same panel the picks tab shows ------------------------
+    with a_cols[0]:
+        # High-momentum names first, then the momentum book, then everyone
+        # else. Whatever the screen currently holds is what you are most
+        # likely to want to look at while asking about it.
+        hi = [t for t in screen_names if t in uni.columns]
+        mom = [t for t in momentum_names if t in uni.columns and t not in hi]
+        rest = [t for t in uni.columns if t not in hi and t not in mom]
+        a_options = hi + mom + rest
+        st.caption(
+            f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''} first, "
+            f"then {len(mom)} from the momentum book, then the rest of the "
+            f"{len(a_options)}-name universe.")
+        chart_ticker = price_panel(uni, px, asof_analyst, a_options,
+                                   int(n_hold), "analyst")
 
-    if ask:
-        # The agent gets the frames this app already loaded rather than
-        # re-reading the cache: a three-tool answer would otherwise spend a
-        # minute rebuilding a universe that is sitting in memory.
-        book = Book(universe=uni, prices=px, cfg=cfg, note=UNIVERSE_NOTE)
-        with st.spinner(f"Asking {model_name}…"):
-            answer = analyse(
-                question.strip(), model=model_name.strip() or None,
-                book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
-                offline_fundamentals=not live_fundamentals)
+    # ---- right: the chat -------------------------------------------------
+    with a_cols[1]:
+        st.markdown("**Finance assistant**")
+        st.session_state.setdefault("chat", [])
 
-        if answer.disabled:
-            st.info(f"**The analyst is switched off.** {answer.text}", icon="⏸️")
-        elif answer.error:
-            st.error(f"**The analyst could not answer.** {answer.text}", icon="🚫")
-        else:
-            st.markdown(answer.text)
+        if st.session_state["chat"]:
+            if st.button("Clear conversation", key="chat_clear"):
+                st.session_state["chat"] = []
+                st.rerun()
 
-        if answer.tool_calls:
-            st.markdown("---")
-            st.markdown(f"###### Evidence — {len(answer.tool_calls)} tool "
-                        f"call{'s' if len(answer.tool_calls) != 1 else ''}")
-            for i, call in enumerate(answer.tool_calls, 1):
-                args = ", ".join(f"{k}={v!r}" for k, v in call["args"].items())
-                with st.expander(f"{i}. `{call['name']}({args})`"):
-                    st.code(call["result"] or "(no output)", language="text")
-            st.caption(
-                "Every number in the answer above should appear in one of "
-                "these. One that does not is a fabrication, and worth telling "
-                "the model about in a follow-up.")
-        elif ask and not answer.error:
-            st.warning(
-                "The analyst answered without calling a single tool, which "
-                "means nothing in that answer is sourced from your data. "
-                "Treat it as opinion and ask again more specifically.",
-                icon="⚠️")
+        # A fixed-height box so the chart beside it does not jump every time a
+        # message lands, and so the input stays where the eye expects it.
+        with st.container(height=520, border=True):
+            if not st.session_state["chat"]:
+                st.caption(
+                    "Ask about the name on the left, the current books, "
+                    "breadth, or the backtest. Follow-ups work — the "
+                    "conversation is sent with each message, so "
+                    "\u201cwhat about its fundamentals?\u201d knows what "
+                    "\u201cit\u201d is.")
+            for turn in st.session_state["chat"]:
+                with st.chat_message(turn["role"]):
+                    st.markdown(turn["content"])
+                    for i, call in enumerate(turn.get("tool_calls", []), 1):
+                        args = ", ".join(f"{k}={v!r}"
+                                         for k, v in call["args"].items())
+                        with st.expander(f"{i}. `{call['name']}({args})`"):
+                            st.code(call["result"] or "(no output)",
+                                    language="text")
+
+        prompt = st.chat_input(
+            f"Ask about {chart_ticker}…" if chart_ticker else "Ask the analyst…",
+            key="chat_in", disabled=bool(blocker))
+        if blocker:
+            st.caption("💬 The chat needs the analyst configured — see above.")
+
+        if prompt:
+            # The agent gets the frames this app already loaded rather than
+            # re-reading the cache: a three-tool answer would otherwise spend a
+            # minute rebuilding a universe that is sitting in memory.
+            book = Book(universe=uni, prices=px, cfg=cfg, note=UNIVERSE_NOTE)
+            # The selected ticker rides along as context, so "is it extended?"
+            # means the name on screen rather than whatever was mentioned last.
+            asked = (f"[the chart on screen is showing {chart_ticker}] {prompt}"
+                     if chart_ticker else prompt)
+            history = [{"role": t["role"], "content": t["content"]}
+                       for t in st.session_state["chat"]]
+            st.session_state["chat"].append({"role": "user", "content": prompt})
+
+            with st.spinner(f"Asking {model_name}…"):
+                answer = analyse(
+                    asked, model=model_name.strip() or None, history=history,
+                    thinking_budget=int(thinking),
+                    book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
+                    offline_fundamentals=not live_fundamentals)
+
+            if answer.disabled:
+                text = f"⏸️ **Switched off.** {answer.text}"
+            elif answer.error:
+                text = f"🚫 **Could not answer.** {answer.text}"
+            elif not answer.tool_calls:
+                # Say it in the transcript, not in a banner that the next
+                # message scrolls away from the answer it is about.
+                text = (answer.text + "\n\n---\n⚠️ *Answered without calling a "
+                        "tool, so nothing above is sourced from your data. "
+                        "Treat it as opinion.*")
+            else:
+                text = answer.text
+            st.session_state["chat"].append(
+                {"role": "assistant", "content": text,
+                 "tool_calls": answer.tool_calls})
+            st.rerun()
+
+        st.caption(
+            "Every number should appear in one of the tool calls folded under "
+            "the answer. One that does not is a fabrication. Only the last 20 "
+            "turns are re-sent, and tool output is never replayed — the model "
+            "calls the tool again when it needs the numbers twice."
+        )

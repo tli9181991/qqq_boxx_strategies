@@ -1,0 +1,32 @@
+[Unit]
+Description=Patreon pipeline: Gmail IDLE watcher
+Documentation=file:/opt/qbs/docs/PATREON_PIPELINE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=patreon
+Group=patreon
+WorkingDirectory=/opt/qbs
+EnvironmentFile=/etc/patreon/patreon.env
+ExecStart=/opt/qbs/.venv/bin/python -m patreon_pipeline.runner watch
+
+# The watcher only ever writes rows to the queue, so restarting it is free --
+# it re-reads its cursor and carries on. A home connection drops; this must
+# treat that as routine rather than as a reason to stop.
+Restart=always
+RestartSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=patreon-watch
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/patreon
+
+[Install]
+WantedBy=multi-user.target

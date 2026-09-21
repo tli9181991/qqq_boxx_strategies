@@ -43,6 +43,11 @@ data/finviz_universe.csv
 data/universe/us_closes.csv
 data/universe/us_volumes.csv
 
+# When the dashboard last TRIED to auto-refresh the US universe. Host-local
+# state -- committing it would hand every checkout someone else's "already
+# fetched today" and suppress the first fetch on a fresh clone.
+data/universe/us_last_fetch.txt
+
 # Fundamentals snapshots fetched by the analyst. Deliberately untracked: each
 # file is a picture of ONE day's ratios with no history in it, so a committed
 # copy would age into a set of numbers that look current and are not.
@@ -50,3 +55,18 @@ data/fundamentals/
 
 # API keys for the LLM analyst. `.env.example` is the tracked template.
 .env
+
+# The daily news read, cached per calendar day. Host-local and perishable --
+# a committed copy would show one machine's Tuesday as every checkout's today.
+data/sentiment/
+
+# Patreon pipeline credentials. The OAuth client secret and the saved Drive
+# token both live under var/ (already ignored above), but these patterns cover
+# them wherever someone puts them -- a leaked drive_token.json is a live
+# credential, not a config file.
+client_secret*.json
+drive_token.json
+cookies.txt
+deploy/patreon/patreon.env
+deploy/windows/patreon.env
+deploy/patreon/config.json

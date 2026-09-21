@@ -1,0 +1,35 @@
+# Patreon -> Drive pipeline only. Nothing in `qbs` imports any of this, and the
+# backtest and the live trader run without it.
+#
+# Needs Python >= 3.10.
+
+# The downloader. Unpinned on purpose -- this is the one dependency that SHOULD
+# move: Patreon and Vimeo change, and extractor fixes land in yt-dlp within
+# days. A stale yt-dlp is the most common cause of "this post is not available".
+# Update it on a schedule: pip install -U yt-dlp
+yt-dlp>=2024.1.0
+
+# Gmail IDLE. The stdlib's imaplib has no IDLE support, which is the whole
+# reason this is here.
+IMAPClient>=3.0
+
+# Google Drive upload. google-auth-oauthlib is only needed by the one-time
+# `auth` command, but it is small and leaving it out makes the first run fail
+# in a confusing way.
+google-api-python-client>=2.100
+google-auth>=2.30
+google-auth-oauthlib>=1.2
+
+# Transcription. faster-whisper is a CTranslate2 reimplementation of Whisper --
+# several times quicker than openai-whisper on CPU at the same quality, which
+# is the difference between a mini-PC keeping up and not. It pulls ctranslate2,
+# tokenizers and onnxruntime (the last for the VAD filter).
+#
+# Set `transcribe: false` in the config if you only want video and this is more
+# than the box can carry.
+faster-whisper>=1.0.0
+
+# NOT a pip dependency, but required at runtime for both stages: ffmpeg merges
+# yt-dlp's separate audio/video streams and extracts the 16 kHz mono audio
+# Whisper wants.
+#   sudo apt install ffmpeg

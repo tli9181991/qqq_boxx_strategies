@@ -37,7 +37,7 @@ passed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -70,6 +70,22 @@ class BreadthParams:
 
     # Colour thresholds, kept here so the UI never invents its own.
     pulse_strong: int = 300           # |count| at or above this reads as strong
+
+    # Daily-monitor colour bands, as upper edges: (dark, light, light) with
+    # everything above the last edge in the fourth band.
+    #
+    # Green means BULLISH on both columns, not "this is the up column". A day
+    # with 30 names down 4% is a good day, so it shades green exactly as a day
+    # with 400 names up 4% does. Colouring dn4 red at every level would make
+    # a calm tape look like a falling one.
+    up4_bands: Tuple[float, float, float] = (50.0, 100.0, 300.0)
+    dn4_bands: Tuple[float, float, float] = (50.0, 100.0, 200.0)
+
+    # The "% above the 20-day" column is a two-state read of the CURRENT tape,
+    # so only the most recent sessions are shaded. Colouring the whole history
+    # turns a regime indicator into wallpaper -- the eye stops seeing it.
+    ma_fast_recent: int = 10          # sessions shaded, newest first
+    ma_fast_green: float = 20.0       # above this is light green, at or below red
     ma_extreme_low_fast: float = 10.0
     ma_extreme_low_slow: float = 20.0
     ma_extreme_high_fast: float = 90.0
@@ -432,6 +448,42 @@ def ma_class(value: float, which: str, p: Optional[BreadthParams] = None) -> str
     return "low"
 
 
+PULSE_CELLS = ("dark_red", "light_red", "light_green", "dark_green")
+
+
+def pulse_cell(value: float, which: str, p: Optional[BreadthParams] = None) -> str:
+    """Which colour band a 4%-mover count falls in: dark_red .. dark_green.
+
+    `which` is "up" or "down", and the two run in OPPOSITE directions -- a big
+    up count is bullish, a big down count is not -- so the bands are read
+    ascending for "up" and descending for "down". One function rather than
+    two because getting the direction backwards on one of them is the easy
+    mistake, and here it is a single reversal that a test can pin.
+    """
+    p = p or BreadthParams()
+    if pd.isna(value):
+        return "none"
+    bands = p.up4_bands if which == "up" else p.dn4_bands
+    idx = sum(value > edge for edge in bands)      # 0..3
+    order = PULSE_CELLS if which == "up" else tuple(reversed(PULSE_CELLS))
+    return order[idx]
+
+
+def ma_fast_cell(value: float, rank: int,
+                 p: Optional[BreadthParams] = None) -> str:
+    """Two-state shading for the %-above-20-day column, recent rows only.
+
+    `rank` is how far back the row is, 0 for the newest session. Rows beyond
+    `ma_fast_recent` come back "none" and stay uncoloured, which is the point:
+    this column answers "what is the tape doing NOW", and a shaded year of it
+    is wallpaper.
+    """
+    p = p or BreadthParams()
+    if pd.isna(value) or rank >= p.ma_fast_recent:
+        return "none"
+    return "light_green" if value > p.ma_fast_green else "light_red"
+
+
 def atr_class(value: float, p: Optional[BreadthParams] = None) -> str:
     """`stretched` above +5 ATR, `oversold` below -5, else `normal`."""
     p = p or BreadthParams()
@@ -589,8 +641,10 @@ def momentum_profile(
     leader_qtr = _gain(p.leader_quarter_days)
     high_w = float(s.tail(screen.high_window).max()) if len(s) >= 2 else np.nan
     off_high = (high_w - last) / high_w if high_w else np.nan
-    sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
-    sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
+    sma_last = np.nan
+    if screen.above_sma:
+        sma_n = s.rolling(screen.above_sma, min_periods=screen.above_sma).mean()
+        sma_last = float(sma_n.iloc[-1]) if sma_n.notna().any() else np.nan
 
     # The hurdle is measured over the SAME window as the score. Comparing a
     # 6-1 stock return against a 12-1 cash return would be a different test
@@ -607,38 +661,45 @@ def momentum_profile(
          "Rule": f"{mom_label} momentum beats {hurdle_label}",
          "Value": mom_score, "Fmt": "pct",
          "Pass": bool(mom_score > hurdle) if pd.notna(mom_score) else None},
-        # `>=`, matching `priced` in `finviz_momentum_screen` -- a name sitting
-        # exactly on the threshold passes the screen, so it passes here too.
-        {"Strategy": "Finviz screen",
-         "Rule": f"close at or above ${screen.min_price:,.0f}",
-         "Value": last, "Fmt": "price", "Pass": bool(last >= screen.min_price)},
-        {"Strategy": "Finviz screen", "Rule": f"above SMA {screen.above_sma}",
-         "Value": (last / sma_last - 1.0) if sma_last and pd.notna(sma_last) else np.nan,
-         "Fmt": "pct", "Pass": bool(last > sma_last) if pd.notna(sma_last) else None},
-        {"Strategy": "Finviz screen",
-         "Rule": f"within {screen.within_52w_high_pct:.0%} of "
-                 f"{screen.high_window}-day high",
-         "Value": off_high, "Fmt": "off",
-         "Pass": bool(off_high <= screen.within_52w_high_pct)
-         if pd.notna(off_high) else None},
+        # `>`, matching `priced` in `finviz_momentum_screen`.
+        {"Strategy": "Momentum screen",
+         "Rule": f"close over ${screen.min_price:,.0f}",
+         "Value": last, "Fmt": "price", "Pass": bool(last > screen.min_price)},
     ]
+    # Rows only for the legs the screen actually applies. A row for a filter
+    # that is switched off would report a strategy nobody is running, and the
+    # reader has no way to tell the difference from the table.
+    if screen.above_sma:
+        rows.append({
+            "Strategy": "Momentum screen", "Rule": f"above SMA {screen.above_sma}",
+            "Value": (last / sma_last - 1.0) if sma_last and pd.notna(sma_last) else np.nan,
+            "Fmt": "pct", "Pass": bool(last > sma_last) if pd.notna(sma_last) else None})
+    if screen.within_52w_high_pct is not None:
+        rows.append({
+            "Strategy": "Momentum screen",
+            "Rule": f"within {screen.within_52w_high_pct:.0%} of "
+                    f"{screen.high_window}-day high",
+            "Value": off_high, "Fmt": "off",
+            "Pass": bool(off_high <= screen.within_52w_high_pct)
+            if pd.notna(off_high) else None})
     if screen.min_off_high_pct:
         # The band floor, only when one is configured -- the notebook's rule is
         # a ceiling alone, and a row asserting a floor it does not apply would
         # be reporting a strategy nobody is running.
-        rows.append({"Strategy": "Finviz screen",
+        rows.append({"Strategy": "Momentum screen",
                      "Rule": f"at least {screen.min_off_high_pct:.0%} off the high",
                      "Value": off_high, "Fmt": "off",
                      "Pass": bool(off_high >= screen.min_off_high_pct)
                      if pd.notna(off_high) else None})
     if screen.require_quarter_up:
-        rows.append({"Strategy": "Finviz screen",
+        rows.append({"Strategy": "Momentum screen",
                      "Rule": f"quarter up ({screen.quarter_lookback}d)",
                      "Value": screen_qtr, "Fmt": "pct",
                      "Pass": bool(screen_qtr > 0) if pd.notna(screen_qtr) else None})
     if screen.min_quarter_return is not None:
-        rows.append({"Strategy": "Finviz screen",
-                     "Rule": f"quarterly gain over {screen.min_quarter_return:.0%}",
+        rows.append({"Strategy": "Momentum screen",
+                     "Rule": f"quarterly gain over {screen.min_quarter_return:.0%} "
+                             f"({screen.quarter_lookback}d)",
                      "Value": screen_qtr, "Fmt": "pct",
                      "Pass": bool(screen_qtr >= screen.min_quarter_return)
                      if pd.notna(screen_qtr) else None})
