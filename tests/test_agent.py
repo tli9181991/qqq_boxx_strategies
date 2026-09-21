@@ -500,15 +500,14 @@ def test_a_corrupt_cache_reads_as_absent(tmp_path):
 
 def test_gather_collapses_duplicate_headlines(monkeypatch):
     """Four overlapping queries exist so one dead query does not empty the
-    panel. The overlap has to collapse or the model sees the same story four
+    feed. The overlap has to collapse or the model sees the same story four
     times and weights it four times."""
     from qbs.agent import sentiment as snt
 
     dupe = nw.Result(title="same", url="https://x.test/same", source="Example")
-    monkeypatch.setattr(snt.nw, "search_web",
-                        lambda q, **kw: ([dupe], None))
-    out, errors = snt.gather_headlines()
-    assert len(out) == 1 and errors == []
+    monkeypatch.setattr(snt.nw, "search_web", lambda q, **kw: ([dupe], None))
+    feed = snt.fetch_news()
+    assert feed.total == 1 and feed.errors == []
 
 
 def test_one_dead_query_does_not_lose_the_others(monkeypatch):
@@ -520,9 +519,120 @@ def test_one_dead_query_does_not_lose_the_others(monkeypatch):
         return [nw.Result(title=q, url=f"https://x.test/{q}")], None
 
     monkeypatch.setattr(snt.nw, "search_web", flaky)
-    out, errors = snt.gather_headlines()
-    assert len(out) == len(snt.MARKET_QUERIES) - 1
-    assert errors and "rate limited" in errors[0]
+    feed = snt.fetch_news()
+    assert feed.total == len(snt.MARKET_QUERIES) - 1
+    assert feed.errors and "rate limited" in feed.errors[0]
+
+
+def _stamped(monkeypatch, snt, items):
+    monkeypatch.setattr(
+        snt.nw, "search_web",
+        lambda q, **kw: ([nw.Result(title=t, url=f"https://x.test/{t}",
+                                    published=p, source="Example")
+                          for t, p in items], None))
+
+
+def test_the_window_is_applied_here_not_by_the_backend(monkeypatch):
+    """DuckDuckGo's narrowest time filter is one DAY and Tavily's is whole
+    days, so a 12-hour read has to filter on each headline's own timestamp."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("fresh", (now - pd.Timedelta(hours=2)).isoformat()),
+        ("edge", (now - pd.Timedelta(hours=11)).isoformat()),
+        ("stale", (now - pd.Timedelta(hours=20)).isoformat()),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert [r.title for r in feed.headlines] == ["fresh", "edge"]
+    assert feed.n_dated == 2 and feed.n_dropped == 1
+
+
+def test_an_undated_headline_is_kept_and_counted(monkeypatch):
+    """Most web results carry no timestamp, so dropping them would empty the
+    panel. They are kept -- and counted, so the window's real coverage is
+    visible rather than implied."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("dated", (now - pd.Timedelta(hours=1)).isoformat()),
+        ("undated", ""),
+        ("unparseable", "yesterday-ish"),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert feed.total == 3
+    assert feed.n_dated == 1 and feed.n_undated == 2 and feed.n_dropped == 0
+
+
+def test_headlines_come_back_newest_first_with_undated_last(monkeypatch):
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [
+        ("undated", ""),
+        ("older", (now - pd.Timedelta(hours=6)).isoformat()),
+        ("newest", (now - pd.Timedelta(minutes=5)).isoformat()),
+    ])
+    feed = snt.fetch_news(hours=12, now=now)
+    assert [r.title for r in feed.headlines] == ["newest", "older", "undated"]
+
+
+def test_parse_published_says_none_rather_than_guessing():
+    from qbs.agent.sentiment import parse_published
+
+    assert parse_published("2026-09-21T10:00:00") is not None
+    assert parse_published("2026-09-21T10:00:00+00:00") is not None, "tz-aware"
+    for junk in (None, "", "None", "yesterday-ish", object()):
+        assert parse_published(junk) is None
+
+
+def test_the_fingerprint_tracks_the_story_set(monkeypatch):
+    """A cached read can then be shown as current or as superseded, rather
+    than merely as old."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a", now.isoformat())])
+    first = snt.fetch_news(hours=12, now=now).fingerprint()
+    assert snt.fetch_news(hours=12, now=now).fingerprint() == first
+
+    _stamped(monkeypatch, snt, [("a", now.isoformat()), ("b", now.isoformat())])
+    assert snt.fetch_news(hours=12, now=now).fingerprint() != first
+
+
+def test_headlines_are_returned_with_no_model_at_all(monkeypatch, tmp_path):
+    """The point of the tab: the news is worth showing with no key, no model
+    and no spend. `summarise_it=False` must not be able to reach the API."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a story", now.isoformat())])
+
+    def explode(*a, **k):
+        raise AssertionError("the model must not be called")
+
+    monkeypatch.setattr(snt, "summarise", explode)
+    feed, summary, cached = snt.read_news(summarise_it=False,
+                                          cache_dir=str(tmp_path))
+    assert feed.total == 1 and summary is None and cached
+
+
+def test_switching_the_read_off_still_serves_a_paid_for_summary(monkeypatch, tmp_path):
+    """Turning the switch off should not blank a read that has already been
+    paid for."""
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21 18:00:00")
+    _stamped(monkeypatch, snt, [("a story", now.isoformat())])
+    as_of = now.strftime("%Y-%m-%d")
+    snt.save(snt.Summary(as_of=as_of, label="mixed",
+                         bullets=[{"point": "p", "sources": [1]}]),
+             cache_dir=str(tmp_path))
+
+    _, summary, _ = snt.read_news(summarise_it=False, cache_dir=str(tmp_path),
+                                  as_of=as_of)
+    assert summary is not None and summary.label == "mixed"
 
 
 # --------------------------------------------------------------------------

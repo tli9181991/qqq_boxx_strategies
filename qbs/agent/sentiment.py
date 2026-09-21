@@ -58,6 +58,62 @@ MARKET_QUERIES: Tuple[str, ...] = (
 LABELS = ("bullish", "leaning bullish", "mixed", "leaning bearish",
           "bearish", "unclear")
 
+DEFAULT_HOURS = 12
+
+
+def parse_published(value: object) -> Optional[pd.Timestamp]:
+    """A headline's timestamp as naive UTC, or None if it has none.
+
+    Every backend stamps differently -- ISO strings, RFC dates, epochs, or
+    nothing at all -- and a headline with an unreadable date is a headline
+    with no date. Returning None rather than guessing is what lets the caller
+    count the undated ones honestly instead of quietly treating them as fresh.
+    """
+    if value in (None, "", "None"):
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if ts is pd.NaT:
+        return None
+    try:
+        return ts.tz_convert(None) if ts.tzinfo else ts
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class NewsFeed:
+    """The headlines themselves, and what had to be thrown away to get them.
+
+    Separate from `Summary` on purpose: the news is worth showing whether or
+    not a model ever reads it, and this is the object that makes that
+    possible.
+    """
+    hours: int = DEFAULT_HOURS
+    fetched_at: str = ""
+    headlines: List[nw.Result] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    n_dated: int = 0          # in-window and carrying a readable timestamp
+    n_undated: int = 0        # kept, but the window could not be checked
+    n_dropped: int = 0        # dated and older than the window
+
+    @property
+    def total(self) -> int:
+        return len(self.headlines)
+
+    def fingerprint(self) -> str:
+        """Identifies this exact set of stories.
+
+        The summary is cached against it, so a cached read can be shown as
+        current or as superseded rather than just as old.
+        """
+        import hashlib
+
+        key = "|".join(sorted((r.url or r.title) for r in self.headlines))
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
 
 @dataclass
 class Summary:
@@ -71,6 +127,10 @@ class Summary:
     model: str = ""
     error: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
+    hours: int = DEFAULT_HOURS
+    # Which exact set of stories this read. A cached summary can then be shown
+    # as current or as superseded, rather than merely as old.
+    fingerprint: str = ""
 
     @property
     def ok(self) -> bool:
@@ -84,29 +144,61 @@ class Summary:
 # Gathering
 # --------------------------------------------------------------------------
 
-def gather_headlines(
-    days: int = 1,
-    per_query: int = 6,
+def fetch_news(
+    hours: int = DEFAULT_HOURS,
+    per_query: int = 8,
     queries: Sequence[str] = MARKET_QUERIES,
-) -> Tuple[List[nw.Result], List[str]]:
-    """`(headlines, errors)` for the last `days`, de-duplicated by URL.
+    now: Optional[pd.Timestamp] = None,
+) -> NewsFeed:
+    """The last `hours` of market news, de-duplicated and newest first.
+
+    **The window is applied here, not by the search backend.** DuckDuckGo's
+    finest time filter is one day and Tavily's is also whole days, so a
+    12-hour read means fetching a day and filtering on each headline's own
+    timestamp. That has a consequence worth stating rather than hiding: a
+    headline with no readable timestamp is KEPT -- most web results have
+    none, and dropping them would empty the panel -- so `n_undated` is the
+    number of stories the window could not actually be checked against.
 
     Errors are collected per query rather than raised: one dead query out of
-    four is a slightly thinner read, and losing the other three to it would
-    be the wrong trade. An empty list with errors attached is a different
-    thing from an empty list without, and the caller can tell them apart.
+    four is a thinner read, and losing the other three to it would be the
+    wrong trade. An empty feed with errors attached is a different thing from
+    an empty feed without, and the caller can tell them apart.
     """
-    seen, out, errors = set(), [], []
+    now = now or pd.Timestamp.now("UTC").tz_convert(None)
+    cutoff = now - pd.Timedelta(hours=hours)
+
+    seen, kept, errors = set(), [], []
+    n_dated = n_undated = n_dropped = 0
     for q in queries:
-        results, err = nw.search_web(q, max_results=per_query, days=days)
+        # `days=1` is the narrowest any backend offers; the real window is
+        # the timestamp filter below.
+        results, err = nw.search_web(q, max_results=per_query, days=1)
         if err:
             errors.append(f"{q!r}: {err}")
         for r in results:
             key = (r.url or r.title).strip().lower()
-            if key and key not in seen:
-                seen.add(key)
-                out.append(r)
-    return out, errors
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            when = parse_published(r.published)
+            if when is None:
+                n_undated += 1
+            elif when < cutoff:
+                n_dropped += 1
+                continue
+            else:
+                n_dated += 1
+            kept.append(r)
+
+    # Newest first, undated last: an undated story is not necessarily old, but
+    # it is the one we can say least about, so it reads below the ones we can.
+    kept.sort(key=lambda r: (parse_published(r.published) is not None,
+                             parse_published(r.published) or pd.Timestamp.min),
+              reverse=True)
+    return NewsFeed(hours=hours, fetched_at=now.isoformat(timespec="seconds"),
+                    headlines=kept, errors=errors, n_dated=n_dated,
+                    n_undated=n_undated, n_dropped=n_dropped)
 
 
 def headlines_block(headlines: Sequence[nw.Result]) -> str:
@@ -221,17 +313,24 @@ def _parse(text: str, n_headlines: int) -> Tuple[Dict, List[str]]:
 
 
 def summarise(
-    headlines: Sequence[nw.Result],
+    feed: NewsFeed | Sequence[nw.Result],
     model: Optional[str] = None,
     as_of: Optional[str] = None,
 ) -> Summary:
-    """One LLM call over supplied headlines. Returns a `Summary`, never raises."""
+    """One LLM call over a feed. Returns a `Summary`, never raises.
+
+    Accepts a bare list too, so a caller with headlines from somewhere else
+    does not have to build a `NewsFeed` to get a read of them.
+    """
+    if not isinstance(feed, NewsFeed):
+        feed = NewsFeed(headlines=list(feed))
+    headlines = feed.headlines
     as_of = as_of or pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
     off = analyst_disabled()
     if off:
-        return Summary(as_of=as_of, error=off)
+        return Summary(as_of=as_of, hours=feed.hours, error=off)
     if not headlines:
-        return Summary(as_of=as_of,
+        return Summary(as_of=as_of, hours=feed.hours,
                        error="no headlines were retrieved, so there is nothing "
                              "to summarise")
 
@@ -242,7 +341,7 @@ def summarise(
         llm = build_model(name)
         reply = llm.invoke(PROMPT + headlines_block(headlines))
     except Exception as exc:              # noqa: BLE001 -- API, quota, network
-        return Summary(as_of=as_of, model=name,
+        return Summary(as_of=as_of, hours=feed.hours, model=name,
                        error=f"{type(exc).__name__}: {exc}")
 
     from .analyst import _stringify
@@ -250,7 +349,8 @@ def summarise(
     payload, warnings = _parse(_stringify(getattr(reply, "content", reply)),
                                len(headlines))
     if not payload:
-        return Summary(as_of=as_of, model=name, n_articles=len(headlines),
+        return Summary(as_of=as_of, hours=feed.hours, model=name,
+                       n_articles=len(headlines),
                        error="; ".join(warnings) or "unparseable reply")
 
     return Summary(
@@ -264,6 +364,8 @@ def summarise(
         n_articles=len(headlines),
         model=name,
         warnings=warnings,
+        hours=feed.hours,
+        fingerprint=feed.fingerprint(),
     )
 
 
@@ -297,29 +399,42 @@ def save(summary: Summary, cache_dir: Optional[str] = None) -> None:
         pass
 
 
-def daily_sentiment(
+def read_news(
+    hours: int = DEFAULT_HOURS,
+    summarise_it: bool = True,
     refresh: bool = False,
     model: Optional[str] = None,
-    days: int = 1,
     cache_dir: Optional[str] = None,
     as_of: Optional[str] = None,
-) -> Tuple[Summary, bool]:
-    """`(summary, from_cache)` for today. The dashboard's one entry point.
+) -> Tuple[NewsFeed, Optional[Summary], bool]:
+    """`(feed, summary, summary_from_cache)` -- the dashboard's entry point.
 
-    Cached per calendar day on disk, so a restart does not re-bill and a
-    rerun costs nothing. `refresh=True` goes past the cache.
+    The feed is ALWAYS fetched; the summary is optional. That split is the
+    point: the headlines are worth showing with no model, no key and no
+    money, and the read is what you add on top when a model is available.
+
+    `summarise_it=False` never calls the model. It still returns a cached
+    summary if one is on disk, so turning the switch off does not blank a
+    read that has already been paid for.
     """
     as_of = as_of or pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
+    feed = fetch_news(hours=hours)
+
+    if not summarise_it:
+        return feed, load_cached(as_of, cache_dir), True
+
     if not refresh:
         cached = load_cached(as_of, cache_dir)
+        # A cached read of a DIFFERENT set of stories is still worth showing --
+        # it is what the model actually said -- but the caller needs to know
+        # it has been overtaken, which the fingerprint mismatch tells it.
         if cached is not None:
-            return cached, True
+            return feed, cached, True
 
-    headlines, errors = gather_headlines(days=days)
-    out = summarise(headlines, model=model, as_of=as_of)
-    if errors:
-        out.warnings = list(out.warnings) + [f"search: {e}" for e in errors]
-        if not headlines and out.error:
-            out.error = f"{out.error} ({'; '.join(errors)})"
+    out = summarise(feed, model=model, as_of=as_of)
+    if feed.errors:
+        out.warnings = list(out.warnings) + [f"search: {e}" for e in feed.errors]
+        if not feed.headlines and out.error:
+            out.error = f"{out.error} ({'; '.join(feed.errors)})"
     save(out, cache_dir)
-    return out, False
+    return feed, out, False
