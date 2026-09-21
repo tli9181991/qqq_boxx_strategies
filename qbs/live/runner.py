@@ -166,8 +166,26 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         max_staleness_days=live.max_price_staleness_days,
         min_coverage=live.min_universe_coverage,
         exclude=_excluded_names(live),
+        record_ranks=live.ranking_log_top,
     )
     return px, book
+
+
+def _write_csv_logs(live: LiveConfig, book=None) -> None:
+    """Refresh the CSVs beside the database, so `report` is never required.
+
+    Never allowed to fail a phase. These are a convenience view of a record
+    that is already safely written -- a full disk or a read-only mount must not
+    turn a successful session into a failed unit after the orders have gone.
+    """
+    try:
+        if book is not None and book.ranking:
+            st.append_ranking_csv(live.ranking_csv_path,
+                                  f"{book.asof:%Y-%m-%d}", book.ranking)
+        store.export_trade_csv(live.db_path, live.trade_csv_path)
+    except Exception as exc:
+        log.warning("could not refresh the CSV logs (%s: %s); the database is "
+                    "unaffected", type(exc).__name__, exc)
 
 
 def _bar_is_today(book, tz: str) -> bool:
@@ -259,6 +277,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
                 max_positions=live.max_positions,
                 min_shares=live.min_order_shares,
                 min_notional=live.min_order_notional,
+                min_drift=live.rebalance_drift,
                 hold_safe_asset=live.hold_safe_asset,
                 safe_asset=live.safe_asset,
                 universe=book.universe,
@@ -268,6 +287,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
             st.write_book_csv(live.book_csv_path, account, external, positions,
                               prices=book.prices, target=target,
                               notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
+            _write_csv_logs(live, book)
             broker.qualify(sorted({o.symbol for o in orders} | set(target)))
             log.info("all symbols qualified with IB")
     except GuardTripped as exc:
@@ -349,6 +369,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
                 max_positions=live.max_positions,
                 min_shares=live.min_order_shares,
                 min_notional=live.min_order_notional,
+                min_drift=live.rebalance_drift,
                 hold_safe_asset=live.hold_safe_asset,
                 safe_asset=live.safe_asset,
                 universe=book.universe,
@@ -357,6 +378,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
             st.write_book_csv(live.book_csv_path, account, external, positions,
                               prices=book.prices, target=target,
                               notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
+            _write_csv_logs(live, book)
 
             # Checked here, immediately before sending, not at the top of the
             # phase: the download and ranking take real time, and it is the
@@ -484,6 +506,7 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
                 source="ib",
             )
 
+            _write_csv_logs(live)
             log.info("end-of-day positions: %s", positions or "(flat)")
             log.info("marked book $%s across %d positions (risk %.0f%%), "
                      "NetLiquidation $%s",
@@ -542,7 +565,7 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     sel = store.selection_history(live.db_path, limit=40)
     if sel:
         print("STOCK SELECTION")
-        print(f"  {'date':<12}{'symbol':<8}{'event':<7}{'rank':>6}{'12-1 mom':>11}"
+        print(f"  {'date':<12}{'symbol':<8}{'event':<7}{'rank':>6}{'momentum':>11}"
               f"  reason")
         for r in sel:
             rank = "" if r["rank"] is None else f"{r['rank']:.0f}"

@@ -1045,11 +1045,21 @@ def finviz_watchlists(
     name that passed, in RS order, then keeps the top `n_watch`. The screen's
     own rebalance is set to `selection_day`, so the list is rebuilt on the last
     session of each week and stands for the week that follows.
+
+    Defaults to `config.notebook_screen_params()` -- the filter set this
+    strategy was built against -- rather than to the screen's current
+    defaults. Pass `params=` to use anything else.
     """
-    from .config import FinvizScreenParams
+    from .config import FinvizScreenParams, notebook_screen_params
     from .screens import finviz_momentum_screen
 
-    base = params or FinvizScreenParams()
+    # The NOTEBOOK filter set, not the screen's current defaults. This
+    # strategy's entry logic assumes names selected near their highs -- that
+    # is what `min_off_high_pct` turns into a band -- and the screen now
+    # selects on the high-momentum definition with the proximity filter off.
+    # Following it would change every result in this module without changing
+    # a line of it.
+    base = params or notebook_screen_params()
     p = FinvizScreenParams(**{**base.__dict__, "n_hold": 0, "exit_rank": 0,
                              "rebalance": selection_day})
     sig = finviz_momentum_screen(universe_prices, safe_prices, p, volumes=volumes)

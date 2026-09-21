@@ -177,6 +177,7 @@ def diff_positions(
     prices: Dict[str, float],
     min_shares: int = 1,
     min_notional: float = 0.0,
+    min_drift: float = 0.0,
 ) -> List[Order]:
     """Deltas between what we want and what we hold, as an order list.
 
@@ -184,6 +185,20 @@ def diff_positions(
     is too small to be worth a spread are skipped -- a two-share rebalance on
     a $200 stock costs more in commission and slippage than the tracking error
     it removes.
+
+    `min_drift` is a no-trade band on positions already held, as a fraction of
+    the target. Share counts are whole numbers, so a position sits one share
+    from its target most days and crosses the rounding boundary whenever the
+    price moves a percent or two -- which produces a one-share trade that
+    corrects a few hundredths of a percent of the book. The band holds the
+    position still until the target has moved enough to be worth acting on.
+
+    It applies only to rebalances. An entry and an exit always trade: those are
+    the strategy changing its mind, not arithmetic drifting across a boundary.
+    Keep the band well below the size of a real de-risking move -- the vol
+    overlay cuts the whole book by 30-50% when realised vol spikes, and a band
+    wide enough to swallow that would suppress the drawdown protection that is
+    the overlay's entire purpose.
 
     Sells are emitted before buys so that, in a fully-invested book, the cash
     from an exit is available for the entry that replaces it.
@@ -212,6 +227,15 @@ def diff_positions(
             log.info("skip %s: delta %+d (~$%.0f) below min_notional $%.0f",
                      sym, delta, abs(delta) * px, min_notional)
             continue
+        # The no-trade band, for rebalances only: `want` and `have` are both
+        # non-zero here, so this is neither an entry nor an exit.
+        if min_drift > 0 and want != 0 and have != 0:
+            drift = abs(delta) / abs(want)
+            if drift < min_drift:
+                log.info("hold %s at %d: target %d is %.0f%% away, inside the "
+                         "%.0f%% no-trade band", sym, have, want,
+                         100 * drift, 100 * min_drift)
+                continue
 
         if want == 0:
             reason = "exit"
@@ -304,6 +328,7 @@ def build_orders(
     max_positions: int,
     min_shares: int = 1,
     min_notional: float = 0.0,
+    min_drift: float = 0.0,
     hold_safe_asset: bool = True,
     safe_asset: str = "BOXX",
     universe: Optional[Iterable[str]] = None,
@@ -333,7 +358,8 @@ def build_orders(
 
     orders = diff_positions(target, {k: v for k, v in actual.items()
                                      if k in strategy_syms},
-                            prices, min_shares=min_shares, min_notional=min_notional)
+                            prices, min_shares=min_shares, min_notional=min_notional,
+                            min_drift=min_drift)
     orders = apply_guards(orders, notional, target, max_order_notional,
                           max_gross_turnover, max_positions,
                           unknown_positions=unknown, safe_asset=safe_asset)

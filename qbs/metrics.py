@@ -164,7 +164,10 @@ def holdings_runs(result: BacktestResult) -> pd.DataFrame:
     entry_meta = {}
     if sig.events is not None and not sig.events.empty:
         for _, row in sig.events[sig.events["action"] == "buy"].iterrows():
-            m = re.search(r"rank (\d+), 12-1 mom ([+-][\d.]+)%", str(row["reason"]))
+            # The lookback is whatever the config says, so match it loosely
+            # rather than pinning the two files to the same literal.
+            m = re.search(r"rank (\d+), [\d.]+-[\d.]+ mom ([+-][\d.]+)%",
+                          str(row["reason"]))
             if m:
                 entry_meta[(row["asset"], pd.Timestamp(row["date"]))] = (
                     int(m.group(1)), float(m.group(2)))

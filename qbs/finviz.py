@@ -30,7 +30,13 @@ What this costs, because it is not free
   it, but the first run takes a while and the cache runs to tens of megabytes.
   Volume comes back in the same yfinance response as the closes, so keeping it
   costs no extra network -- only disk -- and it is what lets the momentum
-  screen apply its $5m turnover test instead of skipping it.
+  screen apply its 300k-share volume test instead of skipping it.
+* **This 300k floor and the leader rule's now measure the same thing**, which
+  makes the leader leg close to non-binding here: a name in this universe
+  already AVERAGES over 300k shares, so it fails the leg only on an unusually
+  quiet session. That is fine -- it is a sanity check rather than a filter --
+  but do not read the leader count as liquidity-screened beyond what this
+  universe filter already did.
 * **Finviz is a scrape, not an API.** It rate-limits, and the page layout is
   not a contract. Every entry point here returns None or raises a clear error
   rather than half a universe, because a breadth reading computed over a
@@ -47,11 +53,75 @@ import numpy as np
 import pandas as pd
 
 from .config import DOWNLOAD_START
+from .data import sessions_behind
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 UNIVERSE_CSV = os.path.join(CACHE_DIR, "finviz_universe.csv")
 BARS_DIR = os.path.join(CACHE_DIR, "universe")
+FETCH_STAMP = os.path.join(BARS_DIR, "us_last_fetch.txt")
+
+
+# --------------------------------------------------------------------------
+# "Once a day" -- an ATTEMPT counter, not a success counter
+# --------------------------------------------------------------------------
+# Streamlit re-runs the whole script on every widget interaction, and the app
+# is expected to refresh itself when the data is old. Those two together are a
+# trap: at 10am the last bar is yesterday's, so "is the data stale?" says yes,
+# a 2,400-name download runs, today's bar still does not exist because the
+# market has not closed, and the next rerun asks the same question and gets the
+# same answer. The app would download all day.
+#
+# So the gate is on the attempt, not on the data. One automatic try per
+# calendar day, stamped whether it succeeds or fails, and the manual refresh
+# button ignores the stamp entirely.
+#
+# The cost of stamping failures too: if the network is down at 9am it will not
+# retry by itself until tomorrow. That is deliberate -- a silent retry loop on
+# a broken connection is worse than a stale number with a button next to it --
+# and the UI says when the next automatic attempt is due.
+
+def last_fetch_attempt(stamp_path: str = FETCH_STAMP) -> Optional[pd.Timestamp]:
+    """When the app last TRIED to refresh the US universe, or None."""
+    try:
+        with open(stamp_path) as fh:
+            return pd.Timestamp(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def record_fetch_attempt(stamp_path: str = FETCH_STAMP,
+                         now: Optional[pd.Timestamp] = None) -> None:
+    """Stamp an attempt. Never raises -- an unwritable stamp must not break a
+    fetch that otherwise worked; it only costs one extra attempt."""
+    now = now or pd.Timestamp.now("UTC").tz_convert(None)
+    try:
+        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+        with open(stamp_path, "w") as fh:
+            fh.write(now.isoformat(timespec="seconds"))
+    except (OSError, ValueError):
+        # ValueError too: `os.makedirs` raises it, not OSError, on a path the
+        # OS will not even look at (an embedded null, say). Catching only
+        # OSError turns an unusable stamp path into a dashboard that will not
+        # start, which is a much worse failure than fetching twice.
+        pass
+
+
+def due_for_fetch(stamp_path: str = FETCH_STAMP,
+                  now: Optional[pd.Timestamp] = None) -> Tuple[bool, str]:
+    """`(due, why)` -- is an automatic refresh allowed right now?
+
+    Calendar days, not 24 hours: an app opened at 08:00 and again at 09:00 the
+    next morning should refresh, and a 24-hour rule would refuse.
+    """
+    now = now or pd.Timestamp.now("UTC").tz_convert(None)
+    last = last_fetch_attempt(stamp_path)
+    if last is None:
+        return True, "no automatic fetch has run yet"
+    if last.date() < now.date():
+        return True, f"last automatic fetch was {last:%Y-%m-%d %H:%M}"
+    return False, (f"already fetched today at {last:%H:%M} — "
+                   f"use Refresh now to fetch again")
 
 
 @dataclass
@@ -178,12 +248,18 @@ def load_universe_bars(
     offline: bool = False,
     batch_size: int = 100,
     verbose: bool = True,
+    stale_after: Optional[int] = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
     """`(closes, volumes, error)` for a wide universe, cached as two CSVs.
 
+    `stale_after` is how many trading sessions behind the cache may be before
+    a hit stops counting and the download runs anyway. Without it a cache hit
+    is returned whatever its age, which pins a long-running app to whatever
+    happened to be on disk when it started.
+
     Volume is kept because it arrives in the same yfinance response as the
     closes -- no extra network -- and it is the only thing standing between
-    the momentum screen and its $5m turnover test. `universe.load_universe_prices`
+    the momentum screen and its volume test. `universe.load_universe_prices`
     deliberately discards it, which is right for the ranking strategies and
     wrong here.
 
@@ -215,7 +291,19 @@ def load_universe_bars(
                 "Source set to Online to build them")
             return c, v, err
         if c is not None and not c.empty:
-            return c, v, None
+            # A cache HIT that never asks how old it is pins the app to
+            # whatever is on disk for ever. `stale_after` is the number of
+            # trading sessions behind at which the hit stops counting; None
+            # keeps the old behaviour for callers that manage freshness
+            # themselves.
+            if stale_after is None:
+                return c, v, None
+            behind = sessions_behind(c.index.max())
+            if behind < stale_after:
+                return c, v, None
+            if verbose:
+                print(f"[finviz] price cache is {behind} session(s) behind "
+                      f"(limit {stale_after}) — re-downloading")
 
     tickers = sorted({t for t in tickers if t})
     closes, volumes, failed = [], [], []

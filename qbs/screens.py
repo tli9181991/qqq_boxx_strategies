@@ -273,7 +273,7 @@ def trend_template_screen(
 #      and then by distance below the 52-week high ascending
 #
 # Stage 3 is the selection rule, so that is what is reproduced here. Stage 2
-# is available through `min_quarter_return` / `min_turnover` but is off by
+# is available through `min_quarter_return` / `min_dollar_volume` but is off by
 # default, because in the notebook it feeds the breakdown table and nothing
 # else. Stage 1 is a set of absolute tests, which is what makes this a screen
 # rather than a ranking: on a bad day nothing passes and the book is in cash.
@@ -295,7 +295,8 @@ def finviz_momentum_screen(
                       too few names pass, sit here.
     volumes         : optional date x ticker share volume. Supplying it enables
                       the "Average Volume over 200K" criterion (and
-                      `min_turnover`, if set); without it both are skipped and
+                      `min_dollar_volume`, if set); without it both are skipped
+                      and
                       `volume_filter_applied` on the result is False.
 
     The ranking
@@ -321,20 +322,34 @@ def finviz_momentum_screen(
     px = universe_prices.sort_index()
     safe = safe_prices.reindex(px.index).ffill()
 
-    # ---- stage 1: the Finviz filters --------------------------------------
-    sma = px.rolling(p.above_sma, min_periods=p.above_sma).mean()
-    above_sma = px > sma
+    # ---- stage 1: the filters ---------------------------------------------
+    # Legs that can be switched off are switched off by a value, not by an
+    # `if` that skips the assignment: the diagnostics below report every leg
+    # on every date, and a leg that is off has to read as "everyone passed"
+    # rather than vanish from the table.
+    everyone = px.notna()
 
+    if p.above_sma:
+        sma = px.rolling(p.above_sma, min_periods=p.above_sma).mean()
+        above_sma = px > sma
+    else:
+        above_sma = everyone
+
+    # `pct_off_high` is computed whether or not the proximity filter is on --
+    # it is also the RS tie-break, so turning the filter off must not change
+    # the ranking.
     high_52w = px.rolling(p.high_window, min_periods=p.high_window).max()
     pct_off_high = 1.0 - px / high_52w
-    within_high = pct_off_high <= p.within_52w_high_pct
+    within_high = everyone
+    if p.within_52w_high_pct is not None:
+        within_high = pct_off_high <= p.within_52w_high_pct
     if p.min_off_high_pct:
-        within_high &= pct_off_high >= p.min_off_high_pct
+        within_high = within_high & (pct_off_high >= p.min_off_high_pct)
 
-    priced = px >= p.min_price
+    priced = px > p.min_price
 
     quarter_ret = px / px.shift(p.quarter_lookback) - 1.0
-    quarter_up = quarter_ret > 0 if p.require_quarter_up else px.notna()
+    quarter_up = quarter_ret > 0 if p.require_quarter_up else everyone
 
     # A name needs enough history before any of this means anything.
     history = px.notna().cumsum()
@@ -346,18 +361,32 @@ def finviz_momentum_screen(
     volume_filter_applied = volumes is not None
     if volume_filter_applied:
         vol = volumes.reindex(index=px.index, columns=px.columns).ffill()
-        avg_vol = vol.rolling(p.avg_volume_window,
-                              min_periods=p.avg_volume_window).mean()
-        passes &= avg_vol > p.min_avg_volume
-        if p.min_turnover is not None:
-            passes &= (px * vol) >= p.min_turnover
-    elif p.min_turnover is not None:
-        raise ValueError("min_turnover needs `volumes`; pass it or leave the "
-                         "parameter at None")
+        if p.min_volume is not None:
+            passes &= vol > p.min_volume
+        if p.min_avg_volume is not None:
+            avg_vol = vol.rolling(p.avg_volume_window,
+                                  min_periods=p.avg_volume_window).mean()
+            passes &= avg_vol > p.min_avg_volume
+        if p.min_dollar_volume is not None:
+            passes &= (px * vol) >= p.min_dollar_volume
+    else:
+        needed = [n for n, v in (("min_volume", p.min_volume),
+                                 ("min_dollar_volume", p.min_dollar_volume))
+                  if v is not None]
+        if needed:
+            # `min_avg_volume` is NOT in that list: it is skipped silently when
+            # no volume is supplied, which is the pre-existing behaviour and is
+            # permissive. These two are the high-momentum definition's own leg,
+            # so dropping one on the floor would overstate the screen.
+            plural = len(needed) > 1
+            raise ValueError(
+                f"{' and '.join(needed)} "
+                f"{'need' if plural else 'needs'} `volumes`; pass volumes= or "
+                f"set {'them' if plural else 'it'} to None")
 
     # ---- the notebook's stage-2 gate, if it was switched on ---------------
     if p.min_quarter_return is not None:
-        passes &= quarter_ret >= p.min_quarter_return
+        passes &= quarter_ret > p.min_quarter_return
 
     # ---- stage 3: the RS measure ------------------------------------------
     # Perf_1Y, on a fixed lookback. See FinvizScreenParams on why it is fixed.

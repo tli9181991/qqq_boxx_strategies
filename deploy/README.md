@@ -159,7 +159,7 @@ query.
 | Table | One row per | Holds |
 |---|---|---|
 | `trade_events` | thing that happened | submissions, fills, cancellations, guard trips, skipped sessions |
-| `selection_events` | (date, symbol, event) | `entry` / `exit` / `hold`, with the rank and 12-1 momentum the strategy actually used |
+| `selection_events` | (date, symbol, event) | `entry` / `exit` / `hold`, with the rank and 6-1 momentum the strategy actually used |
 | `position_closes` | (date, symbol) | shares, close price, market value, unrealised P&L, target vs actual weight |
 | `portfolio_nav` | date | book market value, NetLiquidation, cash, risk weight, the vol scalar |
 | `signal_runs` | (date, phase) | what the signal said, kept for preflight *and* trade so you can see the intraday drift |

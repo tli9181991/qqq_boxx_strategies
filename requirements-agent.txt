@@ -1,0 +1,31 @@
+# The LLM analyst (qbs/agent, and the dashboard's Analyst tab).
+#
+#   pip install -r requirements.txt -r requirements-agent.txt
+#   export GOOGLE_API_KEY=...          # https://aistudio.google.com/apikey
+#   python -m qbs.agent --check
+#
+# Nothing in the backtest imports any of this. The analyst reads results; it
+# never produces them, so a missing key costs you the commentary and not a
+# single number.
+#
+# The data layers underneath (qbs.agent.evidence, .fundamentals, .news) do not
+# import langchain at all, which is why `python -m qbs.agent --report picks`
+# works with none of this installed.
+
+# LangChain 1.x: `from langchain.agents import create_agent`. The 0.x
+# AgentExecutor API is gone, so this is a floor and not a nicety.
+langchain>=1.0
+langchain-core>=1.0
+
+# Gemini. Pinned to the 2.x line of the integration, which is what exposes
+# tool calling the way create_agent expects.
+langchain-google-genai>=2.0
+
+# Web search, no API key required. Tavily is better and costs money: to use
+# it instead, `pip install tavily-python` and set TAVILY_API_KEY -- qbs.agent
+# .news prefers it automatically when both are present.
+ddgs>=9.0
+
+# Fundamentals. Already in requirements.txt for prices; repeated so this file
+# installs standalone.
+yfinance>=0.2.40

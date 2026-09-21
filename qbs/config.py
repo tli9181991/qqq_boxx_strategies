@@ -106,10 +106,10 @@ class MomentumParams:
     top `n_hold`, but do not sell until the name has fallen past `exit_rank`.
     Setting exit_rank == n_hold disables the band and gives the naive version.
     """
-    lookback_months: int = 12
-    skip_months: int = 1          # 12-1 momentum: skip the most recent month
+    lookback_months: int = 6
+    skip_months: int = 1          # 6-1 momentum: skip the most recent month
     n_hold: int = 6
-    exit_rank: int = 10           # hysteresis band; == n_hold means no band
+    exit_rank: int = 8            # hysteresis band; == n_hold means no band
     rebalance: str = "daily"      # "daily" | "ME" (month end) | "W-FRI"
     weighting: str = "equal"      # "equal" | "inv_vol"
     absolute_filter: bool = True  # a name must also beat the safe asset
@@ -124,55 +124,83 @@ class MomentumParams:
 
 @dataclass
 class FinvizScreenParams:
-    """The Finviz screener strategy, rolled forward so it can be backtested.
+    """The high-momentum screen: filter on the definition, rank, take the top N.
 
-    This reproduces `finviz_filter_with_daily_summary.ipynb`: a Finviz filter
-    pass, then a relative-strength ranking of whatever survived, then take the
-    strongest N. Every Finviz criterion in that notebook is derived from price
-    and volume, which is why it can be recomputed on every historical date
-    instead of only on the day you ran the screener.
+    Filter, then a relative-strength ranking of whatever survived, then the
+    strongest `n_hold`. The filter is the same high-momentum definition the
+    market-overview tab's leader group uses -- price over $5, over 300k shares
+    a day, up more than 28% on the quarter -- so a name shown as a "momentum
+    leader" there and a name held here are selected on the same rule.
 
-    Where a default here differs from the notebook, the docstring says so.
-    The two that matter:
+    It started as a roll-forward of `finviz_filter_with_daily_summary.ipynb`
+    and kept that notebook's Finviz filters. Those are now OFF by default
+    (`above_sma`, `within_52w_high_pct`) and their fields say what turning
+    them back on costs. The ranking stage is unchanged and still the
+    notebook's: RS Rank on a one-year return, tie-broken by distance below the
+    52-week high.
+
+    Three things worth knowing:
 
     * `rs_lookback` is a FIXED 252 bars. The notebook downloads `period="1y"`
       and takes `(last - first) / first`, so a name with 210 bars of history
       contributes a 210-day return to a column compared against other names'
       252-day returns. Ranking two different horizons against each other is
       not a like-for-like comparison, so the lookback is pinned.
-    * `min_quarter_return` is None -- off. The notebook applies its 20%
-      quarterly gate only to the sector-breakdown table, NOT to the watchlist
-      it finally ranks. Set it to 0.20 to fold that gate into selection.
+    * `min_volume` NEEDS `volumes=`. Unlike the old `min_avg_volume`, which was
+      skipped silently when volume was missing, this one raises: it is a leg of
+      the definition, and dropping a leg on the floor overstates the screen.
+      Set it to None to opt out deliberately -- the caller then knows, and can
+      say so on screen.
+    * Market cap over $300m, one of the notebook's filters, needs fundamentals
+      and is not applied. On a Nasdaq-100 ranking universe it is non-binding;
+      on the broad US universe it is not, and its absence is permissive.
 
-    Two Finviz criteria cannot be reproduced from prices alone:
-
-    * Market cap over $300m needs fundamentals. On a Nasdaq-100 ranking
-      universe it is non-binding -- the smallest constituent is orders of
-      magnitude above the threshold.
-    * Average volume over 200k needs share volume. Pass `volumes=` to
-      `finviz_momentum_screen` to enable it; without it the criterion is
-      skipped and `volume_filter_applied` on the result is False. Skipping it
-      is strictly MORE permissive, so it flatters this strategy rather than
-      the other way round.
+    **`n_hold` is 20 and the universe matters.** On the ~99-name Nasdaq-100
+    cache the filter passes a median of 11 names, so a top-20 is usually a
+    top-whatever-qualified. Run it over the broad US universe
+    (`qbs.finviz.fetch_us_universe`) for the ranking to be a real selection
+    rather than a list of everyone who cleared the bar.
     """
     # ---- Finviz stage-1 filters -----------------------------------------
-    min_price: float = 10.0             # "Price: Over $10"
-    quarter_lookback: int = 63          # ~one quarter, for "Performance: Quarter Up"
-    require_quarter_up: bool = True     # "Performance: Quarter Up"
-    above_sma: int = 200                # "200-Day SMA: Price above SMA200"
-    within_52w_high_pct: float = 0.10   # "52-Week High/Low: 0-10% below High"
+    # The three legs of the high-momentum definition (see BreadthParams, which
+    # holds the same thresholds for the market-overview tab's leader group).
+    # These are the whole filter now.
+    min_price: float = 5.0              # > $5
+    min_volume: float | None = 300_000.0    # > 300k shares/day -- needs volumes=
+    min_quarter_return: float | None = 0.28  # > 28% over `quarter_lookback`
+    quarter_lookback: int = 63          # ~one quarter
+
+    # Subsumed by `min_quarter_return`: a name up 28% is up. Left here because
+    # setting min_quarter_return to None should still leave a usable screen.
+    require_quarter_up: bool = False
+
+    # The two legs the original Finviz notebook applied and the high-momentum
+    # definition does not. OFF by default; both still work if set.
+    #
+    # `above_sma` was near-redundant anyway -- a name up 28% on the quarter is
+    # essentially always above its 200-day average, and on the cached universe
+    # adding it back changes the passing count by zero. The proximity filter
+    # is the one that bites: it roughly halves the qualifying set, and with it
+    # on, a top-20 fills on 3% of sessions instead of 15%.
+    above_sma: int = 0                  # 0 = off; 200 = "price above SMA200"
+    within_52w_high_pct: float | None = None   # None = off; 0.10 = the old rule
     # The notebook's filter is a ceiling only: 0-10% below the high. Setting a
     # FLOOR turns it into a band, which is what a breakout entry needs -- a
     # name already at its high has nothing overhead left to break through.
     # 0.0 keeps the notebook's behaviour.
     min_off_high_pct: float = 0.0
     high_window: int = 252
-    min_avg_volume: float = 200_000.0   # "Average Volume: Over 200K" -- needs volumes=
-    avg_volume_window: int = 50         # the notebook's Avg_Vol_50D
+    # Superseded by `min_volume`, which is the definition's own leg (same-day
+    # shares, not a 50-day average). Off by default so the screen applies one
+    # volume test rather than two.
+    min_avg_volume: float | None = None  # e.g. 200_000 -- needs volumes=
+    avg_volume_window: int = 50          # the notebook's Avg_Vol_50D
 
-    # ---- the notebook's stage-2 gate, off by default --------------------
-    min_quarter_return: float | None = None   # 0.20 reproduces its 動力股 rule
-    min_turnover: float | None = None         # 5e6, same rule -- needs volumes=
+    # ---- other optional gates -------------------------------------------
+    # Dollar volume (close x shares) -- NOT the portfolio turnover of `Ann.
+    # turnover`, which is what the old name here was confusable with, and no
+    # longer the same test as the leader rule's, which counts shares.
+    min_dollar_volume: float | None = None    # e.g. 5e6 -- needs volumes=
 
     # ---- stage-3 ranking ------------------------------------------------
     rs_lookback: int = 252              # the notebook's Perf_1Y
@@ -180,7 +208,7 @@ class FinvizScreenParams:
     min_history: int = 252              # bars before a name is rankable
 
     # ---- turning a watchlist into a book --------------------------------
-    n_hold: int = 6                     # 0 -> hold every name that passes
+    n_hold: int = 20                    # 0 -> hold every name that passes
     exit_rank: int = 0                  # 0 = no band, which is the notebook's rule
     rebalance: str = "daily"            # "daily" | "ME" | "W-FRI"
     safe_asset: str = SAFE_ASSET
@@ -225,6 +253,57 @@ class VixBreakerParams:
     min_cash_days: int = 2        # minimum dwell in cash, even if VIX recovers at once
     safe_asset: str = SAFE_ASSET
     sell_safe_too: bool = True    # True: trigger sells the safe sleeve as well
+
+
+@dataclass
+class DrawdownStopParams:
+    """A circuit breaker on the book's own drawdown.
+
+    The overlay of last resort: when the book is far enough below its own high,
+    hold nothing but the safe asset for a few sessions, then resume. It sits on
+    top of a finished strategy and changes only the exposure, never the picks.
+
+    Why the *book's* drawdown and not the market's or a position's. A market
+    trigger misses the failure this book is most prone to -- in June 2026 QQQ
+    fell 11% while the book fell 16%, because six correlated semiconductors
+    moved together in an index that did not. A position trigger fires on
+    ordinary noise: a 13% fall in a stock running at 50% vol is a routine week,
+    and stopping it swaps one volatile name for another mid-decline. Measured
+    over 2020-2026 both made drawdown *worse*; only the book-level measure
+    improved it, from -33.9% to -17.6% with Calmar 0.81 -> 1.31.
+
+    Why a fixed cooldown rather than a recovery signal. Every "confirm the
+    recovery" rule tested was worse, and the conditions that flicker were much
+    worse: re-entering when VIX returned to its average produced 87 episodes
+    against this rule's 5, and turned Calmar 1.31 into 0.34. The red flag is
+    already a lagging condition, so a lagging green flag stacks delay on delay
+    and sells the decline while missing the rebound.
+
+    `qqq_drawdown` is a second, redundant trigger. Over 2020-2026 the OR fires
+    on exactly the same five episodes as the book leg alone and for the same
+    27% of sessions, because by the time QQQ is 15% below its high this book is
+    already past 13% (Calmar 1.30 against 1.31 -- inside the noise). It is kept
+    because a market-wide guard is worth having on the day the two stop
+    agreeing, and because it costs nothing when it never binds. Set it to 0.0
+    to drop it and with it the live dependency on a benchmark series.
+
+    Enabled. The evidence is five episodes over six years, one of them outside
+    the window the live book has ever seen, so this is a deliberate choice made
+    on thin data rather than a conclusion the sample forced.
+    """
+    enabled: bool = True
+    exit_drawdown: float = 0.13   # book this far below its own high -> cash
+    qqq_drawdown: float = 0.15    # same, on the benchmark. 0.0 = off
+    cooldown_days: int = 5        # sessions to stay out after the flag clears
+    safe_asset: str = SAFE_ASSET
+
+    def __post_init__(self):
+        if not 0.0 < self.exit_drawdown < 1.0:
+            raise ValueError("exit_drawdown must be in (0, 1)")
+        if not 0.0 <= self.qqq_drawdown < 1.0:
+            raise ValueError("qqq_drawdown must be in [0, 1); 0 disables it")
+        if self.cooldown_days < 0:
+            raise ValueError("cooldown_days must not be negative")
 
 
 @dataclass
@@ -373,6 +452,20 @@ class Config:
     weekly_book: WeeklyBookParams = field(default_factory=WeeklyBookParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
+    dd_stop: DrawdownStopParams = field(default_factory=DrawdownStopParams)
+    dd_stop_benchmark: str = RISK_ASSET   # the series dd_stop.qqq_drawdown reads
+    # Restrict the ranker to the dashboard's momentum-leader set before it
+    # picks the top N -- close over $5, over 300k shares a day, up more than
+    # 28% on the quarter (the thresholds live in `breadth.BreadthParams`, so
+    # there is one definition and the dashboard and the ranker cannot drift).
+    #
+    # Off, and measured harmful: on 2020-2026 it takes CAGR from 22.9% to 8.1%
+    # and max drawdown from -17.6% to -30.4%, at 26x annual turnover against
+    # 11x. The leader set is not stable enough to hold a book -- a name crosses
+    # the quarterly threshold in and out constantly, and since the mask forces
+    # an exit the whole risk sleeve churns. Every threshold from 0% to 28% was
+    # worse than no filter, in every window tested.
+    use_leader_filter: bool = False
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -410,6 +503,30 @@ PALETTE = {
     "shade_safe": "#f0efec",  # regime shading -- risk-off
 }
 
+def notebook_screen_params(**kw) -> "FinvizScreenParams":
+    """The ORIGINAL Finviz-notebook filter set, which is no longer the default.
+
+    `FinvizScreenParams()` now applies the high-momentum definition -- over $5,
+    over 300k shares, up more than 28% on the quarter -- and leaves the
+    notebook's 200-day and 52-week-high filters off. That is the right default
+    for the screen, and the wrong one for anything built against the old rules.
+
+    The breakout research is exactly that: its watchlist is this screen's
+    output, and its entry logic assumes names selected NEAR their highs, with
+    `min_off_high_pct` turning that ceiling into a band. Handing it the new
+    defaults would change a documented result without changing a line of its
+    own code, so it asks for this instead.
+    """
+    for key, value in (("min_price", 10.0), ("above_sma", 200),
+                       ("within_52w_high_pct", 0.10),
+                       ("require_quarter_up", True),
+                       ("min_quarter_return", None),
+                       ("min_volume", None),
+                       ("min_avg_volume", 200_000.0)):
+        kw.setdefault(key, value)
+    return FinvizScreenParams(**kw)
+
+
 STRATEGY_LABELS = {
     "rsi2": "Connors RSI(2)",
     "gem": "GEM dual momentum",
@@ -417,7 +534,7 @@ STRATEGY_LABELS = {
     "momentum": "Top-6 NDX momentum",
     "momentum_vix": "Top-6 + VIX breaker",
     "momentum_vt": "Top-6 vol-targeted",
-    "finviz": "Top-6 Finviz screen",
+    "finviz": "Top-20 high momentum screen",
     "breakout": "Weekly breakout, 6 slots",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",

@@ -6,11 +6,11 @@ that shows you where every signal fired.
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
 - **GEM (Global Equities Momentum)** — Antonacci dual momentum across QQQ / VEU / BOXX
 - **Volatility-targeting overlay** — scales QQQ exposure so forecast vol sits near target
-- **Top-6 Nasdaq-100 momentum** — cross-sectional 12-1 momentum with a hysteresis band
+- **Top-6 Nasdaq-100 momentum** — cross-sectional 6-1 momentum with a hysteresis band
 - **Top-6 + VIX circuit breaker** — the same book, switched off entirely when VIX spikes
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
-- **Top-6 Finviz screen** — the Finviz filter-and-rank notebook, rolled forward so it
-  can be held against the momentum book on identical assumptions
+- **Top-20 high momentum screen** — an absolute bar (over $5, over 300k shares a day,
+  up more than 28% on the quarter), then ranked by relative strength
 
 Plus one strategy that does not fit the daily model and runs on its own:
 
@@ -41,6 +41,11 @@ python run_backtest.py --synthetic
 The first live run downloads from Yahoo and caches to `data/`; later runs are instant
 and work offline (`--offline`). `--no-momentum` skips the ~100-ticker Nasdaq-100
 download while you iterate on the other three.
+
+Optional extras, each in its own requirements file so the backtest never depends on
+them: `requirements-dashboard.txt` (Streamlit),
+`requirements-agent.txt` ([the LLM analyst](#the-llm-analyst)),
+`requirements-live.txt` (IB trading).
 
 ---
 
@@ -176,13 +181,13 @@ Cross-sectional momentum: rank the whole index, hold the strongest names.
 
 | | Rule |
 |---|---|
-| Score | **12-1 momentum** — return from 12 months ago to 1 month ago |
+| Score | **6-1 momentum** — return from 6 months ago to 1 month ago |
 | Hold | the top `n_hold` (6), equal weight per *slot* |
-| Exit | only once a name falls past `exit_rank` (10) — the hysteresis band |
-| Filter | a name must also beat BOXX's own 12-1 return, else that slot goes to cash |
+| Exit | only once a name falls past `exit_rank` (8) — the hysteresis band |
+| Filter | a name must also beat BOXX's own return over the same window, else that slot goes to cash |
 | Rebalance | daily by default, matching the intended live design |
 
-**Why 12-1 and not 12-0.** The most recent month is skipped because short-horizon
+**Why skip the most recent month.** The most recent month is skipped because short-horizon
 returns *reverse* rather than persist. Including them mixes two effects with opposite
 signs and blunts both.
 
@@ -269,27 +274,52 @@ gap in one name: it responds to sustained volatility, not to jumps.
 against VIX so you can see the episodes an index signal misses. The dial is expected
 to be *boring* — a kink would mean the overlay is doing more than rescaling.
 
-### 7. Top-6 Finviz screen
+### 7. Top-20 high momentum screen
 
-`finviz_filter_with_daily_summary.ipynb` answers "what would I buy today". This rolls
-it forward to every historical date so it can be held against the momentum book.
+Started as a roll-forward of `finviz_filter_with_daily_summary.ipynb`. It now applies
+the **same high-momentum definition** as the market-overview tab's leader group, so a
+name shown as a "momentum leader" there and a name held here are selected on one rule.
 
 | | Rule |
 |---|---|
-| Filter | price > $10, close > SMA(200), quarter return > 0, **within 10% of the 52-week high** |
+| Filter | close > **$5**, volume > **300k shares/day**, quarterly gain > **28%** |
 | Score | 1-year total return, bucketed into a 1–99 RS Rank |
 | Tie-break | smallest distance below the 52-week high |
-| Hold | the top 6, equal weight per slot |
-| Exit | the day a name stops passing or drops out of the top 6 — **no band** |
+| Hold | the top 20, equal weight per slot |
+| Exit | the day a name stops passing or drops out of the top 20 — **no band** |
 
-**What was reproduced and what could not be.** Every Finviz criterion in the notebook
-is derived from price or volume, which is what makes it rollable at all. Two are not
-applied: market cap over $300m needs fundamentals (non-binding on the Nasdaq-100), and
-average volume over 200k needs share volume — pass `volumes=` to enable it. Both
-omissions are *permissive*, so they flatter this strategy rather than the other way
-round. The notebook's 20%-quarterly-return gate is off by default because the notebook
-itself applies it only to the sector-breakdown table, not to the list it ranks
-(`min_quarter_return=0.20` switches it on).
+**It is a different kind of strategy from the momentum book**, not a variant of it. The
+momentum book ranks the whole universe and takes the top six whatever the market is
+doing, so it is always fully invested. This screen applies an *absolute* bar first, so
+in a weak tape it can return almost nobody and sit in cash. That is a feature of the
+design, and the reason the two rarely hold the same names.
+
+**The two Finviz-notebook filters are now off by default**: `above_sma` (200-day) and
+`within_52w_high_pct` (10%). Both still work if set. Turning `above_sma` back on is
+near-free — on the cached universe it changes the passing count by zero, because a name
+up 28% on the quarter is essentially always above its 200-day average. The proximity
+filter is the one that bites: it roughly halves the qualifying set and takes a full
+top-20 from 15% of sessions down to 3%.
+
+**Running it on Colab.** `notebooks/finviz_selection_colab.ipynb` clones the repo,
+downloads closes *and volumes* so all three legs apply, runs this same
+`finviz_momentum_screen`, and prints the ranked picks with the numbers that chose
+them plus a per-leg funnel. A flag at the top switches between the Nasdaq-100
+(under a minute) and the full US universe (several minutes, ~120 paginated Finviz
+requests). Runtime → Run all.
+
+**`n_hold` is 20, and the universe decides whether that means anything.** On the
+~99-name Nasdaq-100 cache a median of **11** names clear the filter, so "top 20" is
+usually "everyone who qualified" — on the last cached bar, 6 names. For the ranking to
+be a real selection, run it over the broad US universe
+(`qbs.finviz.fetch_us_universe`), which is what the market tab already fetches.
+
+**What is not applied.** Market cap over $300m needs fundamentals (non-binding on the
+Nasdaq-100, permissive elsewhere). And `min_volume` **needs `volumes=`** — unlike the
+old average-volume filter, which was skipped silently when volume was missing, this one
+*raises*, because it is a leg of the definition and dropping a leg on the floor
+overstates the screen. The dashboard and the backtest both opt out of it explicitly
+and say so on screen, since the Nasdaq-100 cache carries closes only.
 
 **It is ranked against the Nasdaq-100, not against Finviz's own output.** That is
 deliberate. The notebook screens the whole US market and gets ~530 names; running the
@@ -307,8 +337,8 @@ Same universe, same six slots, same engine, same 1bp + 5bp costs, 2025-01-20 →
 | | CAGR | Vol | Sharpe | Max DD | Turnover | Cost drag |
 |---|---|---|---|---|---|---|
 | **Top-6 NDX momentum** (12-1, band 10) | **46.1%** | 49.0% | **0.94** | **−34.8%** | **5.7×** | 0.3% |
-| Top-6 Finviz screen (notebook rules) | 25.8% | 40.1% | 0.67 | −36.0% | 86.7× | 5.2% |
-| Top-6 Finviz screen, monthly rebalance | 43.3% | 45.9% | 0.93 | −39.9% | 12.7× | 0.8% |
+| Finviz screen, **as it was** (top 6, notebook rules) | 25.8% | 40.1% | 0.67 | −36.0% | 86.7× | 5.2% |
+| Finviz screen, **as it was**, monthly rebalance | 43.3% | 45.9% | 0.93 | −39.9% | 12.7× | 0.8% |
 | Buy & hold QQQ | 22.2% | 22.6% | 0.82 | −22.8% | 0.6× | 0.0% |
 
 **Roughly a third of the gap is churn, the rest is selection.** Gross of costs the
@@ -360,6 +390,13 @@ and its edge — if it has one — may live in the small and mid caps the Nasdaq
 not contain. Nothing above rules that out. What it does show is that the *selection
 rule*, applied to the same names as the momentum book, picks differently and, on this
 window, worse — and that the 52-week-high proximity filter is why.
+
+> **Everything in this section measures the screen as it was**: top 6, price > $10,
+> above the 200-day, within 10% of the 52-week high, quarter up. It now runs the
+> high-momentum definition instead, with the proximity filter **off** — which is the
+> very filter this section identifies as the cause. The findings are kept because they
+> are why the screen changed, not because they describe what it does now. **Re-run the
+> backtest before quoting any number above as current.**
 
 ---
 
@@ -658,8 +695,9 @@ qbs/
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
   strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
-  screens.py      filter-based screens: the trend template and the Finviz screen,
-                  both rolled forward from a notebook so they can be backtested
+  screens.py      filter-based screens: the trend template and the high-momentum
+                  screen, both rolled forward from a notebook so they can be
+                  backtested
   breakout.py     hourly resistance-breakout trading + the weekly six-slot book;
                   its own fill-level accounting, because weights cannot express a stop
   engine.py       one backtest function: lag, commission, slippage, equity curve
@@ -669,13 +707,26 @@ qbs/
                   sweep_vix(), sweep_target_vol()
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
+  agent/          an LLM analyst that READS the results above
+    env.py          .env loading: the shell wins, and no value is ever printed
+    evidence.py     the lab's own numbers as text, each with its caveat attached
+    fundamentals.py yfinance company data, cached      (no LangChain import)
+    news.py         web search + Yahoo headlines       (no LangChain import)
+    tools.py        the three above, as LangChain tools
+    analyst.py      a Gemini agent that may call them
 run_backtest.py   CLI
-dashboard/app.py  Streamlit: daily picks + market overview
+dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
-tests/test_qbs.py 142 tests: indicators, engine, momentum, circuit-breaker,
+notebooks/momentum_ranker_colab.ipynb  today's ranking, on Colab
+notebooks/finviz_selection_colab.ipynb the high-momentum screen, on Colab,
+                  over the Nasdaq-100 or the whole US market
+tests/test_qbs.py 166 tests: indicators, engine, momentum, circuit-breaker,
                   vol-target and screen invariants (each strategy gets a
                   shuffled-future look-ahead test)
+tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
+                  precedence, the kill switch, its tools, and one real agent
+                  run driven by a scripted model (no key, no network)
 
 patreon_pipeline/ nothing to do with the strategy. A Gmail-triggered Patreon
                   downloader that transcribes with Whisper and uploads both the
@@ -790,16 +841,43 @@ streamlit run dashboard/app.py
 
 Two tabs:
 
-- **Daily picks** — what each of the three selection strategies held on any chosen
-  day, the entries and exits that changed it, the momentum ∩ Finviz overlap, and a
+- **Daily picks** — what each of the two selection strategies held on any chosen day,
+  the entries and exits that changed it, how many names they hold in common, and a
   downloadable history table. A chart panel on the right plots any name with its
   10/20/50/200-day EMAs and the nearest support and resistance levels.
 
   The levels are re-derived **from history up to the selected date only** — the same
   causal rule `candidate_trades` uses, so the chart never draws a line the strategy
   could not have seen on that date. When a name has cleared everything overhead the
-  panel says so outright: that is the state 52% of Finviz picks are in, and it is the
-  reason a breakout entry has nothing to fire on.
+  panel says so outright — it is in price discovery, with nothing above it to break
+  through.
+
+  **Below the plot, the same name in numbers:** trailing returns over 1w/1m/3m/6m/12m
+  plus the book's own momentum score, each with its **percentile rank in the universe on
+  that date** and the universe median beside it — a twelve-month return means nothing
+  alone, since the question a momentum strategy asks is relative. Then where price sits
+  against each EMA, the SMA 200, its 52-week high and its own ATR.
+
+  Last comes the row that ties the panel to the three above it: **every gate each
+  strategy actually applies, with the reading that decides it and a ✅/❌** — and *only*
+  the gates that are switched on. A row for a filter nobody is running describes a
+  strategy that does not exist, and the table gives the reader no way to tell.
+
+  Every threshold in that table is read off `FinvizScreenParams`, `MomentumParams` and
+  `BreadthParams` rather than written out again, so retuning a strategy retunes its gate
+  rows, labels and verdicts with it; turn the band floor on and its row appears, turn
+  "quarter up" on and its row appears, change the ranker's lookback and every row
+  naming it follows. **That last one is not hypothetical** — the book moved from 12-1 to 6-1,
+  and a panel with the horizon written into it would now be labelling a number the
+  strategy does not use with the name of the rule it claims to explain.
+
+  One leg is deliberately missing: the volume test (> 300k shares/day), which the
+  screen and the leader group both apply and which needs volume data this panel does
+  not carry — so clearing every row shown is **necessary but not sufficient**. The
+  screen and the leader group show the same rules because they *are* the same
+  definition, held in two places (`FinvizScreenParams`, `BreadthParams`) so either can
+  be retuned alone. The momentum hurdle is BOXX over the same window where a safe asset
+  is supplied, and zero where it is not — the row says which.
 
   Price is drawn as **candlesticks**, which need real Open/High/Low. The universe
   cache holds closes only, so the panel fetches daily OHLC for the *selected name*
@@ -808,9 +886,30 @@ Two tabs:
   from closes** — a body spanning previous-close to close with no wick asserts a
   session high and low that never happened, and a chart that lies about range is worse
   than one that admits it only has closes.
-- **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
+- **Market overview** — opens with **What the news said**: a one-day read of market
+  news by the model, then the breadth monitor — 4% up/down counts, percent holding the
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.
+
+  The news panel searches the last day, hands the headlines to Gemini **numbered**, and
+  requires every bullet to cite the numbers it came from. **A bullet with no citation is
+  dropped before you see it**, as is a citation pointing outside the headline list — an
+  unsourced claim in a finance summary cannot be told apart from a remembered one, and
+  the model's memory is a year stale. Whatever was removed is listed in a "dropped from
+  this summary" expander rather than silently discarded, and every source is one click
+  away.
+
+  **It is a read of what was written, not a signal.** Nothing in it is backtested and
+  nothing enters a strategy. The package keeps a hard line between measured things
+  (prices, screens, backtests) and read things (fundamentals, news, this), and
+  everything on the read side is labelled as such.
+
+  **Cost:** one Gemini call a day. The result is cached per calendar day to
+  `data/sentiment/` so a restart does not re-bill and a Streamlit rerun costs nothing,
+  and a **failed** read is never cached — a quota error today would otherwise be served
+  as today's summary until tomorrow. *Daily news summary* in the sidebar turns the
+  automatic run off, in which case the panel shows what is on disk and only
+  **Re-read the news** will spend anything.
 
 **Data source** is a sidebar control:
 
@@ -847,8 +946,73 @@ than an index summary. Two panels light up as a consequence:
   share / pool-weight / penetration / excess-pp table now computes. `Excess pp` is the
   column to read: a sector holding 20% of the leaders is unremarkable if it *is* 20% of
   the universe.
-- **The turnover leg of the leader screen** — volume arrives in the same yfinance
-  response as the closes, so the $5m/day test applies instead of being skipped.
+- **The volume leg of the leader screen** — volume arrives in the same yfinance
+  response as the closes, so the 300k-share test applies instead of being skipped.
+
+#### What counts as a high-momentum stock
+
+The momentum-leader group ("動力股") on that tab is three tests, all strictly
+greater-than, applied to every name in the universe on every date:
+
+| Leg | Threshold | Parameter |
+|---|---|---|
+| Any US stock or ADR, price | **> $5** | `leader_min_price` |
+| Share volume | **> 300,000/day** | `leader_min_volume` |
+| Quarterly gain, over 63 sessions | **> 28%** | `leader_min_quarter_return` |
+
+**The volume leg counts shares, and price does not enter it.** That is worth stating
+because the leg previously held a flat $5m/day dollar floor, and neither test is a
+stricter version of the other:
+
+| | 400k shares at $6 | 50k shares at $200 |
+|---|---|---|
+| Dollar volume | $2.4m/day | $10m/day |
+| Old `> $5m/day` | ❌ | ✅ |
+| Now `> 300k shares` | ✅ | ❌ |
+
+A share count scales the dollar bar with price — 300k shares is $1.5m/day at $5 and
+$30m/day at $100 — where the old test held the money constant and let the share count
+float.
+
+**At 300k it is close to non-binding on either universe this package uses.** The Finviz
+screen already filters to names *averaging* over 300k shares, and every Nasdaq-100
+constituent trades far above it, so on most days this leg removes nobody: it catches an
+unusually quiet session rather than an illiquid name. Treat it as a sanity check, and
+do not read the leader count as liquidity-screened beyond what the universe filter
+already did. (Same-day volume, not a rolling average — a quiet holiday session can
+drop a name out for a day. Say so if you would rather it averaged.)
+
+Strictly greater-than on all three, which matters most on price: a stock sitting at
+exactly $5.00 is a common thing, and `>=` would admit names the universe screen itself
+excludes, so the two filters would disagree about the same name.
+
+The 28% was 20% until it was raised by hand. It is a **preference about how selective
+"high momentum" should be, not a measured optimum** — raising it shrinks the leader
+count and the sector table built on it, and nothing here claims the smaller group
+performs better. It lives in a diff for that reason.
+
+**One interaction to know about.** The universe filter (`Average Volume > 300K`) now
+measures the same quantity as the leader rule's volume leg, at the same threshold — the
+only difference being that Finviz averages it and the leader rule reads the single
+session. That is why the leg barely bites in the US-universe mode: anything that got
+into the universe already clears it on a normal day.
+
+**It refreshes itself, once a day.** On launch the app checks whether an automatic
+fetch has run today; if not, it pulls the screener list and re-downloads any price
+frames more than a session behind. The status line under the toggle says which
+happened — *fetched on this run*, or *already fetched today at HH:MM*.
+
+**The gate counts attempts, not data age**, and that distinction is the whole design.
+Streamlit re-runs the script on every widget interaction, and before the close the
+last bar is always yesterday's — so "is the data stale?" would answer *yes* on every
+rerun and start a 2,400-name download each time, all day. One attempt per calendar
+day, stamped in `data/universe/us_last_fetch.txt` **before** the work starts so a
+download that dies halfway still counts.
+
+The cost of stamping failures too: a fetch that fails at 09:00 will not retry by
+itself until tomorrow. That is deliberate — a silent retry loop against a broken feed
+is worse than a stale number with a button next to it — and **Refresh now** ignores
+the gate entirely.
 
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real
@@ -884,6 +1048,178 @@ Colab is **not** installed for the interpreter running Streamlit. `pip install -
 requirements-dashboard.txt` with that interpreter fixes it.
 
 The SPY column and S&P 500 level are still blank — this package caches QQQ, not SPY.
+
+---
+
+## The LLM analyst
+
+A Gemini agent, via LangChain, that reads everything above and writes about it. It
+lives in `qbs/agent/`, is entirely optional, and **produces no numbers of its own**.
+
+```bash
+pip install -r requirements.txt -r requirements-agent.txt
+cp .env.example .env && chmod 600 .env       # paste your key into it
+python -m qbs.agent --check
+
+python -m qbs.agent "Why is the momentum book holding names the screen rejects?"
+python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
+```
+
+Or use the dashboard's **🤖 Analyst** tab: the same price/levels/momentum panel the
+picks tab shows on the left, and a **chat** on the right. The combo box lists the
+high-momentum names first, then the momentum book, then the rest of the universe, and
+the selected ticker rides along with each message — so *"is it extended?"* means the
+name on screen rather than whatever was mentioned last.
+
+The chat is a conversation, not a series of one-shot questions: the transcript is
+re-sent with each message, so follow-ups resolve. Two limits, both deliberate. Only the
+last 20 turns go back, because every turn re-sends the whole thing and an unbounded
+history grows the bill and the latency on every message. And **tool output is never
+replayed** — results run to thousands of lines, and the model can call the tool again
+when it needs the numbers twice.
+
+Each answer carries its tool calls folded underneath, and an answer that used **no**
+tools is labelled as opinion in the transcript itself rather than in a banner the next
+message scrolls away from.
+
+The tab hands the agent the frames the app has already loaded instead of re-reading the
+cache.
+
+### Where the key comes from
+
+`qbs.agent` reads a `.env` at the repository root on import, so the CLI, the dashboard
+and a notebook all pick it up with nothing further to do. `.env` is gitignored;
+`.env.example` is the tracked template.
+
+```
+GOOGLE_API_KEY=...          # GEMINI_API_KEY works too — Google's docs use both
+QBS_GEMINI_MODEL=gemini-2.5-flash    # optional
+TAVILY_API_KEY=...                   # optional, better search than the default
+QBS_DISABLE_ANALYST=1                # optional kill switch, see below
+```
+
+**A real environment variable always wins**, so `GOOGLE_API_KEY=... python -m qbs.agent
+...` overrides the file for one run. `--check` says which source supplied each key,
+by name:
+
+```
+$ python -m qbs.agent --check
+.env:            loaded .env; set QBS_GEMINI_MODEL; kept the shell's GOOGLE_API_KEY
+keys set:        GOOGLE_API_KEY, QBS_GEMINI_MODEL
+google key:      found
+model:           gemini-2.5-flash
+search backends: duckduckgo
+analyst:         ready
+```
+
+Nothing ever prints a value — `--check`, the dashboard caption and the load summary
+carry key *names* and the file path only. The loader warns if `.env` is readable by
+anyone but you, and points out an unrecognised key name, since a typo'd
+`GOOGEL_API_KEY` otherwise presents as "the key is not set" while sitting in the file.
+
+The syntax is deliberately small: `KEY=value`, one per line, `export` prefix ignored,
+surrounding quotes stripped, `#` starting a comment only at the beginning of a line
+(so a key containing `#` survives). No `$VAR` interpolation, no multi-line values —
+export those from your shell instead. A malformed line is reported rather than
+skipped, and the other lines still load.
+
+Streamlit will not re-import a package it has already loaded, so **restart the
+dashboard** after creating `.env`; a rerun alone will not pick the key up.
+
+### Switching it off
+
+```bash
+QBS_DISABLE_ANALYST=1          # environment, or a line in .env
+```
+
+No Gemini call is made from anywhere in the package: `check_requirements` reports it,
+`analyse` returns an `Answer` with `disabled=True` before loading anything, and
+`build_model` refuses — so nothing reaches the API even from a caller that skipped the
+check, and nothing is billed. **Everything that does not need the model keeps working**
+— the picks, momentum profiles, breadth, fundamentals, search, and every
+`python -m qbs.agent --report ...`. That is the point of a switch rather than an
+uninstall.
+
+Only an explicit off-word re-enables it — `0`, `false`, `no`, `off`, `none`,
+`disabled`. **Any other non-empty value switches it off.** That is deliberately not
+`qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
+as false: for a flag whose job is to stop spending money, an unrecognised value has to
+fail *safe*, so a half-remembered `QBS_DISABLE_ANALYST=disable` stops the spending
+rather than quietly leaving it running.
+
+`python -m qbs.agent --check` prints the switch on its own line and says **"DISABLED on
+purpose"** rather than "not ready", because a deliberate shutdown and a missing key
+have different remedies. The dashboard does the same: a paused notice with `unset`,
+not the "create a `.env`" instructions, which would send you to fix something that is
+not broken.
+
+Streamlit reads the environment once at start-up, so **restart the app** after changing
+this — a rerun alone will not pick it up.
+
+### What it can look at
+
+| Tool | Answers |
+|---|---|
+| `current_picks` | what each strategy holds on the latest bar, and how much they overlap |
+| `name_momentum` | one name's returns, universe rank, location vs every MA, and each strategy gate |
+| `market_breadth` | participation over the last N sessions, not the index |
+| `strategy_performance` | the backtest comparison table |
+| `breakout_funnel` | selection → breakout conversion, stage by stage |
+| `breakout_trades` | trade statistics in R, with the concentration check |
+| `fundamentals` | valuation, margins, growth, balance sheet, analyst view (yfinance) |
+| `search_news` / `ticker_headlines` | the web, and Yahoo's feed for one symbol |
+
+### The problem this is built around
+
+Ask a language model about a backtest and it will produce a fluent, confident,
+plausible paragraph **whether or not it has the numbers**. That paragraph is
+indistinguishable from a correct one until you check it. So:
+
+- **Every figure must come from a tool call.** The system prompt says an answer
+  containing an unsourced number is worse than no answer, and tells the model to say
+  "I don't have that" and name the missing tool instead.
+- **Caveats are welded to the numbers.** `breakout_trades` cannot return
+  "expectancy +1.37R" without also returning "over 11 closed trades, top 3 are 39% of
+  all R, below the 30-trade floor, do not size off it". The model has nowhere to put a
+  clean number.
+- **Every call is shown.** The CLI prints the tool list; the dashboard renders each
+  call and its full output in an expander under the answer. A figure that appears in
+  the prose and in none of the traces is a fabrication, and you can see that in a
+  glance rather than by re-deriving it.
+- **Nothing writes.** No tool changes a parameter, places an order, or produces an
+  input another run reads back. The agent is a reader of results.
+
+### Fundamentals are not a signal
+
+`yfinance`'s `Ticker.info` is a snapshot of **today**: today's trailing P/E, today's
+analyst target, today's short interest. There is no history in it and no way to ask
+what a ratio was in March. Feeding any of it into a backtest would date today's balance
+sheet back over the whole sample and report a return nobody could have earned.
+
+So the payload carries `backtest_safe=False` and an `as_of`, the rendered text leads
+with "a snapshot of today only", and the system prompt forbids using a fundamental to
+explain any dated signal. A missing field stays missing — never filled with a zero that
+would read as a measurement.
+
+### Search results are data, never instructions
+
+Web results reach a model that can call tools, so they arrive fenced in an
+`<untrusted_search_results>` block whose own text says what the fence means. A result
+containing "ignore your previous instructions" is quoted verbatim and treated as a
+string. Run with `--no-web` (or untick the box in the sidebar) and the search tools are
+**absent** rather than blocked, so the model cannot report having tried.
+
+### The escape hatch
+
+`python -m qbs.agent --report picks|name|breadth|universe|fundamentals|news` prints
+exactly what the agent would read, with no model, no key and no LangChain installed.
+When an answer looks wrong, diff it against the report rather than re-prompting.
+
+### What it is not
+
+A research note from a capable but unaccountable junior. The numbers in it are
+checkable against the tool traces; check them. Nothing here constitutes advice, and the
+model is instructed not to issue buy/sell calls or position sizes.
 
 ---
 

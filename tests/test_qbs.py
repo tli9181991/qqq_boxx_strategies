@@ -12,12 +12,15 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dataclasses import replace
+
 from qbs.config import (
-    BookVolTargetParams, Config, FinvizScreenParams, GEMParams, MomentumParams,
-    RSI2Params, VixBreakerParams, VolTargetParams,
+    SAFE_ASSET, BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams,
+    GEMParams, MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -25,8 +28,9 @@ from qbs.indicators import drawdown, sma, wilder_rsi
 from qbs.metrics import summarise
 from qbs.pipeline import build_signals, run, sweep_band, sweep_target_vol, sweep_vix
 from qbs.strategies import (
-    book_vol_target, buy_and_hold, connors_rsi2, cross_sectional_momentum, gem,
-    vix_circuit_breaker, vol_target_overlay,
+    StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
+    cross_sectional_momentum, drawdown_stop, gem, vix_circuit_breaker,
+    vol_target_overlay,
 )
 from qbs.universe import membership_mask, synthetic_universe
 
@@ -757,11 +761,38 @@ def _finviz_inputs(n=40):
     return uni, px["BOXX"]
 
 
+def _screen(**kw):
+    """Screen params for a closes-only fixture.
+
+    `min_volume` is ON in the real defaults and RAISES without volumes, on
+    purpose -- it is a leg of the high-momentum definition and skipping it
+    silently would overstate the screen. Tests that are not about volume opt
+    out here once instead of in twenty places.
+    """
+    kw.setdefault("min_volume", None)
+    return FinvizScreenParams(**kw)
+
+
+def _notebook_screen(**kw):
+    """The original Finviz-notebook filter set, which is no longer the default.
+
+    Kept as a fixture because those legs still work and several tests exist to
+    pin their behaviour; they just no longer describe what the screen does out
+    of the box.
+    """
+    for key, value in (("min_price", 10.0), ("above_sma", 200),
+                       ("within_52w_high_pct", 0.10),
+                       ("require_quarter_up", True),
+                       ("min_quarter_return", None)):
+        kw.setdefault(key, value)
+    return _screen(**kw)
+
+
 def test_finviz_weights_are_a_valid_long_only_book():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     assert np.allclose(sig.weights.sum(axis=1), 1.0)
     assert (sig.weights >= -1e-9).all().all()
     risk = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
@@ -774,7 +805,7 @@ def test_finviz_parks_in_the_safe_asset_when_nothing_passes():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=6, within_52w_high_pct=-1.0)
+    p = _screen(n_hold=6, within_52w_high_pct=-1.0)
     sig = finviz_momentum_screen(uni, safe, p)
     assert np.allclose(sig.weights["BOXX"], 1.0), "must be fully in cash"
     assert np.nanmax(sig.diagnostics["n_passing"].to_numpy()) == 0
@@ -786,7 +817,7 @@ def test_finviz_ranks_by_one_year_return_among_passing_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=6)
+    p = _screen(n_hold=6)
     sig = finviz_momentum_screen(uni, safe, p)
 
     perf = uni / uni.shift(p.rs_lookback) - 1.0
@@ -832,7 +863,7 @@ def test_finviz_caps_the_book_at_n_hold():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=4))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=4))
     assert sig.diagnostics["n_held"].max() <= 4
 
 
@@ -847,7 +878,7 @@ def test_finviz_has_no_look_ahead():
     after = tampered.index > cut
     tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
 
-    p = FinvizScreenParams(n_hold=6)
+    p = _screen(n_hold=6)
     a = finviz_momentum_screen(uni, safe, p).weights.loc[:cut]
     b = finviz_momentum_screen(tampered, safe, p).weights.loc[:cut]
     pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
@@ -859,7 +890,7 @@ def test_finviz_volume_filter_only_ever_removes_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    p = FinvizScreenParams(n_hold=0)
+    p = _screen(n_hold=0)
     base = finviz_momentum_screen(uni, safe, p)
 
     # Half the universe trades under the threshold, half far above it.
@@ -874,26 +905,83 @@ def test_finviz_volume_filter_only_ever_removes_names():
         assert set(withv.holdings_log[dt]) <= set(base.holdings_log[dt])
 
 
-def test_finviz_min_turnover_needs_volumes():
+def test_the_screen_defaults_are_the_high_momentum_definition():
+    """The screen and the market tab's leader group must apply one rule. If
+    these drift apart, a name can be a "momentum leader" on one tab and fail
+    the screen on the other, with nothing on screen explaining why."""
+    from qbs.breadth import BreadthParams
+
+    screen, leader = FinvizScreenParams(), BreadthParams()
+    assert screen.min_price == leader.leader_min_price == 5.0
+    assert screen.min_volume == leader.leader_min_volume == 300_000.0
+    assert screen.min_quarter_return == leader.leader_min_quarter_return == 0.28
+    assert screen.quarter_lookback == leader.leader_quarter_days == 63
+    # And the notebook legs the definition does not include are off.
+    assert screen.above_sma == 0
+    assert screen.within_52w_high_pct is None
+    assert screen.n_hold == 20
+
+
+def test_the_screen_refuses_to_skip_its_volume_leg():
+    """`min_avg_volume` was skipped silently when volume was missing. This one
+    is a leg of the definition, so dropping it on the floor would overstate
+    the screen -- the caller has to opt out deliberately."""
+    from qbs.screens import finviz_momentum_screen
+
+    uni, safe = _finviz_inputs()
+    try:
+        finviz_momentum_screen(uni, safe, FinvizScreenParams())
+    except ValueError as exc:
+        assert "min_volume" in str(exc) and "volumes" in str(exc)
+    else:
+        raise AssertionError("the default screen must raise without volumes")
+
+    # Opting out explicitly is fine and is what the dashboard does.
+    sig = finviz_momentum_screen(uni, safe, _screen())
+    assert sig.weights.notna().any().any()
+
+
+def test_the_breakout_watchlist_keeps_the_notebook_rules():
+    """The breakout strategy's entries assume names selected NEAR their highs
+    -- that is what `min_off_high_pct` turns into a band. The screen no longer
+    selects that way, so following its defaults would change every result in
+    that module without changing a line of it."""
+    from qbs.config import notebook_screen_params
+
+    nb = notebook_screen_params()
+    assert nb.within_52w_high_pct == 0.10, "the band the breakout needs"
+    assert nb.above_sma == 200 and nb.min_price == 10.0
+    assert nb.min_quarter_return is None
+    assert nb.min_volume is None, "closes-only fixtures must still run"
+
+    # And the watchlist builder defaults to it rather than to the screen's.
+    uni, safe = _finviz_inputs()
+    from qbs.breakout import finviz_watchlists
+    wl = finviz_watchlists(uni, safe, n_watch=10)
+    assert wl, "the notebook rules must still produce a watchlist"
+
+
+def test_finviz_min_dollar_volume_needs_volumes():
     """Silently ignoring a criterion the caller asked for would overstate the
     strategy, so an unusable parameter has to raise."""
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
     try:
-        finviz_momentum_screen(uni, safe, FinvizScreenParams(min_turnover=5e6))
+        finviz_momentum_screen(uni, safe,
+                               _screen(min_dollar_volume=5e6))
     except ValueError:
         return
-    raise AssertionError("min_turnover without volumes must raise")
+    raise AssertionError("min_dollar_volume without volumes must raise")
 
 
 def test_finviz_quarter_up_gate_removes_names():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    on = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    on = finviz_momentum_screen(uni, safe, _screen(n_hold=0))
     off = finviz_momentum_screen(uni, safe,
-                                 FinvizScreenParams(n_hold=0, require_quarter_up=False))
+                                 _screen(n_hold=0, require_quarter_up=False))
     for dt in uni.index[::40]:
         assert set(on.holdings_log[dt]) <= set(off.holdings_log[dt])
 
@@ -904,8 +992,10 @@ def test_finviz_band_reduces_turnover():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    none = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=0))
-    band = finviz_momentum_screen(uni, safe, FinvizScreenParams(exit_rank=15))
+    # n_hold pinned: the default is 20 and `exit_rank` must not be narrower
+    # than the book, so a 15-wide band needs a book smaller than 15.
+    none = finviz_momentum_screen(uni, safe, _screen(n_hold=6, exit_rank=0))
+    band = finviz_momentum_screen(uni, safe, _screen(n_hold=6, exit_rank=15))
     t_none = float(none.weights.diff().abs().sum(axis=1).sum())
     t_band = float(band.weights.diff().abs().sum(axis=1).sum())
     assert t_band < t_none, "a hysteresis band must reduce turnover"
@@ -913,7 +1003,7 @@ def test_finviz_band_reduces_turnover():
 
 def test_finviz_band_cannot_be_narrower_than_the_book():
     try:
-        FinvizScreenParams(n_hold=6, exit_rank=3)
+        _screen(n_hold=6, exit_rank=3)
     except ValueError:
         return
     raise AssertionError("exit_rank below n_hold must raise")
@@ -924,7 +1014,7 @@ def test_finviz_records_rank_and_score_like_the_momentum_book():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     assert {"rank", "score"} <= set(sig.events.columns)
     assert sig.held_ranks is not None
     buys = sig.events[sig.events["action"] == "buy"]
@@ -935,7 +1025,7 @@ def test_finviz_runs_through_the_shared_engine():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    sig = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    sig = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     book = uni.copy()
     book["BOXX"] = safe
     res = run_backtest(book, sig, start="2025-01-20")
@@ -950,8 +1040,11 @@ def test_finviz_monthly_rebalance_only_trades_at_month_ends():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    monthly = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="ME"))
-    daily = finviz_momentum_screen(uni, safe, FinvizScreenParams(rebalance="daily"))
+    # n_hold pinned well below the number that passes on this fixture, so the
+    # candidate pool can actually be wider than the book -- which is what the
+    # last assertion here is about. The default 20 exceeds the pool.
+    monthly = finviz_momentum_screen(uni, safe, _screen(n_hold=3, rebalance="ME"))
+    daily = finviz_momentum_screen(uni, safe, _screen(n_hold=3, rebalance="daily"))
 
     changed = monthly.weights.diff().abs().sum(axis=1) > 1e-12
     assert 0 < changed.sum() < (daily.weights.diff().abs().sum(axis=1) > 1e-12).sum()
@@ -1473,9 +1566,9 @@ def test_finviz_high_band_floor_excludes_names_at_their_high():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    ceiling = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=0))
+    ceiling = finviz_momentum_screen(uni, safe, _screen(n_hold=0))
     band = finviz_momentum_screen(
-        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04,
+        uni, safe, _screen(n_hold=0, min_off_high_pct=0.04,
                                       within_52w_high_pct=0.20))
 
     high = uni.rolling(252, min_periods=252).max()
@@ -1489,7 +1582,7 @@ def test_finviz_high_band_floor_excludes_names_at_their_high():
 
     # A floor can only remove names that the bare ceiling admitted.
     strict = finviz_momentum_screen(
-        uni, safe, FinvizScreenParams(n_hold=0, min_off_high_pct=0.04))
+        uni, safe, _screen(n_hold=0, min_off_high_pct=0.04))
     for dt in uni.index[::40]:
         assert set(strict.holdings_log[dt]) <= set(ceiling.holdings_log[dt])
 
@@ -1499,9 +1592,9 @@ def test_finviz_high_band_floor_defaults_to_the_notebook_rule():
     from qbs.screens import finviz_momentum_screen
 
     uni, safe = _finviz_inputs()
-    a = finviz_momentum_screen(uni, safe, FinvizScreenParams(n_hold=6))
+    a = finviz_momentum_screen(uni, safe, _screen(n_hold=6))
     b = finviz_momentum_screen(uni, safe,
-                               FinvizScreenParams(n_hold=6, min_off_high_pct=0.0))
+                               _screen(n_hold=6, min_off_high_pct=0.0))
     pd.testing.assert_frame_equal(a.weights, b.weights)
 
 
@@ -1585,6 +1678,201 @@ def test_leader_mask_turnover_leg_only_removes_names():
     with_vol = leader_mask(px, volumes=vol)
     assert (with_vol & ~without).sum().sum() == 0, "volume cannot admit a name"
     assert with_vol.sum().sum() < without.sum().sum(), "a $1 turnover must exclude"
+
+
+def test_the_4pc_colour_bands_match_their_edges():
+    """Boundary values, both columns, because an off-by-one on a band edge is
+    invisible on screen -- the cell is simply the wrong shade."""
+    from qbs.breadth import pulse_cell
+
+    for value, want in ((0, "dark_red"), (50, "dark_red"), (51, "light_red"),
+                        (100, "light_red"), (101, "light_green"),
+                        (300, "light_green"), (301, "dark_green"),
+                        (9999, "dark_green")):
+        assert pulse_cell(value, "up") == want, f"up 4% at {value}"
+
+    for value, want in ((0, "dark_green"), (50, "dark_green"),
+                        (51, "light_green"), (100, "light_green"),
+                        (101, "light_red"), (200, "light_red"),
+                        (201, "dark_red"), (9999, "dark_red")):
+        assert pulse_cell(value, "down") == want, f"down 4% at {value}"
+
+
+def test_the_20day_column_shades_only_recent_sessions():
+    """It answers "what is the tape doing NOW". Shading the whole history
+    turns a regime indicator into wallpaper and the eye stops seeing it."""
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    p = BreadthParams()
+    assert ma_fast_cell(55.0, 0) == "light_green"
+    assert ma_fast_cell(55.0, p.ma_fast_recent - 1) == "light_green"
+    assert ma_fast_cell(55.0, p.ma_fast_recent) == "none", "11th row back is bare"
+    assert ma_fast_cell(55.0, 200) == "none"
+
+
+def test_the_20day_column_is_two_state_around_its_threshold():
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    p = BreadthParams()
+    assert p.ma_fast_green == 20.0
+    assert ma_fast_cell(20.1, 0) == "light_green"
+    assert ma_fast_cell(20.0, 0) == "light_red", "at the threshold is not above it"
+    assert ma_fast_cell(0.0, 0) == "light_red"
+    assert ma_fast_cell(float("nan"), 0) == "none"
+    # Only ever the light shades -- the dark pair belongs to the 4% columns.
+    shades = {ma_fast_cell(v, 0) for v in (0.0, 20.0, 20.1, 99.0)}
+    assert shades == {"light_red", "light_green"}
+
+
+def test_the_20day_shading_follows_its_parameters():
+    from qbs.breadth import BreadthParams, ma_fast_cell
+
+    strict = BreadthParams(ma_fast_recent=3, ma_fast_green=60.0)
+    assert ma_fast_cell(55.0, 0, strict) == "light_red", "55 is below a 60 bar"
+    assert ma_fast_cell(55.0, 3, strict) == "none", "only 3 rows shaded"
+    assert ma_fast_cell(55.0, 3) == "light_green", "the default still shades 10"
+
+
+def test_green_is_bullish_in_both_4pc_columns():
+    """The two run in opposite directions: a big up count is bullish, a big
+    down count is not. Getting that reversal backwards is the easy mistake and
+    would make a calm tape look like a falling one."""
+    from qbs.breadth import pulse_cell
+
+    assert pulse_cell(500, "up") == "dark_green"
+    assert pulse_cell(500, "down") == "dark_red"
+    assert pulse_cell(10, "up") == "dark_red"
+    assert pulse_cell(10, "down") == "dark_green"
+
+
+def test_a_missing_4pc_count_has_no_colour():
+    from qbs.breadth import pulse_cell
+
+    assert pulse_cell(float("nan"), "up") == "none"
+    assert pulse_cell(float("nan"), "down") == "none"
+
+
+def test_the_4pc_bands_follow_their_parameters():
+    """The UI reads the edges off BreadthParams rather than repeating them, so
+    retuning has to move the colours."""
+    from qbs.breadth import BreadthParams, pulse_cell
+
+    tight = BreadthParams(up4_bands=(10.0, 20.0, 30.0))
+    assert pulse_cell(35, "up", tight) == "dark_green", "35 clears a 30 top edge"
+    assert pulse_cell(35, "up") == "dark_red", \
+        "and is still in the bottom band under the default 50/100/300"
+
+
+def test_leader_rule_is_the_stated_definition():
+    """A US stock or ADR over $5, trading more than 300k shares a day, up more
+    than 28% on the quarter. Each leg is pinned separately so a name can only
+    fail for the reason the test is about."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    assert (p.leader_min_price, p.leader_min_volume,
+            p.leader_min_quarter_return) == (5.0, 300_000.0, 0.28)
+
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 5)
+    n = len(idx)
+
+    def ramp(start, gain):
+        return np.linspace(start, start * (1.0 + gain), n)
+
+    # Quarterly gain is measured over `leader_quarter_days`, and the frames
+    # below span a few bars more, so the ramps are sized generously either
+    # side of 28% rather than exactly on it.
+    px = pd.DataFrame({
+        "STRONG": ramp(50.0, 0.60),     # clears every leg
+        "WEAK": ramp(50.0, 0.10),       # up, but nowhere near 28%
+        "CHEAP": ramp(2.0, 0.60),       # strong, under $5
+    }, index=idx)
+    vol = pd.DataFrame(1e6, index=idx, columns=px.columns)   # $50m/day on STRONG
+
+    last = leader_mask(px, volumes=vol).iloc[-1]
+    assert last["STRONG"], "clears price, turnover and the quarterly gain"
+    assert not last["WEAK"], "a 10% quarter is not high momentum"
+    assert not last["CHEAP"], "under $5 is out however strong the move"
+
+
+def test_the_quarterly_gate_is_28_percent_not_20():
+    """The gate moved from 20% to 28%, which is a real change in how selective
+    the leader group is -- a name in between must now be excluded."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    # +24% over exactly the lookback: inside the old gate, outside the new one.
+    px = pd.DataFrame({"MID": np.linspace(50.0, 62.0, n)}, index=idx)
+    vol = pd.DataFrame(1e6, index=idx, columns=["MID"])
+
+    assert not leader_mask(px, volumes=vol).iloc[-1]["MID"]
+    loose = BreadthParams(leader_min_quarter_return=0.20)
+    assert leader_mask(px, volumes=vol, p=loose).iloc[-1]["MID"], \
+        "the same name passes the old 20% gate, so the fixture is the gate's"
+
+
+def test_the_liquidity_leg_counts_shares_and_ignores_price():
+    """`leader_min_volume` is a share count. Price does not enter it, so two
+    names on the same volume must agree however far apart they trade -- which
+    is exactly what the $5m dollar test it replaced would NOT have done."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    # Same share volume, wildly different prices, both with a strong quarter.
+    px = pd.DataFrame({"PRICEY": np.linspace(50.0, 100.0, n),
+                       "CHEAPISH": np.linspace(3.0, 6.0, n)}, index=idx)
+    vol = pd.DataFrame(400_000.0, index=idx, columns=px.columns)
+
+    last = leader_mask(px, volumes=vol).iloc[-1]
+    assert last["PRICEY"] and last["CHEAPISH"], \
+        "400k shares is 400k shares; the dollar amounts are irrelevant"
+    # $2.4m/day for CHEAPISH -- it would have failed the old $5m floor, and
+    # that it passes now is the change, not an accident of the fixture.
+    assert px["CHEAPISH"].iloc[-1] * 400_000.0 < 5_000_000.0
+
+
+def test_a_thin_but_expensive_name_now_fails_the_volume_leg():
+    """The reverse direction of the same change. 50k shares of a $200 stock is
+    $10m a day: it cleared the old dollar floor comfortably and must fail a
+    300k share count. Neither test is a stricter version of the other."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+    px = pd.DataFrame({"THIN": np.linspace(100.0, 200.0, n)}, index=idx)
+    vol = pd.DataFrame(50_000.0, index=idx, columns=["THIN"])
+
+    assert px["THIN"].iloc[-1] * 50_000.0 > 5_000_000.0, "clears the old floor"
+    assert not leader_mask(px, volumes=vol).iloc[-1]["THIN"]
+
+
+def test_every_leader_leg_is_strictly_greater_than():
+    """Not pedantry on the price leg: a stock at exactly $5.00 is common, and
+    `>=` would admit names the Finviz universe screen ("Over $5") excludes, so
+    the two filters would disagree about the same name."""
+    from qbs.breadth import BreadthParams, leader_mask
+
+    p = BreadthParams()
+    idx = pd.bdate_range("2025-01-01", periods=p.leader_quarter_days + 1)
+    n = len(idx)
+
+    # Exactly $5.00 on the last bar, with a strong quarter and heavy volume.
+    at_price = pd.DataFrame({"EDGE": np.linspace(2.0, 5.0, n)}, index=idx)
+    vol = pd.DataFrame(1e7, index=idx, columns=["EDGE"])
+    assert at_price["EDGE"].iloc[-1] == 5.0, "the fixture must sit on the line"
+    assert not leader_mask(at_price, volumes=vol).iloc[-1]["EDGE"]
+
+    # Exactly 300,000 shares.
+    flat = pd.DataFrame({"EDGE": np.linspace(5.0, 10.0, n)}, index=idx)
+    exact = pd.DataFrame(300_000.0, index=idx, columns=["EDGE"])
+    assert not leader_mask(flat, volumes=exact).iloc[-1]["EDGE"]
+    more = pd.DataFrame(300_001.0, index=idx, columns=["EDGE"])
+    assert leader_mask(flat, volumes=more).iloc[-1]["EDGE"], "one share over passes"
 
 
 def test_sector_breakdown_shares_and_excess_are_consistent():
@@ -1966,6 +2254,87 @@ def test_load_universe_bars_reads_both_cached_frames():
         assert (v["MSFT"] == 20).all()
 
 
+# ---- the once-a-day auto-fetch gate --------------------------------------
+
+def test_the_fetch_gate_allows_the_first_run(tmp_path):
+    from qbs.finviz import due_for_fetch
+
+    due, why = due_for_fetch(str(tmp_path / "stamp.txt"))
+    assert due and "no automatic fetch" in why
+
+
+def test_the_fetch_gate_closes_for_the_rest_of_the_day(tmp_path):
+    """The gate counts ATTEMPTS, not data age. Streamlit re-runs the script on
+    every widget interaction, and before the close the last bar is always
+    yesterday's -- so a data-based test would start a 2,400-name download on
+    every rerun and never stop."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    record_fetch_attempt(stamp)
+    due, why = due_for_fetch(stamp)
+    assert not due
+    assert "already fetched today" in why and "Refresh now" in why
+
+
+def test_the_fetch_gate_reopens_on_the_next_calendar_day(tmp_path):
+    """Calendar days, not 24 hours: an app opened at 08:00 and again at 09:00
+    the next morning should refresh, and a 24-hour rule would refuse."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    now = pd.Timestamp("2026-09-18 08:00:00")
+    record_fetch_attempt(stamp, now=now)
+
+    assert not due_for_fetch(stamp, now=now + pd.Timedelta(hours=15))[0]
+    assert due_for_fetch(stamp, now=now + pd.Timedelta(hours=25))[0], \
+        "09:00 the next morning is a new day even though it is under 24h"
+
+
+def test_an_unwritable_stamp_does_not_break_the_fetch(tmp_path):
+    """Worst case it costs one extra attempt tomorrow. Raising here would turn
+    a read-only data directory into a dashboard that will not start."""
+    from qbs.finviz import last_fetch_attempt, record_fetch_attempt
+
+    bad = str(tmp_path / "nope" / "\x00" / "stamp.txt")
+    record_fetch_attempt(bad)             # must not raise
+    assert last_fetch_attempt(bad) is None
+
+
+def test_a_corrupt_stamp_reads_as_never_fetched(tmp_path):
+    from qbs.finviz import due_for_fetch
+
+    stamp = tmp_path / "stamp.txt"
+    stamp.write_text("not a timestamp")
+    assert due_for_fetch(str(stamp))[0], "unreadable means unknown means try"
+
+
+def test_a_stale_bars_cache_stops_counting_as_a_hit(tmp_path):
+    """A cache hit that never asks how old it is pins the app to whatever was
+    on disk when it started. With `stale_after` the hit expires; without it the
+    old behaviour is kept for callers that manage freshness themselves."""
+    import os
+    from qbs.finviz import load_universe_bars
+
+    old_idx = pd.bdate_range("2020-01-01", periods=6)     # years behind
+    d = str(tmp_path)
+    pd.DataFrame({"AAPL": 1.0}, index=old_idx).rename_axis("Date") \
+        .to_csv(os.path.join(d, "us_closes.csv"))
+    pd.DataFrame({"AAPL": 10}, index=old_idx).rename_axis("Date") \
+        .to_csv(os.path.join(d, "us_volumes.csv"))
+
+    # No staleness limit: the stale cache is returned, as before.
+    c, _, err = load_universe_bars(["AAPL"], cache_dir=d, verbose=False)
+    assert c is not None and err is None
+
+    # With one: the cache is rejected, so the loader goes to the network. There
+    # is none here, so it must come back with a REASON rather than silently
+    # handing over the stale frame it just declined to trust.
+    c2, _, err2 = load_universe_bars(["AAPL"], cache_dir=d, verbose=False,
+                                     stale_after=1)
+    assert err2, "a rejected cache and a failed download must report something"
+
+
 def test_fetch_us_universe_names_a_missing_package():
     """The commonest failure by far: installed in a notebook or on Colab, not
     for the interpreter running Streamlit. The message has to say that."""
@@ -2001,3 +2370,518 @@ def test_diagnose_reports_each_step():
     assert "python" in steps and "finvizfinance" in steps
     # Whatever the outcome, every reported step must carry a verdict.
     assert all(isinstance(v, str) and v for v in steps.values())
+
+
+# --------------------------------------------------------------------------
+# Per-name momentum profile (qbs/breadth.py)
+# --------------------------------------------------------------------------
+
+def _profile_universe():
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    return pd.DataFrame({
+        "WIN": np.linspace(10.0, 40.0, n),        # strongest
+        "MID": np.linspace(10.0, 14.0, n),
+        "FLAT": np.full(n, 10.0),
+        "LOSE": np.linspace(40.0, 12.0, n),       # weakest
+    }, index=idx)
+
+
+def test_momentum_profile_ranks_within_the_universe():
+    """A return means nothing alone; the rank is the point."""
+    from qbs.breadth import momentum_profile
+
+    px = _profile_universe()
+    win = momentum_profile(px, "WIN")["returns"].set_index("Horizon")
+    lose = momentum_profile(px, "LOSE")["returns"].set_index("Horizon")
+
+    assert win.loc["12 months", "Rank"] > lose.loc["12 months", "Rank"]
+    assert win.loc["12 months", "Return"] > win.loc["12 months", "Universe median"]
+    assert lose.loc["12 months", "Return"] < lose.loc["12 months", "Universe median"]
+    assert win["Rank"].between(1, 99).all()
+
+
+def test_momentum_profile_skips_the_most_recent_month():
+    """The book's score skips the most recent month. The row must differ from
+    the plain trailing return, or it is measuring the wrong thing."""
+    from qbs.breadth import momentum_label, momentum_profile
+    from qbs.config import MomentumParams
+
+    p = MomentumParams(lookback_months=12, skip_months=1)
+    px = _profile_universe().copy()
+    # A spike confined to the last month: 12-0 sees it, 12-1 must not.
+    px.iloc[-15:, px.columns.get_loc("MID")] *= 3.0
+    r = momentum_profile(px, "MID", momentum=p)["returns"].set_index("Horizon")
+    row = f"{momentum_label(p)} momentum"
+    assert r.loc["12 months", "Return"] > r.loc[row, "Return"]
+
+
+def test_momentum_profile_scores_the_window_the_ranker_is_configured_with():
+    """The lookback has already moved from 12-1 to 6-1 once. A profile that
+    keeps reporting 12-1 would label a number the book does not use with the
+    name of the rule it claims to be explaining."""
+    from qbs.breadth import momentum_label, momentum_profile
+    from qbs.config import MomentumParams
+
+    px = _profile_universe()
+    six = MomentumParams(lookback_months=6, skip_months=1)
+    twelve = MomentumParams(lookback_months=12, skip_months=1)
+
+    assert momentum_label(six) == "6-1" and momentum_label(twelve) == "12-1"
+    r6 = momentum_profile(px, "WIN", momentum=six)["returns"].set_index("Horizon")
+    r12 = momentum_profile(px, "WIN", momentum=twelve)["returns"].set_index("Horizon")
+    assert "6-1 momentum" in r6.index and "12-1 momentum" not in r6.index
+    assert "12-1 momentum" in r12.index
+    # Different windows over a trending name are different numbers; equal
+    # values would mean the parameter is being ignored.
+    assert r6.loc["6-1 momentum", "Return"] != r12.loc["12-1 momentum", "Return"]
+
+    g6 = momentum_profile(px, "WIN", momentum=six)["gates"]
+    assert any(r.startswith("6-1 momentum beats") for r in g6["Rule"])
+
+
+def test_the_momentum_hurdle_uses_the_same_window_as_the_score():
+    """Comparing a 6-1 stock return against a 12-1 cash return would be a
+    different test from the one `absolute_filter` applies."""
+    from qbs.breadth import momentum_profile
+    from qbs.config import MomentumParams
+
+    px = _profile_universe()
+    idx = px.index
+    # Cash compounding steadily: a 12-month hurdle is far above a 6-month one,
+    # so a window mix-up changes the number the rule prints.
+    safe = pd.Series(np.linspace(100.0, 200.0, len(idx)), index=idx)
+
+    def hurdle(months):
+        gates = momentum_profile(
+            px, "MID", safe=safe,
+            momentum=MomentumParams(lookback_months=months))["gates"]
+        rule = [r for r in gates["Rule"] if "beats" in r][0]
+        return float(rule.split("(")[1].split("%")[0])
+
+    assert hurdle(6) < hurdle(12), "a longer window must show a bigger hurdle"
+
+
+def test_momentum_profile_gates_explain_a_rejection():
+    """The gate table is the point of the panel: it has to name the rule that
+    blocks a name, not merely that something did."""
+    from qbs.breadth import momentum_profile
+
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    # Rises hard, then gives back 14%. Chosen so it is MORE than 10% off its
+    # high while still above the 200-day average: that isolates the proximity
+    # rule as the only thing blocking it, which is the case worth pinning.
+    path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
+    px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
+
+    # Both legs this test is about are OFF in the defaults now, so the
+    # rejection it pins only exists when they are switched on.
+    screen = _screen(within_52w_high_pct=0.10, above_sma=200)
+    g = momentum_profile(px, "PULLBACK", screen=screen)["gates"].set_index("Rule")
+    proximity = "within 10% of 252-day high"
+    # Truthiness, not identity: pandas stores these as numpy bools, and
+    # `np.False_ is False` is False.
+    assert not g.loc[proximity, "Pass"]
+    assert g.loc["above SMA 200", "Pass"], "the pullback must stay above SMA 200"
+    blocked = g[~g["Pass"].astype(bool)]
+    assert proximity in blocked.index
+    assert "above SMA 200" not in blocked.index, "only the proximity rule blocks it"
+
+
+def test_momentum_profile_gates_follow_the_screen_parameters():
+    """The panel reports the screen that is configured, not the one that was
+    configured when the panel was written. Retune the params and every
+    threshold, label and verdict has to move with them."""
+    from qbs.breadth import momentum_profile
+    from qbs.config import FinvizScreenParams
+
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    n = len(idx)
+    path = np.concatenate([np.linspace(10, 100, n - 25), np.linspace(100, 86, 25)])
+    px = pd.DataFrame({"PULLBACK": path, "OTHER": np.linspace(10, 12, n)}, index=idx)
+
+    def gates(**kw):
+        return momentum_profile(
+            px, "PULLBACK", screen=_screen(**kw))["gates"].set_index("Rule")
+
+    # A leg that is switched OFF must have NO row. A row for a filter nobody
+    # is running describes a strategy that does not exist, and the reader has
+    # no way to tell that from the table.
+    default = gates()
+    assert not any("high" in r for r in default.index), \
+        "within_52w_high_pct is None by default -- no proximity row"
+    assert not any("SMA" in r for r in default.index), \
+        "above_sma is 0 by default -- no moving-average row"
+    assert not any("quarter up" in r for r in default.index)
+    assert any("quarterly gain over 28%" in r for r in default.index), \
+        "the leg that IS on must be reported, at its configured threshold"
+
+    # 14% off the high fails a 10% ceiling and clears a 20% one.
+    tight = gates(within_52w_high_pct=0.10)
+    loose = gates(within_52w_high_pct=0.20)
+    assert not tight.loc["within 10% of 252-day high", "Pass"]
+    assert loose.loc["within 20% of 252-day high", "Pass"]
+
+    # A configured band floor adds its row; a ceiling-only rule must not claim
+    # a floor the screen does not apply.
+    assert not any("off the high" in r for r in tight.index)
+    banded = gates(min_off_high_pct=0.05)
+    assert banded.loc["at least 5% off the high", "Pass"], "14% off clears a 5% floor"
+
+    # And the legs that can be switched back on appear when they are.
+    assert any("quarter up" in r for r in gates(require_quarter_up=True).index)
+    assert any("above SMA 200" in r for r in gates(above_sma=200).index)
+
+
+def test_momentum_profile_hurdle_uses_the_safe_asset_when_given():
+    from qbs.breadth import momentum_label, momentum_profile
+
+    px = _profile_universe()
+    idx = px.index
+    safe = pd.Series(np.linspace(100.0, 130.0, len(idx)), index=idx)  # strong cash
+
+    without = momentum_profile(px, "MID")["gates"].set_index("Rule")
+    with_safe = momentum_profile(px, "MID", safe=safe)["gates"].set_index("Rule")
+
+    prefix = f"{momentum_label()} momentum beats"
+    rules_without = [r for r in without.index if r.startswith(prefix)]
+    rules_with = [r for r in with_safe.index if r.startswith(prefix)]
+    assert "zero" in rules_without[0], "no safe asset -> the weaker test, and it says so"
+    assert "BOXX" in rules_with[0], "the hurdle used must be named"
+
+
+def test_momentum_profile_unknown_ticker_is_empty_not_an_error():
+    from qbs.breadth import momentum_profile
+
+    prof = momentum_profile(_profile_universe(), "NOPE")
+    assert all(v.empty for v in prof.values())
+
+
+def test_momentum_profile_trend_rows_are_present():
+    from qbs.breadth import momentum_profile
+
+    tr = momentum_profile(_profile_universe(), "WIN")["trend"].set_index("Measure")
+    for row in ("vs EMA 10", "vs EMA 200", "Off 52-week high", "vs SMA 200",
+                "Distance from 50-day EMA", "Annualised volatility"):
+        assert row in tr.index
+    assert tr.loc["Off 52-week high", "Value"] >= -1e-9, "a high is never below price"
+
+
+# --------------------------------------------------------------------------
+# The drawdown circuit breaker
+# --------------------------------------------------------------------------
+
+def _dd_fixture():
+    from qbs.strategies import cross_sectional_momentum, book_vol_target
+    cfg = Config()
+    cfg.momentum = replace(cfg.momentum, min_history=200)
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    mom = cross_sectional_momentum(uni, px[cfg.momentum.safe_asset], cfg.momentum)
+    vt = book_vol_target(mom, frame, cfg.book_vol, lag=cfg.execution_lag)
+    return cfg, frame, vt, px
+
+
+def test_the_stop_is_inert_when_disabled():
+    """Disabled, the overlay must not change a single weight."""
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False),
+                        lag=cfg.execution_lag)
+
+    pd.testing.assert_frame_equal(out.weights, vt.weights)
+
+
+def test_a_deep_drawdown_moves_the_whole_book_to_the_safe_asset():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+    safe = cfg.momentum.safe_asset
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+    blocked = out.diagnostics["blocked"].astype(bool)
+    assert blocked.any(), "a 2% threshold should fire on this fixture"
+
+    risk = [c for c in out.weights.columns if c != safe]
+    assert (out.weights.loc[blocked, risk].abs().to_numpy() == 0).all()
+    assert np.allclose(out.weights.loc[blocked, safe], 1.0)
+    # And the untouched days are exactly the base book.
+    pd.testing.assert_frame_equal(out.weights.loc[~blocked], vt.weights.loc[~blocked])
+
+
+def test_the_stop_never_changes_which_names_were_picked():
+    """It is an exposure overlay. Selection is not its business."""
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+
+    assert out.holdings_log == vt.holdings_log
+    assert out.held_ranks == vt.held_ranks
+
+
+def test_the_cooldown_holds_the_book_out_after_the_flag_clears():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    short = drawdown_stop(vt, frame, DrawdownStopParams(
+        enabled=True, exit_drawdown=0.02, cooldown_days=1), lag=cfg.execution_lag)
+    long_ = drawdown_stop(vt, frame, DrawdownStopParams(
+        enabled=True, exit_drawdown=0.02, cooldown_days=20), lag=cfg.execution_lag)
+
+    assert long_.diagnostics["blocked"].sum() > short.diagnostics["blocked"].sum()
+    # The flag itself is a property of the book, not of the cooldown.
+    pd.testing.assert_series_equal(short.diagnostics["dd_flag"],
+                                   long_.diagnostics["dd_flag"])
+
+
+def test_the_drawdown_is_measured_on_the_undisturbed_book():
+    """Gate on the stopped equity curve and the flag could never clear.
+
+    Parked in cash the book stops moving, so its drawdown would freeze at the
+    level that triggered the stop and the breaker would latch on for ever.
+    """
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    out = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.05),
+                        lag=cfg.execution_lag)
+    off = drawdown_stop(vt, frame, DrawdownStopParams(exit_drawdown=0.05),
+                        lag=cfg.execution_lag)
+
+    # Same diagnostics whether or not the stop acted -- that is what makes the
+    # trigger a pure function of prices rather than of its own output.
+    pd.testing.assert_series_equal(out.diagnostics["book_drawdown"],
+                                   off.diagnostics["book_drawdown"])
+
+    # And it releases: measured on the stopped curve the book would freeze at
+    # the triggering drawdown and the flag could never clear again, so the
+    # breaker must be observed switching back off at least once.
+    blocked = out.diagnostics["blocked"].astype(bool)
+    assert blocked.any(), "the fixture never triggered; the test proves nothing"
+    released = (blocked.astype(int).diff() == -1).sum()
+    assert released > 0, "the breaker latched on and never released"
+
+
+def test_the_benchmark_leg_only_acts_when_configured():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, px = _dd_fixture()
+    bench = px[cfg.momentum.safe_asset] * 0 + np.linspace(100, 40, len(px))  # -60%
+
+    # Explicitly off -- the configured default is 0.15, so "without" has to say so.
+    without = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.0),
+                            lag=cfg.execution_lag, benchmark=bench)
+    with_ = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.10),
+                          lag=cfg.execution_lag, benchmark=bench)
+
+    assert with_.diagnostics["blocked"].sum() > without.diagnostics["blocked"].sum()
+    # No benchmark passed -> the leg is silently skipped, not an error.
+    none = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, qqq_drawdown=0.10),
+                         lag=cfg.execution_lag, benchmark=None)   # leg skipped
+    pd.testing.assert_frame_equal(none.weights, without.weights)
+
+
+def test_a_missing_safe_asset_is_rejected():
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+    trimmed = vt.weights.drop(columns=[cfg.momentum.safe_asset])
+    bad = StrategySignals("x", trimmed)
+
+    with pytest.raises(ValueError, match="safe asset"):
+        drawdown_stop(bad, frame, DrawdownStopParams(enabled=True))
+
+
+# --------------------------------------------------------------------------
+# The momentum-leader filter as a pre-screen for the ranker
+# --------------------------------------------------------------------------
+
+def test_leader_eligibility_is_the_dashboards_own_mask():
+    """One definition. The screen and the ranker must not drift apart."""
+    from qbs.breadth import BreadthParams, leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    p = BreadthParams()
+
+    pd.testing.assert_frame_equal(leader_eligibility(px, p=p), leader_mask(px, p=p))
+
+
+def test_leader_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import leader_eligibility, leader_mask
+
+    px = synthetic_universe(n=20, start="2023-06-01")
+    half = pd.DataFrame(False, index=px.index, columns=px.columns)
+    half.iloc[:, :5] = True
+
+    out = leader_eligibility(px, existing=half)
+
+    assert not out.iloc[:, 5:].to_numpy().any(), "the existing mask was ignored"
+    assert (out == (leader_mask(px) & half)).to_numpy().all()
+
+
+def test_the_leader_filter_is_off_and_inert_by_default():
+    cfg = Config()
+    assert cfg.use_leader_filter is False
+
+    px = synthetic_prices()
+    lab_off = run(cfg=cfg, prices=px, universe_prices=synthetic_universe(
+        n=20, start="2023-06-01").reindex(px.index).ffill(),
+        offline=True, fetch_universe=False, with_vix=False)
+    assert "momentum" in lab_off.signals
+
+
+def test_the_leader_filter_narrows_the_book_when_switched_on():
+    """Switched on it must actually bind, and unfilled slots go to cash."""
+    from dataclasses import replace as _replace
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01").reindex(px.index).ffill()
+
+    off = run(cfg=Config(), prices=px, universe_prices=uni, offline=True,
+              fetch_universe=False, with_vix=False)
+    cfg_on = Config()
+    cfg_on.use_leader_filter = True
+    on = run(cfg=cfg_on, prices=px, universe_prices=uni, offline=True,
+             fetch_universe=False, with_vix=False)
+
+    w_off = off.signals["momentum"].weights
+    w_on = on.signals["momentum"].weights
+    risk = [c for c in w_on.columns if c != SAFE_ASSET]
+
+    assert w_on[risk].sum(axis=1).mean() < w_off[risk].sum(axis=1).mean(), \
+        "the filter did not reduce exposure at all"
+    # Every weight it does hold is one the unfiltered book could also hold.
+    assert (w_on[risk].to_numpy() > 0).sum() < (w_off[risk].to_numpy() > 0).sum()
+
+
+def test_a_disabled_stop_never_reports_itself_as_blocking():
+    """`blocked` must mean the book was held flat, not that it might have been.
+
+    A risk readout claiming the breaker is halting a fully invested book is
+    worse than none: it is the one line an operator would trust in a hurry.
+    """
+    from qbs.strategies import drawdown_stop
+    cfg, frame, vt, _ = _dd_fixture()
+
+    off = drawdown_stop(vt, frame, DrawdownStopParams(enabled=False, exit_drawdown=0.02),
+                        lag=cfg.execution_lag)
+    on = drawdown_stop(vt, frame, DrawdownStopParams(enabled=True, exit_drawdown=0.02),
+                       lag=cfg.execution_lag)
+
+    assert not off.diagnostics["blocked"].astype(bool).any()
+    assert on.diagnostics["blocked"].astype(bool).any()
+    # The condition itself is reported either way, so a dry run still shows it.
+    pd.testing.assert_series_equal(off.diagnostics["dd_flag"], on.diagnostics["dd_flag"])
+    pd.testing.assert_frame_equal(off.weights, vt.weights)
+
+
+# --------------------------------------------------------------------------
+# Volume filters on the ranker
+# --------------------------------------------------------------------------
+
+def _vol_fixture():
+    idx = pd.bdate_range("2024-01-01", periods=200)
+    return pd.DataFrame({
+        "SURGE": np.r_[np.full(195, 1e6), np.full(5, 4e6)],
+        "QUIET": np.r_[np.full(195, 1e6), np.full(5, 2e5)],
+        "FLAT":  np.full(200, 1e6),
+    }, index=idx)
+
+
+def test_relative_volume_is_a_ratio_to_the_names_own_norm():
+    from qbs.breadth import relative_volume
+
+    r = relative_volume(_vol_fixture()).iloc[-1]
+
+    assert r["SURGE"] > 2.5 and r["QUIET"] < 0.4
+    assert r["FLAT"] == pytest.approx(1.0)
+
+
+def test_an_unconfigured_volume_filter_admits_everything():
+    """A filter nobody asked for must never quietly remove a name."""
+    from qbs.breadth import volume_eligibility
+
+    assert volume_eligibility(_vol_fixture()).to_numpy().all()
+
+
+def test_each_volume_leg_selects_what_it_claims():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    assert [c for c in v if volume_eligibility(v, min_ratio=1.5)[c].iloc[-1]] == ["SURGE"]
+    assert [c for c in v if volume_eligibility(v, max_ratio=0.5)[c].iloc[-1]] == ["QUIET"]
+    # The absolute floor is the near-useless one on a large-cap index.
+    assert [c for c in v if volume_eligibility(v, min_shares=3e5)[c].iloc[-1]] \
+        == ["SURGE", "FLAT"]
+
+
+def test_volume_eligibility_ands_with_an_existing_mask():
+    from qbs.breadth import volume_eligibility
+
+    v = _vol_fixture()
+    only_flat = pd.DataFrame(False, index=v.index, columns=v.columns)
+    only_flat["FLAT"] = True
+
+    out = volume_eligibility(v, min_shares=3e5, existing=only_flat)
+
+    assert not out["SURGE"].any(), "the existing mask was ignored"
+    assert out["FLAT"].iloc[-1]
+
+
+def test_missing_volumes_read_as_none_rather_than_failing(tmp_path):
+    """A cache written before volumes were kept must not break a price load."""
+    from qbs.universe import load_universe_volumes
+
+    assert load_universe_volumes(cache_dir=str(tmp_path)) is None
+
+
+def test_sweep_volume_scores_the_book_it_can_actually_price(tmp_path, monkeypatch):
+    """`lab.universe` carries columns the engine never priced.
+
+    It is the frame as it arrived -- not reindexed, not pruned by min_history --
+    so building weights from it puts a position on a ticker the return frame
+    lacks, and run_backtest raises a KeyError from deep inside. The sweep must
+    take its universe from `combined`, as the other sweeps do.
+    """
+    from qbs import pipeline
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    uni = synthetic_universe(n=20, start="2023-06-01")
+    # A column with almost no history: pruned out of `combined`, still present
+    # in `universe`. This is exactly the shape that broke it.
+    uni["SPARSE"] = np.nan
+    uni.iloc[-5:, uni.columns.get_loc("SPARSE")] = 100.0
+
+    lab = run(cfg=Config(), prices=px, universe_prices=uni.reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    assert "SPARSE" in lab.universe.columns
+    assert "SPARSE" not in lab.combined.columns, "the fixture no longer bites"
+
+    vols = pd.DataFrame(1e6, index=lab.combined.index,
+                        columns=lab.combined.drop(columns=[SAFE_ASSET]).columns)
+    monkeypatch.setattr(pipeline, "load_universe_volumes", lambda *a, **k: vols,
+                        raising=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: vols)
+
+    out = sweep_volume(lab, min_ratios=(0.0, 1.0))
+
+    assert not out.empty
+    assert list(out["min_ratio"]) == [0.0, 1.0]
+
+
+def test_sweep_volume_says_nothing_rather_than_zero_without_a_cache(monkeypatch):
+    from qbs.pipeline import sweep_volume
+
+    px = synthetic_prices()
+    lab = run(cfg=Config(), prices=px,
+              universe_prices=synthetic_universe(n=20, start="2023-06-01")
+              .reindex(px.index).ffill(),
+              offline=True, fetch_universe=False, with_vix=False)
+    monkeypatch.setattr("qbs.universe.load_universe_volumes", lambda *a, **k: None)
+
+    assert sweep_volume(lab).empty, "a missing cache must not read as a result"
