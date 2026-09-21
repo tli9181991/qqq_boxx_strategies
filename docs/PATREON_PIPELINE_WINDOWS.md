@@ -160,6 +160,46 @@ Get-ScheduledTaskInfo -TaskName PatreonPipeline-Work   # last result, last run
 Firefox again and the worker picks up by itself on its next restart, with
 nothing lost from the queue.
 
+## Uninstalling
+
+```powershell
+.\uninstall.ps1
+```
+
+By default that does the safe half only: stops and unregisters the four
+Scheduled Tasks, and touches nothing else. "Uninstall" usually means "make it
+stop", and the data left behind is the part that is expensive to get back.
+
+Everything destructive is opt-in, prompts first, and honours `-WhatIf`:
+
+| Flag | Removes |
+| --- | --- |
+| `-RemoveState` | Queue database, staging, logs, `config.json` |
+| `-RemoveModels` | Cached Whisper models (~1.5 GB) |
+| `-RemoveVenv` | The virtualenv |
+| `-RemoveCredentials` | `patreon.env`, plus any leftover Drive API secret or token |
+| `-RemoveRcloneRemote` | Only the pipeline's rclone remote, leaving your others alone |
+| `-All` | All of the above |
+
+See exactly what a full teardown would delete, without deleting anything:
+
+```powershell
+.\uninstall.ps1 -All -WhatIf
+```
+
+Two things worth knowing:
+
+- **`pipeline.db` is the record of every post already downloaded.** Delete it
+  and the next sweep re-downloads everything it finds. That is why it is not
+  part of the default.
+- **Deleting a local credential does not revoke it.** The Gmail app password
+  and the Drive grant stay live in your Google account until you revoke them at
+  [apppasswords](https://myaccount.google.com/apppasswords) and
+  [permissions](https://myaccount.google.com/permissions). The script prints
+  both links when it removes credentials.
+
+The repository, and anything already uploaded to Drive, are never touched.
+
 ## Benchmark Whisper before trusting it
 
 ```powershell
