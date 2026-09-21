@@ -308,6 +308,43 @@ def test_validate_reports_every_problem_at_once():
     assert len(problems) >= 3
 
 
+def test_the_shipped_example_configs_actually_load():
+    """The installer copies these verbatim. Shipping an example the loader
+    rejects means a fresh install fails on its first command -- which is
+    exactly what happened, because the examples carry `_comment` keys."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    example = os.path.join(here, "deploy", "patreon", "patreon.example.json")
+    cfg = PipelineConfig.from_env(example)
+    assert cfg.campaign_urls, "example config should carry a campaign URL"
+
+
+def test_underscore_keys_are_comments_not_settings():
+    """JSON has no comment syntax, so `_note` keys document the file in
+    place and are dropped on load."""
+    import json
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"_comment": "explain something", "max_attempts": 7}, fh)
+    cfg = PipelineConfig.from_env(path)
+    assert cfg.max_attempts == 7
+    assert not hasattr(cfg, "_comment")
+
+
+def test_a_misspelled_setting_is_still_rejected():
+    """The underscore escape hatch must not turn into blanket permissiveness:
+    a typo that silently does nothing is worse than a startup error."""
+    import json
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"campaign_url": "https://www.patreon.com/c/x"}, fh)
+    try:
+        PipelineConfig.from_env(path)
+    except ValueError as exc:
+        assert "campaign_url" in str(exc)
+    else:
+        raise AssertionError("a misspelled key should not be accepted")
+
+
 def test_secrets_are_not_read_from_the_config_file():
     """A Gmail app password in a tracked JSON file is how it ends up in a
     commit. It must come from the environment or not at all."""

@@ -241,8 +241,17 @@ class PipelineConfig:
         if path:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+            # JSON has no comment syntax, so a key beginning with an
+            # underscore is treated as an annotation and dropped. The shipped
+            # example config uses them to explain settings in place, and
+            # without this the file the installer copies is one this loader
+            # refuses to load.
+            data = {k: v for k, v in data.items() if not k.startswith("_")}
             unknown = set(data) - {f for f in cls.__dataclass_fields__}
             if unknown:
+                # Still strict about everything else: a typo like
+                # "campaign_url" for "campaign_urls" would otherwise be
+                # ignored silently and the setting would never take effect.
                 raise ValueError(f"unknown config keys: {sorted(unknown)}")
 
         cfg = cls(**data)
