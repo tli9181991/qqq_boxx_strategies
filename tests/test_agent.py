@@ -345,6 +345,30 @@ def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
     assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
 
 
+def test_the_dashboard_watchlist_is_not_the_runners(tmp_path):
+    """Two watchlists, two names, and the root `.env` knows only its own.
+
+    The dashboard's list seeds a box someone edits while looking at charts;
+    the runner's decides what goes into var/watchlist_log.csv on the trading
+    host. One name for both would mean a host running both hands one list to
+    two programs -- and a rename back to `QBS_WATCHLIST` would do exactly
+    that silently, which is what this pins.
+    """
+    assert "QBS_DASH_WATCHLIST" in env.KNOWN_KEYS
+    assert "QBS_WATCHLIST" not in env.KNOWN_KEYS, (
+        "the runner's watchlist lives in deploy/docker/.env and is read by "
+        "qbs.live.config, not by this loader")
+
+    path = _write_env(tmp_path, "QBS_DASH_WATCHLIST=TSM,GOOGL\n")
+    load = env.load_env(path, environ={})
+    assert load.unknown == [] and load.applied == ["QBS_DASH_WATCHLIST"]
+
+    # And the runner's name in the DASHBOARD's file is the mix-up worth
+    # naming out loud, so it has to read as unrecognised rather than work.
+    path = _write_env(tmp_path, "QBS_WATCHLIST=TSM\n")
+    assert env.load_env(path, environ={}).unknown == ["QBS_WATCHLIST"]
+
+
 def test_the_chat_switch_leaves_the_news_read_running(monkeypatch):
     """The point of having two switches: bring one feature up at a time. A
     chat-only shutdown must not silence the daily read."""

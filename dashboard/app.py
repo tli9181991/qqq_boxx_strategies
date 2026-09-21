@@ -438,18 +438,29 @@ n_screen = st.sidebar.number_input(
          "shows everyone who passed.")
 
 # Loaded here, not with the Analyst settings further down, because the
-# default below reads QBS_WATCHLIST out of the environment and this box is
-# rendered first. The load is cached per file, so the later call is free.
+# default below reads the environment and this box is rendered first. The
+# load is cached per file, so the later call is free.
 from qbs.agent.env import load_env as _load_env
 _load_env()
+# Deliberately NOT `QBS_WATCHLIST`. That one belongs to the live runner and
+# lives in deploy/docker/.env on the trading host; this one belongs to the
+# dashboard and lives in the repo root's .env. Different files already, but
+# the same NAME would collide the moment both run on one host with the
+# runner's env exported into the shell -- and then changing what the
+# dashboard charts would quietly change what the runner logs. Two names, no
+# fallback between them: a fallback is the coupling this is removing.
+WATCHLIST_VAR = "QBS_DASH_WATCHLIST"
 watch_raw = st.sidebar.text_input(
-    "Watchlist", os.environ.get("QBS_WATCHLIST", ""),
+    "Watchlist", os.environ.get(WATCHLIST_VAR, ""),
     help="Names to rank beside the book without letting the book buy them — "
          "comma or space separated. Anything outside the index is "
-         "interpolated into the constituents' ranking. Same variable the "
-         "live runner reads: QBS_WATCHLIST.")
-# The runner's own parser, not a second one that agrees with it today: the
-# box and QBS_WATCHLIST must mean the same thing by construction.
+         f"interpolated into the constituents' ranking. Set {WATCHLIST_VAR} "
+         "in the repo root's .env to seed this box. The live runner's own "
+         "watchlist (QBS_WATCHLIST, in deploy/docker/.env) is separate and "
+         "nothing here touches it.")
+# The runner's parser, not a second one that agrees with it today. The two
+# watchlists are different lists; they should still mean the same thing by
+# "TSM, googl".
 WATCHLIST = parse_watchlist(watch_raw)
 
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
@@ -864,9 +875,9 @@ with tab_picks:
     if not WATCHLIST:
         st.caption(md(
             "Nothing watched. Put tickers in the sidebar box (or set "
-            "`QBS_WATCHLIST`) to see where they place in the ranking the book "
-            "acts on. A name outside the index is interpolated into that "
-            "ranking without joining it."))
+            f"`{WATCHLIST_VAR}` in the repo root's `.env`) to see where they "
+            "place in the ranking the book acts on. A name outside the index "
+            "is interpolated into that ranking without joining it."))
     else:
         outsiders = tuple(t for t in WATCHLIST if t not in uni.columns)
         watch_px, watch_err = load_watch_prices(

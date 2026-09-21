@@ -66,7 +66,7 @@ DISABLE_CHAT_VAR = "QBS_DISABLE_CHAT"
 # them, and so a typo in a `.env` can be pointed out rather than ignored.
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
               "QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL", "QBS_THINKING_BUDGET",
-              "QBS_WATCHLIST", DISABLE_VAR, DISABLE_CHAT_VAR)
+              "QBS_DASH_WATCHLIST", DISABLE_VAR, DISABLE_CHAT_VAR)
 
 # Values that mean "switch is off, carry on". Everything else non-empty
 # disables -- see `analyst_disabled` for why this is not `_env_bool`.
