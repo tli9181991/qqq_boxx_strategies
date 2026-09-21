@@ -39,7 +39,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from . import news as nw
-from .env import analyst_disabled
+from .env import news_analysis_disabled
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
@@ -348,7 +348,7 @@ def summarise(
         feed = NewsFeed(headlines=list(feed))
     headlines = feed.headlines
     as_of = as_of or pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
-    off = analyst_disabled()
+    off = news_analysis_disabled()
     if off:
         return Summary(as_of=as_of, hours=feed.hours, error=off)
     if not headlines:
@@ -367,7 +367,10 @@ def summarise(
     # tokens to restate headlines is spending without buying anything.
     name = model or DEFAULT_SUMMARY_MODEL
     try:
-        llm = build_model(name, thinking_budget=None)
+        # `role="summary"` so the refusal in `build_model` checks the news
+        # switch. The default is the chat's, and the chat's being off is not
+        # a reason to skip the news read.
+        llm = build_model(name, thinking_budget=None, role="summary")
         reply = llm.invoke(PROMPT + headlines_block(headlines))
     except Exception as exc:              # noqa: BLE001 -- API, quota, network
         return Summary(as_of=as_of, hours=feed.hours, model=name,

@@ -731,21 +731,26 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
                                _default_thinking_budget, analyse,
                                check_requirements)
-from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_VAR, analyst_disabled,
-                           chat_disabled, load_env)
+from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
+                           DISABLE_NEWS_READ_VAR, RETIRED_VARS, chat_disabled,
+                           load_env, news_analysis_disabled,
+                           news_read_disabled, retired_vars_in_use)
 from qbs.agent.evidence import Book
 from qbs.agent.news import available_backends, backend_note
 from qbs.agent.sentiment import parse_published as snt_parse_published
 
 env_load = load_env()
-switched_off = analyst_disabled()
 chat_off = chat_disabled()
-# Two blockers, because the two features can be switched off independently:
-# the chat has its own kill switch and the news read does not answer to it.
+news_off = news_analysis_disabled()
+fetch_off = news_read_disabled()
+# Two blockers, because the three features answer to three switches and no
+# master: the chat being off says nothing about the news read, or the other
+# way round.
 chat_blocker = check_requirements(role="chat")
 news_blocker = check_requirements(role="summary")
 blocker = chat_blocker                    # the Analyst tab's own gate
 backends = available_backends()
+retired = retired_vars_in_use()
 
 with st.sidebar:
     st.markdown("---")
@@ -753,12 +758,19 @@ with st.sidebar:
     # The controls below stay editable on purpose -- you can line the model and
     # the toggles up while something is off -- but without this they read as an
     # analyst that is simply misbehaving.
-    if switched_off:
-        st.caption(f"⏸️ everything switched off by `{DISABLE_VAR}`. These "
-                   "settings are saved for when it is switched back on.")
-    elif chat_off:
-        st.caption(f"⏸️ chat only, switched off by `{DISABLE_CHAT_VAR}`. "
-                   "The news read still runs.")
+    if chat_off:
+        st.caption(f"⏸️ chat switched off by `{DISABLE_CHAT_VAR}`. These "
+                   "settings are saved for when it is switched back on; the "
+                   "news read answers to its own switch.")
+    if news_off:
+        st.caption(f"⏸️ news analysis off. `{DISABLE_NEWS_ANALYSIS_VAR}=0` "
+                   "switches the Gemini read on; headlines show either way.")
+    # A retired switch someone is still setting is the one thing here worth
+    # a warning rather than a caption: it LOOKS like it is holding the bill
+    # down, and it is not holding anything.
+    for _var in retired:
+        st.warning(md(f"`{_var}` is retired and no longer read — "
+                      + RETIRED_VARS[_var]), icon="⚠️")
     # Two models, because they are not the same job: the chat reasons over
     # tool output turn after turn (~17x the news panel's token usage), while
     # the news read is one call a day. Cheap-and-thinking for the first,
@@ -788,11 +800,16 @@ with st.sidebar:
     live_fundamentals = st.checkbox(
         "Fetch fundamentals live", value=True,
         help="Off reads only what is already cached in data/fundamentals/.")
+    # `value=not news_blocker`, not `value=True`. The box is the in-app
+    # mirror of the switch, and a ticked box over a switched-off feature is
+    # the UI telling you the opposite of what is happening.
     daily_news = st.checkbox(
-        "News sentiment analysis", value=True, disabled=bool(news_blocker),
-        help="One Gemini call per day on the News tab, cached to "
-             "data/sentiment/. Off still shows the headlines — only the "
-             "model's read of them goes away.")
+        "News sentiment analysis", value=not news_blocker,
+        disabled=bool(news_blocker),
+        help=f"One Gemini call per day on the News tab, cached to "
+             f"data/sentiment/. Off still shows the headlines — only the "
+             f"model's read of them goes away. Off by default: set "
+             f"{DISABLE_NEWS_ANALYSIS_VAR}=0 in your .env to allow it.")
 
 
 tab_picks, tab_market, tab_news, tab_analyst = st.tabs(
@@ -1288,136 +1305,150 @@ with tab_news:
     # only the read on top.
     run_llm = bool(daily_news) and not news_blocker
 
-    top = st.columns([3, 1])
-    with top[1]:
-        if st.button("Refresh news", width="stretch",
-                     help="Re-search now. Also re-reads with the model when "
-                          "the sentiment analysis is on."):
-            st.session_state["news_token"] += 1
-            load_news.clear()
-            st.rerun()
-
-    feed, summary, from_cache = load_news(
-        _today, NEWS_HOURS, summary_model.strip(),
-        st.session_state["news_token"], run_llm)
-
-    # ---- the read, when there is a model to do it ------------------------
-    with top[0]:
-        if not run_llm:
-            why = ("switched off in the sidebar" if not daily_news
-                   else news_blocker.split(" — ")[0])
-            st.info(
-                f"**Headlines only — no sentiment analysis** ({why}). "
-                "Everything below is the news itself, which needs no model.",
-                icon="📰")
-        elif summary is None or summary.error:
-            st.warning(
-                f"**No sentiment read.** "
-                f"{summary.error if summary else 'not run yet'}", icon="📰")
-        else:
-            tint = SENTIMENT_TINT.get(summary.label, "")
-            st.markdown(
-                f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
-                f"background:{tint or '#00000010'};display:inline-block'>"
-                f"<b>{summary.label.upper()}</b></div>",
-                unsafe_allow_html=True)
-            if summary.headline:
-                st.markdown(f"**{summary.headline}**")
-            for b in summary.bullets:
-                cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
-                st.markdown(f"- {b['point']} {cites}")
-
-    if run_llm and summary is not None and not summary.error:
-        # A cached read of a DIFFERENT set of stories is still what the model
-        # said -- but saying so beats letting it pass as current.
-        if summary.fingerprint and summary.fingerprint != feed.fingerprint():
-            st.caption(
-                "🔁 This read covers an earlier set of stories than the "
-                "headlines below — the feed has moved on since. "
-                "**Refresh news** re-reads it.")
-        if summary.warnings:
-            with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
-                             "from this summary"):
-                for w in summary.warnings:
-                    st.markdown(f"- {w}")
-                st.caption(
-                    "Bullets without a citation, and citations pointing "
-                    "outside the headline list, are removed before you see "
-                    "them — an unsourced claim in a finance summary cannot be "
-                    "told apart from a remembered one.")
+    if fetch_off:
+        # Nothing below this point can run without a feed, so it stops here
+        # rather than rendering an empty page and blaming the search. Note
+        # `news_read_disabled` returns None whenever the analysis is on, so
+        # this branch cannot strand a read that was asked for.
+        st.info(md(f"**No news is being fetched** — {fetch_off}"), icon="⏸️")
         st.caption(
-            f"🤖 {summary.model} over {summary.n_articles} headlines"
-            + (" · served from cache" if from_cache else " · read just now")
-            + ". **This is a read of what was written, not a signal.** Nothing "
-            "here is backtested and nothing enters a strategy; every bullet "
-            "points back to a numbered headline below.")
+            "Streamlit reads the environment once at start-up, so **restart "
+            "the app** after changing this — a rerun alone will not pick it "
+            "up.")
 
-    st.divider()
-
-    # ---- the headlines, always ------------------------------------------
-    st.markdown(f"#### Headlines — last {feed.hours} hours")
-    # Which backend actually served this, not which one is configured. The
-    # two differ silently when the key is set and the package is not, and
-    # this panel's whole window rests on timestamps only one of them sends.
-    _note = backend_note()
-    if _note:
-        st.warning(md(_note), icon="🔍")
-    if feed.backends:
-        # `feed.backends`, not the result's `source` -- that one is the
-        # OUTLET (Reuters, CNBC), so reading backends off it printed
-        # publishers where search engines belonged.
-        st.caption("Searched with " + ", ".join(f"**{b}**" for b in feed.backends)
-                   + (" (both, merged and de-duplicated)"
-                      if len(feed.backends) > 1 else "")
-                   + ". No model is involved in fetching these.")
-    if not feed.headlines:
-        st.warning(
-            "**No headlines came back.** "
-            + ("; ".join(feed.errors) if feed.errors else
-               "the search returned nothing for any query."), icon="🔍")
-        st.caption(
-            "Run `python -m qbs.agent --check` in this app's environment to "
-            "see which search backends resolve. With none installed, "
-            "`pip install ddgs` adds the keyless one.")
+    # `else`, not `st.stop()`: every tab renders in one script run, so
+    # stopping here would take the Analyst tab down with it.
     else:
-        # Say what the window really cost. The backends' narrowest filter is
-        # one DAY, so the 12-hour window is applied here on each headline's
-        # own timestamp -- and a headline without one cannot be checked.
-        bits = [f"**{feed.total}** stories",
-                f"{feed.n_dated} timestamped inside the window"]
-        if feed.n_undated:
-            bits.append(f"**{feed.n_undated} undated** (kept, but the window "
-                        f"could not be checked)")
-        if feed.n_dropped:
-            bits.append(f"{feed.n_dropped} older than {feed.hours}h, dropped")
-        st.caption(" · ".join(bits))
+        top = st.columns([3, 1])
+        with top[1]:
+            if st.button("Refresh news", width="stretch",
+                         help="Re-search now. Also re-reads with the model when "
+                              "the sentiment analysis is on."):
+                st.session_state["news_token"] += 1
+                load_news.clear()
+                st.rerun()
 
-        for i, r in enumerate(feed.headlines, 1):
-            when = snt_parse_published(r.published)
-            age = ""
-            if when is not None:
-                mins = max(0, int((_now - when).total_seconds() // 60))
-                age = (f"{mins}m ago" if mins < 60 else
-                       f"{mins // 60}h {mins % 60:02d}m ago")
-            title = f"[{r.title}]({r.url})" if r.url else r.title
-            st.markdown(f"`[{i}]` **{title}**")
-            meta = " · ".join(x for x in (r.source, age or "no timestamp") if x)
-            st.caption(meta + ("" if age else
-                               " — this one could not be checked against the "
-                               "12-hour window"))
-            if r.snippet:
-                st.caption(r.snippet)
+        feed, summary, from_cache = load_news(
+            _today, NEWS_HOURS, summary_model.strip(),
+            st.session_state["news_token"], run_llm)
 
-        if feed.errors:
-            with st.expander(f"⚠️ {len(feed.errors)} search query "
-                             "returned an error"):
-                for e in feed.errors:
-                    st.markdown(f"- {e}")
+        # ---- the read, when there is a model to do it ------------------------
+        with top[0]:
+            if not run_llm:
+                why = ("switched off in the sidebar" if not daily_news
+                       else news_blocker)
+                st.info(md(
+                    f"**Headlines only — no sentiment analysis.** {why}\n\n"
+                    "Everything below is the news itself, which needs no model "
+                    "and costs nothing to read."), icon="📰")
+            elif summary is None or summary.error:
+                st.warning(
+                    f"**No sentiment read.** "
+                    f"{summary.error if summary else 'not run yet'}", icon="📰")
+            else:
+                tint = SENTIMENT_TINT.get(summary.label, "")
+                st.markdown(
+                    f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
+                    f"background:{tint or '#00000010'};display:inline-block'>"
+                    f"<b>{summary.label.upper()}</b></div>",
+                    unsafe_allow_html=True)
+                if summary.headline:
+                    st.markdown(f"**{summary.headline}**")
+                for b in summary.bullets:
+                    cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
+                    st.markdown(f"- {b['point']} {cites}")
+
+        if run_llm and summary is not None and not summary.error:
+            # A cached read of a DIFFERENT set of stories is still what the model
+            # said -- but saying so beats letting it pass as current.
+            if summary.fingerprint and summary.fingerprint != feed.fingerprint():
                 st.caption(
-                    "Queries overlap on purpose, so one failing leaves a "
-                    "thinner feed rather than an empty one.")
-        st.caption(f"Fetched {feed.fetched_at.replace('T', ' ')} UTC · "
-                   "re-searched at most every 30 minutes.")
+                    "🔁 This read covers an earlier set of stories than the "
+                    "headlines below — the feed has moved on since. "
+                    "**Refresh news** re-reads it.")
+            if summary.warnings:
+                with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
+                                 "from this summary"):
+                    for w in summary.warnings:
+                        st.markdown(f"- {w}")
+                    st.caption(
+                        "Bullets without a citation, and citations pointing "
+                        "outside the headline list, are removed before you see "
+                        "them — an unsourced claim in a finance summary cannot be "
+                        "told apart from a remembered one.")
+            st.caption(
+                f"🤖 {summary.model} over {summary.n_articles} headlines"
+                + (" · served from cache" if from_cache else " · read just now")
+                + ". **This is a read of what was written, not a signal.** Nothing "
+                "here is backtested and nothing enters a strategy; every bullet "
+                "points back to a numbered headline below.")
+
+        st.divider()
+
+        # ---- the headlines, always ------------------------------------------
+        st.markdown(f"#### Headlines — last {feed.hours} hours")
+        # Which backend actually served this, not which one is configured. The
+        # two differ silently when the key is set and the package is not, and
+        # this panel's whole window rests on timestamps only one of them sends.
+        _note = backend_note()
+        if _note:
+            st.warning(md(_note), icon="🔍")
+        if feed.backends:
+            # `feed.backends`, not the result's `source` -- that one is the
+            # OUTLET (Reuters, CNBC), so reading backends off it printed
+            # publishers where search engines belonged.
+            st.caption("Searched with " + ", ".join(f"**{b}**" for b in feed.backends)
+                       + (" (both, merged and de-duplicated)"
+                          if len(feed.backends) > 1 else "")
+                       + ". No model is involved in fetching these.")
+        if not feed.headlines:
+            st.warning(
+                "**No headlines came back.** "
+                + ("; ".join(feed.errors) if feed.errors else
+                   "the search returned nothing for any query."), icon="🔍")
+            st.caption(
+                "Run `python -m qbs.agent --check` in this app's environment to "
+                "see which search backends resolve. With none installed, "
+                "`pip install ddgs` adds the keyless one.")
+        else:
+            # Say what the window really cost. The backends' narrowest filter is
+            # one DAY, so the 12-hour window is applied here on each headline's
+            # own timestamp -- and a headline without one cannot be checked.
+            bits = [f"**{feed.total}** stories",
+                    f"{feed.n_dated} timestamped inside the window"]
+            if feed.n_undated:
+                bits.append(f"**{feed.n_undated} undated** (kept, but the window "
+                            f"could not be checked)")
+            if feed.n_dropped:
+                bits.append(f"{feed.n_dropped} older than {feed.hours}h, dropped")
+            st.caption(" · ".join(bits))
+
+            for i, r in enumerate(feed.headlines, 1):
+                when = snt_parse_published(r.published)
+                age = ""
+                if when is not None:
+                    mins = max(0, int((_now - when).total_seconds() // 60))
+                    age = (f"{mins}m ago" if mins < 60 else
+                           f"{mins // 60}h {mins % 60:02d}m ago")
+                title = f"[{r.title}]({r.url})" if r.url else r.title
+                st.markdown(f"`[{i}]` **{title}**")
+                meta = " · ".join(x for x in (r.source, age or "no timestamp") if x)
+                st.caption(meta + ("" if age else
+                                   " — this one could not be checked against the "
+                                   "12-hour window"))
+                if r.snippet:
+                    st.caption(r.snippet)
+
+            if feed.errors:
+                with st.expander(f"⚠️ {len(feed.errors)} search query "
+                                 "returned an error"):
+                    for e in feed.errors:
+                        st.markdown(f"- {e}")
+                    st.caption(
+                        "Queries overlap on purpose, so one failing leaves a "
+                        "thinner feed rather than an empty one.")
+            st.caption(f"Fetched {feed.fetched_at.replace('T', ' ')} UTC · "
+                       "re-searched at most every 30 minutes.")
 
 
 with tab_analyst:
@@ -1430,34 +1461,16 @@ with tab_analyst:
     screen_names = names_on("finviz", asof_analyst)
     momentum_names = names_on("momentum", asof_analyst)
 
-    if switched_off:
-        # A deliberate shutdown and a missing key have different remedies, and
-        # "create a .env and paste your key in" is actively wrong advice for
-        # someone who turned the analyst off on purpose.
-        st.info(
-            f"**The analyst is switched off.** `{DISABLE_VAR}` is set, so no "
-            "Gemini call is made from anywhere in this app — nothing is being "
-            "billed. Every other tab is unaffected, and so are the reports "
-            "below the model: picks, momentum profiles, breadth, fundamentals "
-            "and search all still run.", icon="⏸️")
-        st.markdown(
-            "```bash\n"
-            f"unset {DISABLE_VAR}          # or set it to 0\n"
-            "python -m qbs.agent --check\n"
-            "```")
-        st.caption(
-            "Streamlit reads the environment once at start-up, so **restart "
-            "the app** after changing this — a rerun alone will not pick it up."
-        )
-    elif chat_off:
+    if chat_off:
         # A chat switched off on purpose is not a misconfiguration, and the
         # "install this, paste a key there" advice below would send someone to
         # fix something that is not broken.
         st.info(
             f"**The chat is switched off.** `{DISABLE_CHAT_VAR}` is set, so "
-            "this tab makes no Gemini call. **The News tab's sentiment read "
-            "is unaffected and still runs** — that is what this switch is "
-            "for, bringing one feature up at a time.", icon="⏸️")
+            "this tab makes no Gemini call. **The News tab's read answers to "
+            f"its own switch** (`{DISABLE_NEWS_ANALYSIS_VAR}`) and is "
+            "unaffected — that is what separate switches are for, bringing "
+            "one feature up at a time.", icon="⏸️")
         st.markdown(
             "```bash\n"
             f"unset {DISABLE_CHAT_VAR}          # or set it to 0\n"

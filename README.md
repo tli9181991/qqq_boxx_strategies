@@ -1108,7 +1108,8 @@ QBS_GEMINI_MODEL=gemini-2.5-flash    # the chat
 QBS_THINKING_BUDGET=-1               # chat only: -1 dynamic, 0 off, N caps it
 QBS_SUMMARY_MODEL=gemini-2.5-pro     # the news read
 TAVILY_API_KEY=...                   # optional, better search than the default
-QBS_DISABLE_ANALYST=1                # optional kill switch, see below
+QBS_DISABLE_NEWS_ANALYSIS=0          # the news read ships OFF; this turns it on
+QBS_DISABLE_CHAT=1                   # optional kill switch, see below
 ```
 
 **Two models, because they are not the same job.** The chat reasons over tool output
@@ -1166,47 +1167,75 @@ skipped, and the other lines still load.
 Streamlit will not re-import a package it has already loaded, so **restart the
 dashboard** after creating `.env`; a rerun alone will not pick the key up.
 
-### Switching it off
+### Switching things off
+
+One switch per thing that can spend, and **no master over them**. A master is a second
+answer to "is this on?", and the two answers disagree the moment somebody sets only one.
+
+| Variable | Guards | Default |
+|---|---|---|
+| `QBS_DISABLE_NEWS_ANALYSIS` | the News tab's Gemini read | **off** — set it to `0` to switch the read on |
+| `QBS_DISABLE_NEWS_READ` | fetching the headlines at all | on (ignored while the analysis is on) |
+| `QBS_DISABLE_CHAT` | the Analyst tab's chat | on |
+
+**The news read ships off, and it is the only one that does.** Every other switch here
+guards something a person starts — typing in the chat, pressing refresh — so leaving it
+on until told otherwise costs nothing until somebody acts. The news read runs on page
+load, once a day, for anybody who happens to have a key in their `.env`. A default that
+bills a fresh checkout for opening the dashboard is not a default anybody chose. So it
+is switched on explicitly:
 
 ```bash
-QBS_DISABLE_ANALYST=1          # environment, or a line in .env
+QBS_DISABLE_NEWS_ANALYSIS=0    # environment, or a line in .env
 ```
 
-No Gemini call is made from anywhere in the package: `check_requirements` reports it,
-`analyse` returns an `Answer` with `disabled=True` before loading anything, and
-`build_model` refuses — so nothing reaches the API even from a caller that skipped the
-check, and nothing is billed. **Everything that does not need the model keeps working**
-— the picks, momentum profiles, breadth, fundamentals, search, and every
+Its message distinguishes **"off by default"** from **"switched off"**. The remedy reads
+the same but the surprise is completely different, and somebody who never touched the
+switch should not be hunting for who did.
+
+**The headlines are not the read.** Fetching them is a web search — free on DuckDuckGo,
+a credit on Tavily — so it runs regardless, and the News tab shows the stories with no
+key and no spend. `QBS_DISABLE_NEWS_READ=1` stops even that. Switching the analysis on
+overrides it: analysing news you are not fetching is not a configuration anybody means,
+and the setting somebody went out of their way to enable is the one that says what they
+wanted.
+
+**The chat is separate.** `QBS_DISABLE_CHAT=1` stops the Analyst tab and leaves the news
+alone; switching the news off leaves the chat alone. `check_requirements(role=...)`
+reports whichever applies, `analyse` returns an `Answer` with `disabled=True` before
+loading anything, and `build_model(role=...)` refuses — so nothing reaches the API even
+from a caller that skipped the check. **Everything that does not need the model keeps
+working**: the picks, momentum profiles, breadth, fundamentals, search, and every
 `python -m qbs.agent --report ...`. That is the point of a switch rather than an
 uninstall.
 
-**There is a narrower switch too.** `QBS_DISABLE_CHAT=1` stops only the Analyst tab's
-chat and **leaves the news read running** — which is what you want when bringing one
-feature up at a time, or when the chat is the token-heavy half and the daily summary is
-not. It is enforced in `build_analyst`/`analyse` rather than in `build_model`, because
-the news read goes through `build_model` and has to survive it. The master switch wins
-and is reported as the reason, so someone who set `QBS_DISABLE_ANALYST` is told *that*
-rather than handed a message about a switch they never touched.
-
-`--check` reports the two separately, and its exit code means **broken**, not
-*switched off* — a deliberate shutdown is a working configuration, and a script asking
-"is this install OK?" should not be told no because you turned a feature off on purpose.
-
-Only an explicit off-word re-enables either — `0`, `false`, `no`, `off`, `none`,
-`disabled`. **Any other non-empty value switches it off.** That is deliberately not
+Only an explicit off-word means off — `0`, `false`, `no`, `off`, `none`, `disabled`.
+**Any other non-empty value reads as on.** That is deliberately not
 `qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
 as false: for a flag whose job is to stop spending money, an unrecognised value has to
-fail *safe*, so a half-remembered `QBS_DISABLE_ANALYST=disable` stops the spending
-rather than quietly leaving it running.
+fail *safe*, so a half-remembered `QBS_DISABLE_CHAT=disable` stops the spending rather
+than quietly leaving it running.
 
-`python -m qbs.agent --check` prints the switch on its own line and says **"DISABLED on
-purpose"** rather than "not ready", because a deliberate shutdown and a missing key
-have different remedies. The dashboard does the same: a paused notice with `unset`,
-not the "create a `.env`" instructions, which would send you to fix something that is
-not broken.
+`python -m qbs.agent --check` prints each switch on its own line and says **"DISABLED on
+purpose"** rather than "not ready", because a deliberate shutdown and a missing key have
+different remedies. Its exit code means **broken**, not *switched off* — including the
+news read's default, so a script asking "is this install OK?" is not told no because of
+a setting that ships that way. The dashboard does the same: a paused notice with
+`unset`, not the "create a `.env`" instructions, which would send you to fix something
+that is not broken.
+
+#### `QBS_DISABLE_ANALYST` is retired
+
+It was the master over all three and is now read by nothing. A kill switch that has
+quietly stopped being read is the most dangerous kind of dead config — it *looks* like
+it is holding your bill down — so a leftover setting is reported rather than ignored,
+by `load_env`, by `--check`, and by the dashboard sidebar. It is not treated as a typo:
+the name was right, and the remedy is "here is what replaced it", not "check your
+spelling". Replace it with `QBS_DISABLE_NEWS_ANALYSIS` (the news read) and
+`QBS_DISABLE_CHAT` (the chat).
 
 Streamlit reads the environment once at start-up, so **restart the app** after changing
-this — a rerun alone will not pick it up.
+any of these — a rerun alone will not pick it up.
 
 ### What it can look at
 

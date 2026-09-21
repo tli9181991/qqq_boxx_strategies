@@ -31,11 +31,27 @@ what you would expect even with a `.env` sitting next to it. Pass
 
 The kill switches
 -----------------
-`QBS_DISABLE_ANALYST=1` stops every Gemini call in the package;
-`QBS_DISABLE_CHAT=1` stops only the Analyst tab's chat and leaves the news
-read running. Both live here rather than in `analyst.py` because they are
-read the same way as the keys, from the environment or a `.env`, and
-`--check` reports them together. See `analyst_disabled` and `chat_disabled`.
+Three, one per thing that can spend, and no master above them:
+
+* `QBS_DISABLE_NEWS_ANALYSIS` -- the News tab's Gemini read. **Off by
+  default**, so a fresh checkout with a key in it does not start billing;
+  `=0` switches it on. It is the only switch here whose default is the
+  disabled position, because it is the only one that spends without anybody
+  pressing anything.
+* `QBS_DISABLE_NEWS_READ` -- fetching the headlines themselves. On by
+  default, since that is Tavily credits at worst and free at best. Ignored
+  while the analysis is on: there is nothing to analyse without it.
+* `QBS_DISABLE_CHAT` -- the Analyst tab's chat, which spends only when
+  somebody types.
+
+They live here rather than in `analyst.py` because they are read the same
+way as the keys, from the environment or a `.env`, and `--check` reports
+them together. See `news_analysis_disabled`, `news_read_disabled` and
+`chat_disabled`.
+
+`QBS_DISABLE_ANALYST` was the master switch over all of these and is
+retired. A switch that is read by nothing is worse than one that is gone, so
+a leftover setting is reported rather than ignored -- see `RETIRED_VARS`.
 
 Secrets
 -------
@@ -54,22 +70,34 @@ from typing import Dict, List, Optional, Tuple
 # The repository root: qbs/agent/env.py -> qbs/agent -> qbs -> root
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# The kill switches. `QBS_DISABLE_ANALYST` is the master -- set it and no
-# Gemini call is made from anywhere in this package. `QBS_DISABLE_CHAT` is
-# narrower: it stops the Analyst tab's chat while leaving the news read
-# working, which is what you want when testing one feature at a time or when
-# the chat is the expensive half and the daily summary is not.
-DISABLE_VAR = "QBS_DISABLE_ANALYST"
+# One switch per thing that can spend. There is deliberately no master above
+# them: a master is a second answer to "is this on?", and the two answers
+# disagree the moment someone sets only one of them.
 DISABLE_CHAT_VAR = "QBS_DISABLE_CHAT"
+DISABLE_NEWS_ANALYSIS_VAR = "QBS_DISABLE_NEWS_ANALYSIS"
+DISABLE_NEWS_READ_VAR = "QBS_DISABLE_NEWS_READ"
+
+# Retired switches, and what replaced each. Kept so a leftover line can be
+# reported instead of silently doing nothing -- a kill switch that has
+# quietly stopped being read is the most dangerous kind of dead config, and
+# somebody is relying on this one to hold their bill down.
+RETIRED_VARS = {
+    "QBS_DISABLE_ANALYST": (
+        f"it was the master switch over everything. The news read is now "
+        f"{DISABLE_NEWS_ANALYSIS_VAR} (off unless you set it to 0) and the "
+        f"chat is {DISABLE_CHAT_VAR}. Nothing reads the old name, so this "
+        f"line no longer switches anything off."),
+}
 
 # The keys this package looks for. Listed so `--check` can report on all of
 # them, and so a typo in a `.env` can be pointed out rather than ignored.
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
               "QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL", "QBS_THINKING_BUDGET",
-              "QBS_DASH_WATCHLIST", DISABLE_VAR, DISABLE_CHAT_VAR)
+              "QBS_DASH_WATCHLIST", DISABLE_CHAT_VAR,
+              DISABLE_NEWS_ANALYSIS_VAR, DISABLE_NEWS_READ_VAR)
 
 # Values that mean "switch is off, carry on". Everything else non-empty
-# disables -- see `analyst_disabled` for why this is not `_env_bool`.
+# disables -- see `chat_disabled` for why this is not `_env_bool`.
 OFF_VALUES = ("0", "false", "no", "off", "none", "disabled")
 
 
@@ -86,6 +114,7 @@ class EnvLoad:
     applied: List[str] = field(default_factory=list)      # set into os.environ
     skipped: List[str] = field(default_factory=list)      # already in the env
     unknown: List[str] = field(default_factory=list)      # not a KNOWN_KEY
+    retired: List[str] = field(default_factory=list)     # a RETIRED_VAR
     error: Optional[str] = None                           # fatal: nothing read
     warnings: List[str] = field(default_factory=list)     # read, with caveats
     insecure: bool = False        # readable by group or other
@@ -216,7 +245,14 @@ def load_env(path: Optional[str] = None, override: bool = False,
             f"{', '.join(map(str, bad))} (expected KEY=value)")
 
     for key, value in values.items():
-        if key not in KNOWN_KEYS:
+        if key in RETIRED_VARS:
+            # Named separately from the unknown keys, and not as a typo: this
+            # one WAS right, and the remedy is "here is what replaced it"
+            # rather than "check your spelling". Still applied to the
+            # environment, so anything outside this package that reads it
+            # keeps working.
+            out.retired.append(key)
+        elif key not in KNOWN_KEYS:
             out.unknown.append(key)
         if key in env and env[key] and not override:
             out.skipped.append(key)
@@ -224,6 +260,9 @@ def load_env(path: Optional[str] = None, override: bool = False,
         env[key] = value
         out.applied.append(key)
 
+    for key in out.retired:
+        out.warnings.append(f"{key} is RETIRED and no longer read — "
+                            + RETIRED_VARS[key])
     if out.unknown:
         out.warnings.append("unrecognised key" + ("s " if len(out.unknown) > 1
                                                   else " ")
@@ -238,55 +277,118 @@ def load_env(path: Optional[str] = None, override: bool = False,
     return _done(out)
 
 
-def analyst_disabled(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
-    """Why the analyst is switched off, or None if it is not.
+def _off_word(raw: str) -> bool:
+    """Does this value read as "switch is off, carry on"?"""
+    return not raw or raw.strip().lower() in OFF_VALUES
 
-    `QBS_DISABLE_ANALYST=1` stops every Gemini call in this package: the model
-    is never constructed, so nothing reaches the API and nothing is billed.
-    Everything that does not need the model keeps working -- the picks, the
-    momentum profile, breadth, fundamentals, search, `--report`. That is the
-    point of a switch rather than an uninstall.
 
-    Deliberately NOT `qbs.live.config._env_bool`, which treats anything
-    outside ("1", "true", "yes", "on") as false. For a flag that exists to
-    stop spending money, an unrecognised value must fail SAFE: only an
-    explicit off-word re-enables, so `QBS_DISABLE_ANALYST=disable` -- a
-    perfectly natural thing to type -- switches it off rather than quietly
-    leaving it on.
+def news_analysis_disabled(environ: Optional[Dict[str, str]] = None
+                           ) -> Optional[str]:
+    """Why the News tab's Gemini read is off, or None if it is on.
+
+    **The only switch here that defaults to the disabled position.** Unset
+    means off. Every other switch in this file guards something a person
+    starts -- typing in the chat, pressing refresh -- so leaving it on until
+    told otherwise costs nothing until somebody acts. This one runs on page
+    load, once a day, for anybody who happens to have a key in their `.env`,
+    and a default that bills a new checkout for opening the dashboard is not
+    a default anybody chose.
+
+    So it is switched on explicitly: `QBS_DISABLE_NEWS_ANALYSIS=0`. Anything
+    else -- unset, "1", "yes", a typo -- leaves it off. The headlines are
+    unaffected either way; see `news_read_disabled`.
 
     Returns a sentence, not a bool, because every caller needs to tell
-    somebody why: a blank panel with no reason is the thing this avoids.
+    somebody why: a blank panel with no reason is the thing this avoids. The
+    sentence distinguishes "never switched on" from "switched off", because
+    the remedies read the same but the surprise is completely different.
     """
     env = os.environ if environ is None else environ
-    raw = (env.get(DISABLE_VAR) or "").strip()
-    if not raw or raw.lower() in OFF_VALUES:
+    raw = (env.get(DISABLE_NEWS_ANALYSIS_VAR) or "").strip()
+    if raw and _off_word(raw):
         return None
-    return (f"the analyst is switched off by {DISABLE_VAR}={raw!r}. "
-            f"Unset it (or set it to 0) to turn Gemini back on; everything "
-            f"that does not call the model is unaffected.")
+    if not raw:
+        return (f"the news analysis is off by default — it is the one thing "
+                f"here that would spend on its own. Set "
+                f"{DISABLE_NEWS_ANALYSIS_VAR}=0 in your .env to switch the "
+                f"Gemini read on. The headlines below do not need it.")
+    return (f"the news analysis is switched off by "
+            f"{DISABLE_NEWS_ANALYSIS_VAR}={raw!r}. Set it to 0 to switch the "
+            f"Gemini read on; the headlines are unaffected either way.")
+
+
+def news_read_disabled(environ: Optional[Dict[str, str]] = None
+                       ) -> Optional[str]:
+    """Why the headline fetch is off, or None if it is on.
+
+    On unless switched off, the opposite of `news_analysis_disabled`: this
+    is a search, free on DuckDuckGo and a credit on Tavily, not an LLM call.
+
+    **Switched-on analysis wins.** Asking for a read of the news while the
+    news is not being fetched is not a configuration anybody means; it is
+    two settings that contradict each other, and the one someone went out of
+    their way to enable is the one that says what they wanted. So the fetch
+    runs, and this returns None.
+
+    Same fail-safe reading as the others -- only an explicit off-word keeps
+    it running, so an unrecognised value stops the fetching rather than
+    quietly leaving it on.
+    """
+    env = os.environ if environ is None else environ
+    if news_analysis_disabled(env) is None:
+        return None
+    raw = (env.get(DISABLE_NEWS_READ_VAR) or "").strip()
+    if _off_word(raw):
+        return None
+    return (f"the news fetch is switched off by "
+            f"{DISABLE_NEWS_READ_VAR}={raw!r}. Unset it (or set it to 0) to "
+            f"fetch headlines again. Switching the analysis on overrides "
+            f"this, since there is nothing to analyse without it.")
 
 
 def chat_disabled(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
     """Why the Analyst tab's CHAT is switched off, or None if it is not.
 
-    The master switch wins and is reported as the reason: someone who set
-    `QBS_DISABLE_ANALYST` needs to be told that, not handed a message about a
-    chat switch they never touched.
+    On unless switched off: the chat spends only when somebody types into
+    it, so there is nothing for a default to protect them from.
 
-    Same fail-safe reading as `analyst_disabled` -- only an explicit off-word
-    re-enables, so an unrecognised value stops the spending rather than
-    quietly leaving it on.
+    Deliberately NOT `qbs.live.config._env_bool`, which treats anything
+    outside ("1", "true", "yes", "on") as false. For a flag that exists to
+    stop spending money, an unrecognised value must fail SAFE: only an
+    explicit off-word re-enables, so `QBS_DISABLE_CHAT=disable` -- a
+    perfectly natural thing to type -- switches it off rather than quietly
+    leaving it on.
     """
     env = os.environ if environ is None else environ
-    master = analyst_disabled(env)
-    if master:
-        return master
     raw = (env.get(DISABLE_CHAT_VAR) or "").strip()
-    if not raw or raw.lower() in OFF_VALUES:
+    if _off_word(raw):
         return None
     return (f"the chat is switched off by {DISABLE_CHAT_VAR}={raw!r}. "
             f"Unset it (or set it to 0) to turn it back on; the news "
-            f"sentiment read is unaffected and still runs.")
+            f"sentiment read answers to its own switch and is unaffected.")
+
+
+def role_disabled(role: str = "chat",
+                  environ: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The switch that applies to `role`: "chat" or "summary".
+
+    One mapping, used by `check_requirements`, `build_model` and the
+    dashboard alike. Three copies of `if role == "chat"` is how a role ends
+    up checked against the wrong switch -- which, for switches that exist to
+    stop spending, means the one that was set is the one that gets ignored.
+    """
+    return (chat_disabled(environ) if role == "chat"
+            else news_analysis_disabled(environ))
+
+
+def retired_vars_in_use(environ: Optional[Dict[str, str]] = None) -> List[str]:
+    """Retired switch names that are currently set to something.
+
+    Reported rather than ignored. Somebody who set a kill switch is relying
+    on it, and the failure mode of a silently-retired one is a bill.
+    """
+    env = os.environ if environ is None else environ
+    return [k for k in RETIRED_VARS if (env.get(k) or "").strip()]
 
 
 def resolve_google_key(environ: Optional[Dict[str, str]] = None) -> Optional[str]:

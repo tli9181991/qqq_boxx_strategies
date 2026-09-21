@@ -12,7 +12,8 @@ answer looks wrong, diff it against the report rather than re-prompting.
 The key comes from a `.env` at the repository root (see `.env.example`) or
 from the environment, which wins. `--check` says which, without printing it.
 
-`QBS_DISABLE_ANALYST=1` switches Gemini off without uninstalling anything.
+`QBS_DISABLE_CHAT=1` switches the chat off and
+`QBS_DISABLE_NEWS_ANALYSIS=0` switches the news read on, without uninstalling anything.
 `--report` and everything else in this package carry on working.
 
 `--models` asks the API which model IDs your key can serve, which is the only
@@ -53,12 +54,15 @@ def main(argv=None) -> int:
     if args.check:
         from .analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
                               _default_thinking_budget, check_requirements)
-        from .env import (DISABLE_CHAT_VAR, DISABLE_VAR, KNOWN_KEYS,
-                          analyst_disabled, chat_disabled, load_env,
-                          resolve_google_key)
+        from .env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
+                          DISABLE_NEWS_READ_VAR, KNOWN_KEYS, RETIRED_VARS,
+                          chat_disabled, load_env, news_analysis_disabled,
+                          news_read_disabled, resolve_google_key,
+                          retired_vars_in_use)
         from .news import available_backends, backend_note
         loaded = load_env()
-        off = analyst_disabled()
+        news_off = news_analysis_disabled()
+        fetch_off = news_read_disabled()
         missing = check_requirements(role="chat")
         print(f".env:            {loaded.summary()}")
         # Key names and set/unset only. Printing a secret to a terminal puts
@@ -82,24 +86,37 @@ def main(argv=None) -> int:
         # The switch gets its own line and its own word. "NOT ready" reads as
         # a misconfiguration and sends someone hunting for one; "disabled on
         # purpose" tells them they already know the cause.
-        for var in (DISABLE_VAR, DISABLE_CHAT_VAR):
+        for var in (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
+                    DISABLE_NEWS_READ_VAR):
             state = os.environ.get(var)
             print(f"{var}: {state!r}" if state else f"{var}: unset")
+        # A retired switch someone is still setting gets its own line. The
+        # whole point of reporting it is that it looks like it is working.
+        for var in retired_vars_in_use():
+            print(f"{var}: {os.environ[var]!r} — RETIRED, NOT READ. "
+                  + RETIRED_VARS[var])
         chat_off = chat_disabled()
         # The two features answer to different switches, so they are reported
         # separately -- "the analyst is off" would be wrong for a run where
         # only the chat is.
-        print(f"news read:       {'DISABLED — ' + off if off else 'ready'}")
+        print("headline fetch:  "
+              + ("DISABLED — " + fetch_off if fetch_off else "ready"))
+        print("news analysis:   "
+              + ("OFF — " + news_off if news_off else "ready"))
         print("chat:            "
               + ("DISABLED on purpose" if chat_off else
                  "ready" if not missing else "NOT ready — " + missing))
         # Non-zero means BROKEN, not "switched off". A deliberate shutdown is
         # a working configuration, and a script asking "is this install OK?"
         # should not be told no because someone turned a feature off on
-        # purpose. `role="summary"` is the config-only check: it answers to
-        # the master switch alone, so `and not off` leaves real problems.
+        # purpose -- which now includes the default, since the news analysis
+        # ships off.
+        #
+        # `check_requirements` reports the switch BEFORE the missing pieces,
+        # so the switch's own sentence coming back means the switch is the
+        # only thing wrong. Anything else is a real problem.
         problem = check_requirements(role="summary")
-        return 1 if (problem and not off) else 0
+        return 1 if (problem and problem != news_off) else 0
 
     if args.models:
         return _models()

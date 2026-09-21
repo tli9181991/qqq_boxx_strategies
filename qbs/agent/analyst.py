@@ -29,17 +29,22 @@ checkable against the tools; check them.
 
 Turning it off
 --------------
-`QBS_DISABLE_ANALYST=1` (environment or `.env`) stops every Gemini call from
-this package without uninstalling anything. `check_requirements` reports it,
-`analyse` returns an `Answer` with `disabled=True`, and `build_model` refuses
--- so nothing reaches the API even from a caller that skipped the check.
-Everything that does not need the model keeps working.
+One switch per thing that spends, and no master above them.
 
-`QBS_DISABLE_CHAT=1` is the narrower one: it stops this chat and leaves the
-news read running, which is what you want when bringing one feature up at a
-time. It is enforced in `build_analyst` and `analyse` rather than in
-`build_model`, because the news read goes through `build_model` and must
-survive it.
+`QBS_DISABLE_CHAT=1` (environment or `.env`) stops this chat without
+uninstalling anything. `check_requirements(role="chat")` reports it,
+`analyse` returns an `Answer` with `disabled=True`, and `build_model`
+refuses -- so nothing reaches the API even from a caller that skipped the
+check. Everything that does not need the model keeps working.
+
+The News tab's read answers to `QBS_DISABLE_NEWS_ANALYSIS` instead, which is
+OFF until set to 0, and reaches `build_model` as `role="summary"`. The two
+are independent: switching the chat off leaves the news read running and
+vice versa, which is what you want when bringing one feature up at a time.
+
+`QBS_DISABLE_ANALYST`, the old master switch over both, is retired. A
+leftover setting is reported by `load_env` and `--check` rather than
+silently doing nothing.
 
 Requirements
 ------------
@@ -56,7 +61,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .env import (analyst_disabled, chat_disabled, load_env,
+from .env import (chat_disabled, load_env, role_disabled,
                   resolve_google_key)
 
 # Two roles, two models, because they are not the same job.
@@ -183,7 +188,7 @@ class Answer:
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     model: str = ""
     error: Optional[str] = None
-    disabled: bool = False       # stopped by QBS_DISABLE_ANALYST, not a fault
+    disabled: bool = False       # stopped by a kill switch, not a fault
 
     @property
     def tools_used(self) -> List[str]:
@@ -210,7 +215,7 @@ def check_requirements(role: str = "chat") -> Optional[str]:
     # `role` picks WHICH switch applies. The news read only cares about the
     # master switch; the chat is also stopped by its own. One function, so a
     # caller cannot accidentally ask about the wrong one.
-    off = chat_disabled() if role == "chat" else analyst_disabled()
+    off = role_disabled(role)
     if off:
         return off
     try:
@@ -236,7 +241,8 @@ def check_requirements(role: str = "chat") -> Optional[str]:
 
 
 def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
-                thinking_budget: object = "default", **kwargs):
+                thinking_budget: object = "default", role: str = "chat",
+                **kwargs):
     """The Gemini chat model.
 
     Temperature defaults to 0. This agent reports numbers; there is nothing
@@ -252,7 +258,14 @@ def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
     # last line before a billable call: a caller that builds the model
     # directly, or a future code path that forgets to check, still cannot
     # reach Gemini while the switch is on.
-    off = analyst_disabled()
+    #
+    # `role` says WHICH switch, and defaults to the chat's. There is no
+    # master switch to fall back on any more, so a caller that builds a
+    # model for the news read has to say so -- and a caller that forgets
+    # gets the chat's switch, which is the stricter mistake to make: it
+    # refuses a call somebody may have wanted rather than making one they
+    # switched off.
+    off = role_disabled(role)
     if off:
         raise RuntimeError(f"Refusing to build a Gemini client: {off}")
     from langchain_google_genai import ChatGoogleGenerativeAI
