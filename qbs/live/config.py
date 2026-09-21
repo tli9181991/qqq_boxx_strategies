@@ -112,6 +112,11 @@ class LiveConfig:
     # asked ~60 questions. Not computed in the trade phase -- a few seconds of
     # arithmetic has no business anywhere near the MOC cutoff.
     shadow_weights: List[float] = field(default_factory=lambda: [0.5, 1.25, 2.0])
+    # Names to score beside the ranking without making them buyable -- a stock
+    # outside the Nasdaq-100 whose strength you want to read against the book's.
+    # They are ranked in a copy of the universe; the book is computed from the
+    # index constituents and never sees them.
+    watchlist: List[str] = field(default_factory=list)
 
     # ---- safety guards ---------------------------------------------------
     max_order_notional: float = 40_000.0   # per single order
@@ -235,6 +240,11 @@ class LiveConfig:
         return os.path.join(self.state_dir, "ranking_log.csv")
 
     @property
+    def watchlist_csv_path(self) -> str:
+        """Where a watched non-constituent would have ranked each day."""
+        return os.path.join(self.state_dir, "watchlist_log.csv")
+
+    @property
     def shadow_csv_path(self) -> str:
         """What the candidate rules would have held each day. Observation only."""
         return os.path.join(self.state_dir, "shadow_log.csv")
@@ -297,6 +307,10 @@ class LiveConfig:
                                              cfg.position_source)
         cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
         cfg.ranking_log_top = _env_int("QBS_RANKING_TOP", cfg.ranking_log_top)
+        if os.environ.get("QBS_WATCHLIST") is not None:
+            cfg.watchlist = [t.strip().upper() for t in
+                             os.environ["QBS_WATCHLIST"].replace(",", " ").split()
+                             if t.strip()]
         if os.environ.get("QBS_SHADOW_WEIGHTS") is not None:
             raw = os.environ["QBS_SHADOW_WEIGHTS"].replace(",", " ").split()
             cfg.shadow_weights = [float(w) for w in raw]

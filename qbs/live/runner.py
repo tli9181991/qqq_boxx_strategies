@@ -150,8 +150,9 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
     debugging on the box -- the trade phase never uses it, because ranking on
     yesterday's cache would submit an order list the strategy did not ask for.
 
-    `shadow` also scores the candidate ranking rules for the log. Off for the
-    trade phase: it is several seconds of arithmetic that cannot change a
+    `shadow` also scores the candidate ranking rules and the watchlist for the
+    log -- both are observation, and both are off in the trade phase for the
+    same reason. Off for the trade phase: it is several seconds of arithmetic that cannot change a
     single order, and the one phase with a deadline should not be carrying it.
     Preflight runs twice a day and writes the same dated row, so nothing is
     lost by leaving it out of the run that is racing the MOC cutoff.
@@ -163,6 +164,7 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
 
     px = load_live_prices(cfg, tickers=tickers, fetch_universe=not offline,
                           refresh=refresh and not offline, extra=live.extra_tickers,
+                          watch=live.watchlist if shadow else None,
                           offline=offline)
     log.info("prices: %d rows x %d cols, last bar %s",
              len(px), px.shape[1], px.index.max().date())
@@ -174,6 +176,7 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         exclude=_excluded_names(live),
         record_ranks=live.ranking_log_top,
         shadow_weights=live.shadow_weights if shadow else (),
+        watch_names=live.watchlist if shadow else (),
     )
     return px, book
 
@@ -192,6 +195,9 @@ def _write_csv_logs(live: LiveConfig, book=None) -> None:
         if book is not None and book.shadow:
             st.append_shadow_csv(live.shadow_csv_path, f"{book.asof:%Y-%m-%d}",
                                  book.shadow, live_held=book.raw_holdings)
+        if book is not None and book.watchlist:
+            st.append_watchlist_csv(live.watchlist_csv_path,
+                                    f"{book.asof:%Y-%m-%d}", book.watchlist)
         store.export_trade_csv(live.db_path, live.trade_csv_path)
     except Exception as exc:
         log.warning("could not refresh the CSV logs (%s: %s); the database is "

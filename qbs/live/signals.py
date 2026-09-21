@@ -63,6 +63,8 @@ class TargetBook:
     # What candidate ranking rules would be holding today. Logged, never
     # traded: no order builder reads this, and nothing downstream of it can.
     shadow: List[Dict] = field(default_factory=list)
+    # Where a watched non-constituent would have ranked. Same guarantee.
+    watchlist: List[Dict] = field(default_factory=list)
 
     @property
     def risk_weight(self) -> float:
@@ -87,6 +89,7 @@ def load_live_prices(
     fetch_universe: bool = True,
     refresh: bool = True,
     extra: Optional[List[str]] = None,
+    watch: Optional[List[str]] = None,
     offline: bool = False,
 ) -> pd.DataFrame:
     """Download the ranking universe plus the safe asset as one wide frame.
@@ -114,9 +117,20 @@ def load_live_prices(
     bench = cfg.dd_stop_benchmark
     if cfg.dd_stop.enabled and cfg.dd_stop.qqq_drawdown and bench not in per_ticker:
         per_ticker.append(bench)
+    # Watched names come down this path for the same reason the benchmark does:
+    # they are not index constituents, and the universe cache returns only what
+    # it already holds on a cache hit, so a watch name routed through it would
+    # vanish without a word on every run that did not refresh.
+    watch_wanted = [t for t in (watch or []) if t not in per_ticker and t not in wanted]
+    per_ticker.extend(watch_wanted)
 
     core = load_prices(per_ticker, start=cfg.download_start, end=None,
                        refresh=refresh, offline=offline)
+    # A watch name that will not download is a log line, never a failed run.
+    for t in list(watch_wanted):
+        if t not in core.columns or core[t].dropna().empty:
+            log.warning("no prices for watched name %s; skipping it today", t)
+            per_ticker.remove(t)
     if safe not in core.columns or core[safe].dropna().empty:
         raise SignalError(f"could not load any prices for the safe asset {safe}")
     if len(per_ticker) > 1 and (bench not in core.columns
@@ -264,6 +278,7 @@ def compute_targets(
     exclude: Optional[List[str]] = None,
     record_ranks: int = 25,
     shadow_weights: Sequence[float] = (),
+    watch_names: Sequence[str] = (),
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -276,7 +291,16 @@ def compute_targets(
     diag = check_data_quality(prices, requested, safe, max_staleness_days,
                               min_coverage, now=now)
 
-    uni = prices.drop(columns=[safe])
+    # The rankable universe is what was *requested*, not whatever happens to be
+    # in the frame. The frame also carries the safe asset and, when the
+    # drawdown stop is on, the benchmark -- and "everything except the safe
+    # asset" quietly made QQQ a candidate the book could buy. It never came
+    # close (its best 6-1 rank in six years is 22, against an exit_rank of 8,
+    # because an index of a hundred names cannot out-momentum its own top six),
+    # but the live path was ranking a set the backtest never saw, and any name
+    # added to the frame for observation would have inherited the same right to
+    # take a slot.
+    uni = prices[[c for c in prices.columns if c in set(requested) and c != safe]]
     # Same pruning the pipeline does: a name without enough history is not
     # rankable, and leaving it in as a NaN column shrinks the candidate pool.
     uni = uni.loc[:, uni.notna().sum() >= cfg.momentum.min_history]
@@ -372,6 +396,25 @@ def compute_targets(
             log.warning("shadow books could not be scored (%s: %s); the live book "
                         "is unaffected", type(exc).__name__, exc)
 
+    watchlist: List[Dict] = []
+    wanted_watch = [t for t in watch_names if t in prices.columns
+                    and t not in uni.columns]
+    if wanted_watch:
+        from ..shadow import watchlist_rows
+        watchlist = watchlist_rows(uni, prices[safe], prices[wanted_watch],
+                                   cfg.momentum, asof=asof)
+        for r in watchlist:
+            # A cutoff is blank when that slot is unfilled, and "needs nan%"
+            # would read as a broken number rather than an empty seat.
+            def _cut(v, label):
+                return f"{label} {100 * v:+.1f}%" if v == v else f"{label} unfilled"
+            place = (f"rank {r['rank']:.0f}" if r["rank"] == r["rank"]
+                     else "unranked (lost to the safe asset, or too little history)")
+            log.info("watch %s: %s, 6-1 momentum %+.1f%% (%s, %s)",
+                     r["symbol"], place, 100 * r["score"],
+                     _cut(r["book_cutoff"], "book needs"),
+                     _cut(r["band_cutoff"], "band"))
+
     universe = tradeable
 
     last_px = prices.loc[asof]
@@ -400,6 +443,7 @@ def compute_targets(
         selection=selection,
         ranking=ranking,
         shadow=shadow,
+        watchlist=watchlist,
     )
 
     total = sum(book.weights.values())

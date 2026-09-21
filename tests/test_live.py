@@ -1787,3 +1787,89 @@ def test_the_shadow_book_cannot_reach_an_order():
                          universe=shadowed.universe)
     assert [dataclasses.astuple(o) for o in a] == [dataclasses.astuple(o) for o in b]
     assert ta == tb
+
+
+# --------------------------------------------------------------------------
+# The watchlist, and the universe it is kept out of
+# --------------------------------------------------------------------------
+
+def _watch_fixture():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame[cfg.momentum.safe_asset] = px[cfg.momentum.safe_asset]
+    frame[cfg.dd_stop_benchmark] = px[cfg.dd_stop_benchmark]
+    return cfg, frame, list(uni.columns)
+
+
+def test_only_requested_names_are_rankable():
+    """A column in the frame is not a licence to buy it.
+
+    The frame carries the safe asset and the benchmark, and once the watchlist
+    exists it carries names that are deliberately not constituents. Ranking
+    'everything except the safe asset' made every one of them a candidate the
+    book could take a slot in.
+    """
+    cfg, frame, names = _watch_fixture()
+    book = compute_targets(cfg, frame, requested=names, now=frame.index[-1],
+                           record_ranks=99)
+    assert cfg.dd_stop_benchmark not in book.universe
+    assert cfg.dd_stop_benchmark not in [r["symbol"] for r in book.ranking]
+    assert cfg.dd_stop_benchmark not in book.weights
+    assert set(book.raw_holdings) <= set(names)
+
+
+def test_a_watched_name_is_ranked_but_never_held():
+    cfg, frame, names = _watch_fixture()
+    watched = cfg.dd_stop_benchmark          # a real non-constituent in the frame
+
+    plain = compute_targets(cfg, frame, requested=names, now=frame.index[-1])
+    book = compute_targets(cfg, frame, requested=names, now=frame.index[-1],
+                           watch_names=[watched])
+
+    assert [r["symbol"] for r in book.watchlist] == [watched]
+    assert not plain.watchlist
+    # Watching a name changes nothing about the book that holds it.
+    assert plain.weights == book.weights
+    assert plain.raw_holdings == book.raw_holdings
+    assert watched not in book.universe and watched not in book.weights
+
+    row = book.watchlist[0]
+    # A cutoff is the score of the name in that slot, so it exists only when
+    # the slot is filled. Reporting a number for a slot nobody occupies would
+    # claim a hurdle the watched name does not actually have to clear.
+    qualifying = len([r for r in book.ranking if r["rank"]])
+    assert (row["book_cutoff"] == row["book_cutoff"]) == \
+        (qualifying >= cfg.momentum.n_hold)
+    if row["book_cutoff"] == row["book_cutoff"] and row["band_cutoff"] == row["band_cutoff"]:
+        assert row["book_cutoff"] >= row["band_cutoff"], "the band must be easier"
+    if row["rank"] == row["rank"]:
+        assert row["beats_book"] == (row["rank"] <= cfg.momentum.n_hold)
+
+
+def test_a_filtered_out_watch_name_is_unranked_not_ranked_last(tmp_path):
+    """Losing to cash is not the same as placing last, and the log must say so."""
+    from qbs.shadow import watchlist_rows
+
+    cfg, frame, names = _watch_fixture()
+    safe = frame[cfg.momentum.safe_asset]
+    uni = frame[names]
+    # A name that only ever falls cannot clear the absolute filter.
+    falling = pd.DataFrame(
+        {"DOG": 100 * 0.999 ** np.arange(len(frame))}, index=frame.index)
+    rows = watchlist_rows(uni, safe, falling, cfg.momentum)
+
+    assert len(rows) == 1 and rows[0]["symbol"] == "DOG"
+    assert rows[0]["rank"] != rows[0]["rank"], "a filtered name must not get a rank"
+    assert rows[0]["beats_book"] is False
+
+    path = str(tmp_path / "watchlist_log.csv")
+    assert st.append_watchlist_csv(path, "2026-09-16", rows) == 1
+    import csv as _csv
+    got = list(_csv.DictReader(open(path)))
+    assert got[0]["rank"] == "", "an excluded name must not read as a weak one"
+    assert got[0]["beats_book"] == ""
+    # And the day is keyed, like every other appended log.
+    assert st.append_watchlist_csv(path, "2026-09-16", rows) == 0

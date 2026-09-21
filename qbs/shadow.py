@@ -109,3 +109,66 @@ def shadow_books(
             log.warning("shadow book w=%s could not be scored (%s: %s)",
                         w, type(exc).__name__, exc)
     return rows
+
+
+def watchlist_rows(
+    universe: pd.DataFrame,
+    safe_prices: pd.Series,
+    watch: pd.DataFrame,
+    params: Optional[MomentumParams] = None,
+    asof: Optional[pd.Timestamp] = None,
+) -> List[Dict]:
+    """Where a name outside the ranking universe would place, if it were in it.
+
+    For watching a stock the book cannot buy -- TSM is the case this was built
+    for: a semiconductor the whole book is correlated with, and not a Nasdaq-100
+    constituent. The question "is TSM stronger than what we hold?" is a real
+    one, and answering it by adding TSM to `extra_tickers` would have answered
+    a different question, because until this release anything in the price
+    frame was a name the ranker could put in the book.
+
+    So the watch names are ranked in a *copy* of the universe. The live book is
+    computed from the requested constituents and never sees them. What comes
+    back is each name's 6-1 momentum, the rank it would have taken, and the two
+    scores that make that rank mean something: the last name in the book and
+    the last name inside the band.
+
+    A rank of 7 does not mean the book should hold it. It means the book would
+    hold it if it were a constituent, which is a different claim, and the
+    reason this is a log rather than a signal.
+    """
+    p = params or MomentumParams()
+    names = [c for c in watch.columns if c not in universe.columns]
+    if not names:
+        return []
+
+    try:
+        frame = universe.join(watch[names], how="left")
+        sig = cross_sectional_momentum(frame, safe_prices, p,
+                                       record_ranks=frame.shape[1])
+        dt = asof or sig.weights.index[-1]
+        ranked = (sig.rank_log or {}).get(dt, [])
+    except Exception as exc:              # noqa: BLE001 -- a log must not raise
+        log.warning("watchlist could not be scored (%s: %s)", type(exc).__name__, exc)
+        return []
+
+    # The scores that give a rank its meaning: pass these and the book holds
+    # you, fail `band` and the book sells you.
+    scores = [sc for _, _, sc in ranked]
+    book_cut = scores[p.n_hold - 1] if len(scores) >= p.n_hold else float("nan")
+    band_cut = scores[p.exit_rank - 1] if len(scores) >= p.exit_rank else float("nan")
+
+    placed = {t: (r, sc) for t, r, sc in ranked}
+    rows: List[Dict] = []
+    for t in names:
+        rank, score = placed.get(t, (float("nan"), float("nan")))
+        rows.append(dict(
+            symbol=t, rank=rank, score=score,
+            book_cutoff=book_cut, band_cutoff=band_cut,
+            # Absent from the ranking means it was filtered out, not that it
+            # placed last: too little history, or it lost to the safe asset.
+            # Reporting that as "rank 99" would read as a weak name rather than
+            # an excluded one.
+            beats_book=bool(rank == rank and rank <= p.n_hold),
+        ))
+    return rows

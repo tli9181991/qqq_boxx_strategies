@@ -226,6 +226,45 @@ def write_book_csv(path: str,
 
 RANKING_CSV_COLUMNS = ["asof", "rank", "symbol", "score", "held"]
 SHADOW_CSV_COLUMNS = ["asof", "weight", "slot", "symbol", "rank", "live_held"]
+WATCHLIST_CSV_COLUMNS = ["asof", "symbol", "rank", "score", "book_cutoff",
+                         "band_cutoff", "beats_book"]
+
+
+def append_watchlist_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> int:
+    """Append one day's watchlist. Returns rows written; 0 if already there.
+
+    `rank` is blank when the name was filtered out rather than ranked low --
+    too little history, or it lost to the safe asset. Writing a number there
+    would make an excluded name look like a weak one.
+    """
+    if not rows:
+        return 0
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            if any(r.get("asof") == asof for r in csv.DictReader(f)):
+                log.info("watchlist for %s already logged in %s", asof, path)
+                return 0
+
+    def _num(v: Any, fmt: str) -> str:
+        return "" if v is None or v != v else format(float(v), fmt)
+
+    fresh = not os.path.exists(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=WATCHLIST_CSV_COLUMNS)
+        if fresh:
+            w.writeheader()
+        for r in rows:
+            w.writerow({
+                "asof": asof,
+                "symbol": r.get("symbol", ""),
+                "rank": _num(r.get("rank"), ".0f"),
+                "score": _num(r.get("score"), ".6f"),
+                "book_cutoff": _num(r.get("book_cutoff"), ".6f"),
+                "band_cutoff": _num(r.get("band_cutoff"), ".6f"),
+                "beats_book": "yes" if r.get("beats_book") else "",
+            })
+    return len(rows)
 
 
 def append_shadow_csv(path: str, asof: str, rows: List[Dict[str, Any]],
