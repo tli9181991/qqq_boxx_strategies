@@ -65,6 +65,32 @@ def available_backends() -> List[str]:
     return out
 
 
+def backend_note() -> Optional[str]:
+    """A warning when the configured backend is not the one that will run.
+
+    `available_backends` drops Tavily silently when the key is set but the
+    package is missing, which is the right behaviour for a picker and the
+    wrong one for a person: the search still works, so nothing looks broken,
+    and the headlines quietly come from DuckDuckGo instead. That is not a
+    cosmetic difference here -- Tavily's news results carry a published date
+    and DuckDuckGo's mostly do not, and the 12-hour window is applied on
+    those timestamps. A feed that silently lost them is a feed whose window
+    could not be checked.
+
+    None when there is nothing to say.
+    """
+    if os.environ.get("TAVILY_API_KEY"):
+        try:
+            import tavily  # noqa: F401
+        except ImportError:
+            return ("TAVILY_API_KEY is set but `tavily-python` is not "
+                    "installed, so the search is falling back to DuckDuckGo. "
+                    "`pip install tavily-python` to use the key. Most "
+                    "DuckDuckGo results carry no timestamp, so the time "
+                    "window cannot be checked on them.")
+    return None
+
+
 def search_web(
     query: str,
     max_results: int = 6,

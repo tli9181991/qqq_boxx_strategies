@@ -1240,3 +1240,73 @@ def test_final_text_skips_the_tool_calling_turn():
         AIMessage(content="the answer"),
     ]}
     assert _final_text(state) == "the answer"
+
+
+def test_a_tavily_key_without_the_package_is_not_silent(monkeypatch):
+    """A key that is set but cannot be used is worse than a missing one.
+
+    The search still works, so nothing looks broken -- the headlines just
+    quietly come from DuckDuckGo. That is not cosmetic here: the 12-hour
+    window is applied on each headline's own timestamp, and most DuckDuckGo
+    results have none.
+    """
+    import builtins
+
+    from qbs.agent import news as nw
+
+    real_import = builtins.__import__
+
+    def no_tavily(name, *a, **k):
+        if name == "tavily":
+            raise ImportError("no module named 'tavily'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_tavily)
+
+    monkeypatch.setenv("TAVILY_API_KEY", "sk-not-a-real-key")
+    note = nw.backend_note()
+    assert note and "tavily-python" in note and "DuckDuckGo" in note
+    assert "sk-not-a-real-key" not in note, "a warning must not echo the key"
+    # And the picker really has dropped it, which is what makes it silent.
+    assert "tavily" not in nw.available_backends()
+
+    # Nothing to say when the key is not set at all: that is a choice, not a
+    # misconfiguration, and warning about it would train people to ignore it.
+    monkeypatch.delenv("TAVILY_API_KEY")
+    assert nw.backend_note() is None
+
+
+def test_the_headlines_load_with_the_analyst_switched_off(monkeypatch, tmp_path):
+    """QBS_DISABLE_ANALYST stops the MODEL, not the news.
+
+    The whole point of the split in `read_news`: the headlines cost no key
+    and no money, so the master switch must leave them running and take only
+    the read on top.
+    """
+    import pandas as pd
+
+    from qbs.agent import news as nw
+    from qbs.agent import sentiment as snt
+    from qbs.agent.analyst import check_requirements
+
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    assert check_requirements(role="summary"), "the switch must block the read"
+
+    def fake_search(query, max_results=6, backend=None, days=None):
+        return ([nw.Result(title=f"Story for {query[:10]}",
+                           url=f"https://example.invalid/{abs(hash(query))}",
+                           snippet="", source="tavily",
+                           published=pd.Timestamp.now("UTC").isoformat())], None)
+
+    monkeypatch.setattr(snt.nw, "search_web", fake_search)
+    # Not "assert it was not called" -- make calling it impossible to miss.
+    monkeypatch.setattr(snt, "summarise", _never_called)
+
+    feed, summary, _ = snt.read_news(hours=12, summarise_it=False,
+                                     cache_dir=str(tmp_path))
+    assert feed.headlines, "the feed must still be fetched"
+    assert summary is None, "and nothing may have been read on top of it"
+
+
+def _never_called(*a, **k):
+    raise AssertionError("the model was called with the analyst switched off")

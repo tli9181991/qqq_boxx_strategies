@@ -56,7 +56,7 @@ def main(argv=None) -> int:
         from .env import (DISABLE_CHAT_VAR, DISABLE_VAR, KNOWN_KEYS,
                           analyst_disabled, chat_disabled, load_env,
                           resolve_google_key)
-        from .news import available_backends
+        from .news import available_backends, backend_note
         loaded = load_env()
         off = analyst_disabled()
         missing = check_requirements(role="chat")
@@ -74,6 +74,11 @@ def main(argv=None) -> int:
                  if budget is not None else " · no thinking budget sent"))
         print(f"summary model:   {DEFAULT_SUMMARY_MODEL} (news read, no thinking)")
         print(f"search backends: {', '.join(available_backends()) or 'none'}")
+        # A key that is set but cannot be used is worse than one that is
+        # missing: the search still works, so nothing looks wrong.
+        note = backend_note()
+        if note:
+            print(f"                 ⚠️  {note}")
         # The switch gets its own line and its own word. "NOT ready" reads as
         # a misconfiguration and sends someone hunting for one; "disabled on
         # purpose" tells them they already know the cause.

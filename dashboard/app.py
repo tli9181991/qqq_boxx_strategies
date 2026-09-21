@@ -734,7 +734,7 @@ from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
 from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_VAR, analyst_disabled,
                            chat_disabled, load_env)
 from qbs.agent.evidence import Book
-from qbs.agent.news import available_backends
+from qbs.agent.news import available_backends, backend_note
 from qbs.agent.sentiment import parse_published as snt_parse_published
 
 env_load = load_env()
@@ -1356,6 +1356,17 @@ with tab_news:
 
     # ---- the headlines, always ------------------------------------------
     st.markdown(f"#### Headlines — last {feed.hours} hours")
+    # Which backend actually served this, not which one is configured. The
+    # two differ silently when the key is set and the package is not, and
+    # this panel's whole window rests on timestamps only one of them sends.
+    _note = backend_note()
+    if _note:
+        st.warning(md(_note), icon="🔍")
+    elif feed.headlines:
+        _served = sorted({r.source for r in feed.headlines if r.source})
+        if _served:
+            st.caption("Searched with " + ", ".join(f"**{b}**" for b in _served)
+                       + ". No model is involved in fetching these.")
     if not feed.headlines:
         st.warning(
             "**No headlines came back.** "
