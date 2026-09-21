@@ -2,7 +2,7 @@
 
     streamlit run dashboard/app.py
 
-Two tabs:
+Four tabs:
 
 * **Daily picks** -- what each of the two selection strategies held on each
   day, with the entries and exits that changed it. The momentum book ranks the
@@ -10,6 +10,9 @@ Two tabs:
   absolute bar and can hold almost nothing.
 * **Market overview** -- the breadth monitor: 4% movers, percent holding the
   moving averages, index stretch in ATR units, and the momentum-leader group.
+* **News & sentiment** -- the last 12 hours of market headlines, always; plus
+  a model's read of them when one is configured and switched on.
+* **Analyst** -- the price panel again, and a chat over the lab's own tools.
 
 READ THE BANNER AT THE TOP OF THE MARKET TAB
 --------------------------------------------
@@ -197,25 +200,26 @@ SENTIMENT_TINT = {"bullish": UP_STRONG, "leaning bullish": UP,
                   "leaning bearish": DN, "bearish": DN_STRONG}
 
 
-@st.cache_data(show_spinner="Reading the last day of market news…")
-def load_sentiment(as_of: str, model: str, refresh_token: int, _run: bool):
-    """Today's news read, or None when it has not been asked for.
+@st.cache_data(ttl=1800, show_spinner="Fetching the last 12 hours of news…")
+def load_news(as_of: str, hours: int, model: str, refresh_token: int,
+              _summarise: bool):
+    """`(feed, summary, from_cache)` for the news tab.
 
-    Cached twice over: `st.cache_data` stops a rerun re-billing within a
-    session, and `sentiment.daily_sentiment` caches to disk so a restart does
-    not either. `as_of` in the key is what makes it roll over at midnight.
+    The feed is always fetched; the summary only when `_summarise` is set.
+    That split is the whole design -- the headlines are worth showing with no
+    model, no key and no money.
 
-    `_run` False returns whatever is already on disk and NEVER calls the
-    model -- that is the sidebar's "off" position, and it has to be incapable
-    of spending money rather than merely disinclined to.
+    Cached three ways, because each stops a different kind of waste. The
+    30-minute TTL stops a rerun re-searching. `sentiment.read_news` caches the
+    SUMMARY to disk, so a restart does not re-bill. And `_summarise` False
+    cannot reach the model at all -- the sidebar's off position has to be
+    incapable of spending, not merely disinclined to.
     """
     from qbs.agent import sentiment as snt
 
-    if not _run:
-        cached = snt.load_cached(as_of)
-        return (cached, True) if cached else (None, True)
-    return snt.daily_sentiment(refresh=refresh_token > 0, model=model or None,
-                               as_of=as_of)
+    return snt.read_news(hours=hours, summarise_it=_summarise,
+                         refresh=refresh_token > 0, model=model or None,
+                         as_of=as_of)
 
 
 @st.cache_data(show_spinner="Fetching the US universe from Finviz…")
@@ -648,6 +652,7 @@ from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
 from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
 from qbs.agent.evidence import Book
 from qbs.agent.news import available_backends
+from qbs.agent.sentiment import parse_published as snt_parse_published
 
 env_load = load_env()
 switched_off = analyst_disabled()
@@ -675,13 +680,15 @@ with st.sidebar:
         "Fetch fundamentals live", value=True,
         help="Off reads only what is already cached in data/fundamentals/.")
     daily_news = st.checkbox(
-        "Daily news summary", value=True, disabled=bool(blocker),
-        help="One Gemini call per day on the Market overview tab, cached to "
-             "data/sentiment/. Off means the panel only runs when you ask it to.")
+        "News sentiment analysis", value=True, disabled=bool(blocker),
+        help="One Gemini call per day on the News tab, cached to "
+             "data/sentiment/. Off still shows the headlines — only the "
+             "model's read of them goes away.")
 
 
-tab_picks, tab_market, tab_analyst = st.tabs(
-    ["📋 Daily picks", "📊 Market overview", "🤖 Analyst"])
+tab_picks, tab_market, tab_news, tab_analyst = st.tabs(
+    ["📋 Daily picks", "📊 Market overview", "📰 News & sentiment",
+     "🤖 Analyst"])
 
 
 # ==========================================================================
@@ -777,73 +784,6 @@ with tab_picks:
 with tab_market:
     freshness_banner()
 
-    # ---- last day's news, read by the model ------------------------------
-    st.subheader("What the news said")
-    st.session_state.setdefault("news_token", 0)
-    _today = pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
-    if blocker:
-        st.caption(
-            f"🔌 No news summary — {blocker.split(' — ')[0]}. Everything below "
-            "is computed from prices and needs no model.")
-    else:
-        summary, from_cache = load_sentiment(
-            _today, model_name.strip(), st.session_state["news_token"],
-            bool(daily_news))
-        head = st.columns([3, 1])
-        with head[1]:
-            if st.button("Re-read the news", width="stretch",
-                         help="One Gemini call. Otherwise this runs once a day "
-                              "and is served from data/sentiment/."):
-                st.session_state["news_token"] += 1
-                load_sentiment.clear()
-                st.rerun()
-        with head[0]:
-            if summary is None:
-                st.info(
-                    "The daily summary is switched off in the sidebar, and "
-                    "nothing is cached for today. **Re-read the news** runs it "
-                    "once.", icon="📰")
-            elif summary.error:
-                st.warning(f"**No news read today.** {summary.error}", icon="📰")
-            else:
-                tint = SENTIMENT_TINT.get(summary.label, "")
-                st.markdown(
-                    f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
-                    f"background:{tint or '#00000010'};display:inline-block'>"
-                    f"<b>{summary.label.upper()}</b></div>",
-                    unsafe_allow_html=True)
-                if summary.headline:
-                    st.markdown(f"**{summary.headline}**")
-                for b in summary.bullets:
-                    cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
-                    st.markdown(f"- {b['point']} {cites}")
-
-        if summary is not None and not summary.error:
-            with st.expander(f"Sources — {summary.n_articles} headlines"):
-                for src in summary.sources:
-                    stamp = f" · {src['published']}" if src.get("published") else ""
-                    title = (f"[{src['title']}]({src['url']})" if src.get("url")
-                             else src["title"])
-                    st.markdown(f"`[{src['n']}]` {title} — "
-                                f"*{src['source']}{stamp}*")
-            if summary.warnings:
-                with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
-                                 "from this summary"):
-                    for w in summary.warnings:
-                        st.markdown(f"- {w}")
-                    st.caption(
-                        "Bullets without a citation, and citations pointing "
-                        "outside the headline list, are removed before you see "
-                        "them — an unsourced claim in a finance summary cannot "
-                        "be told apart from a remembered one.")
-            st.caption(
-                f"🤖 {summary.model} over {summary.n_articles} headlines from "
-                f"the last day"
-                + (" · served from cache" if from_cache else " · fetched now")
-                + ". **This is a read of what was written, not a signal.** "
-                "Nothing here is backtested, nothing enters a strategy, and "
-                "every bullet points back to a headline you can open.")
-    st.divider()
 
     st.subheader("Breadth & momentum monitor")
 
@@ -1133,6 +1073,138 @@ with tab_market:
 # The tool trace below every answer is not a debug view. It is how a reader
 # checks a number against the call it came from, which is the only thing that
 # separates a research note from a fluent guess.
+
+with tab_news:
+    freshness_banner()
+    st.subheader("News & sentiment")
+
+    st.session_state.setdefault("news_token", 0)
+    _now = pd.Timestamp.now("UTC").tz_convert(None)
+    _today = _now.strftime("%Y-%m-%d")
+    NEWS_HOURS = 12
+
+    # The model is optional here, and that is the point of this tab: the
+    # headlines are worth reading with no key and no spend. `run_llm` gates
+    # only the read on top.
+    run_llm = bool(daily_news) and not blocker
+
+    top = st.columns([3, 1])
+    with top[1]:
+        if st.button("Refresh news", width="stretch",
+                     help="Re-search now. Also re-reads with the model when "
+                          "the sentiment analysis is on."):
+            st.session_state["news_token"] += 1
+            load_news.clear()
+            st.rerun()
+
+    feed, summary, from_cache = load_news(
+        _today, NEWS_HOURS, model_name.strip(),
+        st.session_state["news_token"], run_llm)
+
+    # ---- the read, when there is a model to do it ------------------------
+    with top[0]:
+        if not run_llm:
+            why = ("switched off in the sidebar" if not daily_news
+                   else blocker.split(" — ")[0])
+            st.info(
+                f"**Headlines only — no sentiment analysis** ({why}). "
+                "Everything below is the news itself, which needs no model.",
+                icon="📰")
+        elif summary is None or summary.error:
+            st.warning(
+                f"**No sentiment read.** "
+                f"{summary.error if summary else 'not run yet'}", icon="📰")
+        else:
+            tint = SENTIMENT_TINT.get(summary.label, "")
+            st.markdown(
+                f"<div style='padding:.55rem .9rem;border-radius:.4rem;"
+                f"background:{tint or '#00000010'};display:inline-block'>"
+                f"<b>{summary.label.upper()}</b></div>",
+                unsafe_allow_html=True)
+            if summary.headline:
+                st.markdown(f"**{summary.headline}**")
+            for b in summary.bullets:
+                cites = " ".join(f"`[{n}]`" for n in b.get("sources", []))
+                st.markdown(f"- {b['point']} {cites}")
+
+    if run_llm and summary is not None and not summary.error:
+        # A cached read of a DIFFERENT set of stories is still what the model
+        # said -- but saying so beats letting it pass as current.
+        if summary.fingerprint and summary.fingerprint != feed.fingerprint():
+            st.caption(
+                "🔁 This read covers an earlier set of stories than the "
+                "headlines below — the feed has moved on since. "
+                "**Refresh news** re-reads it.")
+        if summary.warnings:
+            with st.expander(f"⚠️ {len(summary.warnings)} thing(s) dropped "
+                             "from this summary"):
+                for w in summary.warnings:
+                    st.markdown(f"- {w}")
+                st.caption(
+                    "Bullets without a citation, and citations pointing "
+                    "outside the headline list, are removed before you see "
+                    "them — an unsourced claim in a finance summary cannot be "
+                    "told apart from a remembered one.")
+        st.caption(
+            f"🤖 {summary.model} over {summary.n_articles} headlines"
+            + (" · served from cache" if from_cache else " · read just now")
+            + ". **This is a read of what was written, not a signal.** Nothing "
+            "here is backtested and nothing enters a strategy; every bullet "
+            "points back to a numbered headline below.")
+
+    st.divider()
+
+    # ---- the headlines, always ------------------------------------------
+    st.markdown(f"#### Headlines — last {feed.hours} hours")
+    if not feed.headlines:
+        st.warning(
+            "**No headlines came back.** "
+            + ("; ".join(feed.errors) if feed.errors else
+               "the search returned nothing for any query."), icon="🔍")
+        st.caption(
+            "Run `python -m qbs.agent --check` in this app's environment to "
+            "see which search backends resolve. With none installed, "
+            "`pip install ddgs` adds the keyless one.")
+    else:
+        # Say what the window really cost. The backends' narrowest filter is
+        # one DAY, so the 12-hour window is applied here on each headline's
+        # own timestamp -- and a headline without one cannot be checked.
+        bits = [f"**{feed.total}** stories",
+                f"{feed.n_dated} timestamped inside the window"]
+        if feed.n_undated:
+            bits.append(f"**{feed.n_undated} undated** (kept, but the window "
+                        f"could not be checked)")
+        if feed.n_dropped:
+            bits.append(f"{feed.n_dropped} older than {feed.hours}h, dropped")
+        st.caption(" · ".join(bits))
+
+        for i, r in enumerate(feed.headlines, 1):
+            when = snt_parse_published(r.published)
+            age = ""
+            if when is not None:
+                mins = max(0, int((_now - when).total_seconds() // 60))
+                age = (f"{mins}m ago" if mins < 60 else
+                       f"{mins // 60}h {mins % 60:02d}m ago")
+            title = f"[{r.title}]({r.url})" if r.url else r.title
+            st.markdown(f"`[{i}]` **{title}**")
+            meta = " · ".join(x for x in (r.source, age or "no timestamp") if x)
+            st.caption(meta + ("" if age else
+                               " — this one could not be checked against the "
+                               "12-hour window"))
+            if r.snippet:
+                st.caption(r.snippet)
+
+        if feed.errors:
+            with st.expander(f"⚠️ {len(feed.errors)} search query "
+                             "returned an error"):
+                for e in feed.errors:
+                    st.markdown(f"- {e}")
+                st.caption(
+                    "Queries overlap on purpose, so one failing leaves a "
+                    "thinner feed rather than an empty one.")
+        st.caption(f"Fetched {feed.fetched_at.replace('T', ' ')} UTC · "
+                   "re-searched at most every 30 minutes.")
+
 
 with tab_analyst:
     freshness_banner()

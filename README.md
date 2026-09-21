@@ -880,30 +880,41 @@ Two tabs:
   from closes** — a body spanning previous-close to close with no wick asserts a
   session high and low that never happened, and a chart that lies about range is worse
   than one that admits it only has closes.
-- **Market overview** — opens with **What the news said**: a one-day read of market
-  news by the model, then the breadth monitor — 4% up/down counts, percent holding the
+- **Market overview** — the breadth monitor: 4% up/down counts, percent holding the
   20- and 50-day averages, index distance from its 50-day EMA in ATR units, and the
   momentum-leader group with its count trend.
+- **News & sentiment** — the last 12 hours of market headlines, **always**, and a
+  model's read of them **when one is available**. The headlines need no key, no model
+  and no spend; the read is what you add on top. With the analyst unconfigured or the
+  sidebar switch off, the tab says *"Headlines only — no sentiment analysis"* and shows
+  the news.
 
-  The news panel searches the last day, hands the headlines to Gemini **numbered**, and
-  requires every bullet to cite the numbers it came from. **A bullet with no citation is
-  dropped before you see it**, as is a citation pointing outside the headline list — an
-  unsourced claim in a finance summary cannot be told apart from a remembered one, and
-  the model's memory is a year stale. Whatever was removed is listed in a "dropped from
-  this summary" expander rather than silently discarded, and every source is one click
-  away.
+  **The 12-hour window is applied here, not by the search backend.** DuckDuckGo's
+  narrowest time filter is one *day* and Tavily's is whole days, so the tab fetches a
+  day and filters on each headline's own timestamp. A headline with no readable
+  timestamp is **kept** — most web results have none, and dropping them would empty the
+  panel — so the counter line says exactly how many stories the window could actually
+  be checked against. Setting `TAVILY_API_KEY` is worth it for this alone: its news
+  results carry `published_date`, where DuckDuckGo's web results mostly do not.
+
+  The read itself hands Gemini the headlines **numbered** and requires every bullet to
+  cite the numbers it came from. **A bullet with no citation is dropped before you see
+  it**, as is a citation pointing outside the headline list — an unsourced claim in a
+  finance summary cannot be told apart from a remembered one, and the model's memory is
+  a year stale. Whatever was removed is listed in a "dropped from this summary"
+  expander rather than silently discarded.
 
   **It is a read of what was written, not a signal.** Nothing in it is backtested and
   nothing enters a strategy. The package keeps a hard line between measured things
   (prices, screens, backtests) and read things (fundamentals, news, this), and
   everything on the read side is labelled as such.
 
-  **Cost:** one Gemini call a day. The result is cached per calendar day to
-  `data/sentiment/` so a restart does not re-bill and a Streamlit rerun costs nothing,
-  and a **failed** read is never cached — a quota error today would otherwise be served
-  as today's summary until tomorrow. *Daily news summary* in the sidebar turns the
-  automatic run off, in which case the panel shows what is on disk and only
-  **Re-read the news** will spend anything.
+  **Cost:** one Gemini call a day — about **73k tokens a month**, measured. The summary
+  is cached per calendar day to `data/sentiment/` so a restart does not re-bill, the
+  search is cached for 30 minutes so a rerun does not re-search, and a **failed** read
+  is never cached (a quota error today would otherwise be served as today's summary
+  until tomorrow). A cached read of a *different* set of stories is labelled as
+  superseded rather than passed off as current.
 
 **Data source** is a sidebar control:
 
