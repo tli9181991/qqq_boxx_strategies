@@ -1292,11 +1292,12 @@ def test_the_headlines_load_with_the_analyst_switched_off(monkeypatch, tmp_path)
     monkeypatch.setenv(env.DISABLE_VAR, "1")
     assert check_requirements(role="summary"), "the switch must block the read"
 
-    def fake_search(query, max_results=6, backend=None, days=None):
+    def fake_search(query, max_results=6, backend=None, days=None, merge=False):
         return ([nw.Result(title=f"Story for {query[:10]}",
                            url=f"https://example.invalid/{abs(hash(query))}",
-                           snippet="", source="tavily",
-                           published=pd.Timestamp.now("UTC").isoformat())], None)
+                           snippet="", source="example.invalid",
+                           published=pd.Timestamp.now("UTC").isoformat(),
+                           backend="tavily")], None)
 
     monkeypatch.setattr(snt.nw, "search_web", fake_search)
     # Not "assert it was not called" -- make calling it impossible to miss.
@@ -1310,3 +1311,140 @@ def test_the_headlines_load_with_the_analyst_switched_off(monkeypatch, tmp_path)
 
 def _never_called(*a, **k):
     raise AssertionError("the model was called with the analyst switched off")
+
+
+def _hit(title, url, published="", backend="tavily", source=""):
+    from qbs.agent import news as nw
+    return nw.Result(title=title, url=url, published=published,
+                     backend=backend, source=source or backend)
+
+
+def _two_backends(monkeypatch, tavily, ddg):
+    """Both engines available, each answering with a fixed list."""
+    from qbs.agent import news as nw
+    monkeypatch.setattr(nw, "available_backends",
+                        lambda: ["tavily", "duckduckgo"])
+    monkeypatch.setattr(nw, "_search_tavily", lambda q, n, d: list(tavily))
+    monkeypatch.setattr(nw, "_search_ddg", lambda q, n, d: list(ddg))
+    return nw
+
+
+def test_merge_takes_both_backends_and_fallback_still_takes_one(monkeypatch):
+    """The two modes are different questions, and both have a caller.
+
+    Fallback is for the chat -- many searches a conversation, so stopping at
+    the first engine that answers is the right trade. Merge is for the news
+    page, where one search stocks a page read once an hour and Tavily alone
+    comes back with only a handful of stories.
+    """
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds", "https://reuters.com/a")],
+        ddg=[_hit("Oil slips", "https://cnbc.com/c", backend="duckduckgo")])
+
+    res, err = nw.search_web("q", days=1)
+    assert [r.backend for r in res] == ["tavily"], "fallback stops at the first"
+    assert err is None
+
+    res, err = nw.search_web("q", days=1, merge=True)
+    assert [r.backend for r in res] == ["tavily", "duckduckgo"]
+    assert err is None
+
+
+def test_a_merge_counts_one_story_once(monkeypatch):
+    """Two backends finding the same article is the ordinary case, not an
+    edge one, so `max_results` has to mean distinct stories."""
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds rates", "https://reuters.com/a")],
+        # Same article: a trailing slash and a headline punctuated its way.
+        ddg=[_hit("Fed Holds Rates!", "https://reuters.com/a/",
+                  backend="duckduckgo")])
+
+    res, _ = nw.search_web("q", days=1, merge=True)
+    assert len(res) == 1, "one article, found twice, is one headline"
+
+
+def test_a_dated_duplicate_upgrades_an_undated_one(monkeypatch):
+    """The 12-hour window is applied on these timestamps, so a dated copy of
+    a story we are holding undated is an upgrade, not a repeat."""
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds", "https://reuters.com/a", published="")],
+        ddg=[_hit("Fed holds", "https://reuters.com/a",
+                  published="2026-09-21T11:00:00Z", backend="duckduckgo")])
+
+    res, _ = nw.search_web("q", days=1, merge=True)
+    assert len(res) == 1
+    assert res[0].published == "2026-09-21T11:00:00Z"
+    assert res[0].backend == "tavily", "the kept row is still the one we kept"
+
+
+def test_one_backend_down_returns_the_other_and_says_so(monkeypatch):
+    """A thin page and a full one must not look identical."""
+    from qbs.agent import news as nw
+
+    def dead(q, n, d):
+        raise RuntimeError("rate limited")
+
+    nw_ = _two_backends(monkeypatch, tavily=[],
+                        ddg=[_hit("Oil slips", "https://cnbc.com/c",
+                                  backend="duckduckgo")])
+    monkeypatch.setattr(nw, "_search_tavily", dead)
+
+    res, err = nw_.search_web("q", days=1, merge=True)
+    assert len(res) == 1, "the surviving backend still fills the page"
+    assert err and "tavily" in err and "rate limited" in err
+
+
+def test_the_outlet_is_not_the_search_engine(monkeypatch):
+    """`source` answers "who wrote this" and `backend` answers "how did we
+    find it". They were one field, which put the string "tavily" where the
+    prompt and the UI both read a publisher's name."""
+    from qbs.agent import news as nw
+
+    monkeypatch.setenv("TAVILY_API_KEY", "k")
+    monkeypatch.setattr(
+        nw, "TavilyClient", None, raising=False)
+
+    class FakeClient:
+        def __init__(self, api_key): pass
+        def search(self, query, **kw):
+            return {"results": [{"title": "Fed holds",
+                                 "url": "https://www.reuters.com/markets/x",
+                                 "content": "body",
+                                 "published_date": "2026-09-21"}]}
+
+    import sys
+    import types
+    mod = types.ModuleType("tavily")
+    mod.TavilyClient = FakeClient
+    monkeypatch.setitem(sys.modules, "tavily", mod)
+
+    out = nw._search_tavily("q", 5, 1)
+    assert out[0].backend == "tavily"
+    assert out[0].source == "reuters.com", "the outlet, read off the URL"
+
+
+def test_the_feed_reports_the_backends_that_actually_answered(monkeypatch):
+    """Read off the results, not off the configuration: a key that is set and
+    an engine that answered are different claims."""
+    import pandas as pd
+
+    from qbs.agent import news as nw
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21T12:00:00")
+
+    def fake(query, max_results=6, backend=None, days=None, merge=False):
+        assert merge, "the news feed asks every engine"
+        return ([_hit("A", f"https://a.invalid/{abs(hash(query))}",
+                      published="2026-09-21T11:00:00Z"),
+                 _hit("B", f"https://b.invalid/{abs(hash(query))}",
+                      published="2026-09-21T11:30:00Z",
+                      backend="duckduckgo")], None)
+
+    monkeypatch.setattr(snt.nw, "search_web", fake)
+    feed = snt.fetch_news(hours=12, now=now)
+    assert feed.backends == ["duckduckgo", "tavily"]
+    assert feed.total == 2 * len(snt.MARKET_QUERIES), "one pair per query"

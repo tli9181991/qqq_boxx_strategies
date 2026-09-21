@@ -1362,11 +1362,14 @@ with tab_news:
     _note = backend_note()
     if _note:
         st.warning(md(_note), icon="🔍")
-    elif feed.headlines:
-        _served = sorted({r.source for r in feed.headlines if r.source})
-        if _served:
-            st.caption("Searched with " + ", ".join(f"**{b}**" for b in _served)
-                       + ". No model is involved in fetching these.")
+    if feed.backends:
+        # `feed.backends`, not the result's `source` -- that one is the
+        # OUTLET (Reuters, CNBC), so reading backends off it printed
+        # publishers where search engines belonged.
+        st.caption("Searched with " + ", ".join(f"**{b}**" for b in feed.backends)
+                   + (" (both, merged and de-duplicated)"
+                      if len(feed.backends) > 1 else "")
+                   + ". No model is involved in fetching these.")
     if not feed.headlines:
         st.warning(
             "**No headlines came back.** "

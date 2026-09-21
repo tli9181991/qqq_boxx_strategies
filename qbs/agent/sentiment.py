@@ -98,6 +98,11 @@ class NewsFeed:
     n_dated: int = 0          # in-window and carrying a readable timestamp
     n_undated: int = 0        # kept, but the window could not be checked
     n_dropped: int = 0        # dated and older than the window
+    # Which search engines actually put a headline on this page. Read off the
+    # results rather than off the configuration: a key that is set and a
+    # backend that answered are different claims, and only the second one is
+    # worth printing under a feed.
+    backends: List[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -149,6 +154,7 @@ def fetch_news(
     per_query: int = 8,
     queries: Sequence[str] = MARKET_QUERIES,
     now: Optional[pd.Timestamp] = None,
+    merge_backends: bool = True,
 ) -> NewsFeed:
     """The last `hours` of market news, de-duplicated and newest first.
 
@@ -164,6 +170,15 @@ def fetch_news(
     four is a thinner read, and losing the other three to it would be the
     wrong trade. An empty feed with errors attached is a different thing from
     an empty feed without, and the caller can tell them apart.
+
+    `merge_backends` asks every available search engine instead of stopping
+    at the first that answers, and defaults to on HERE and nowhere else. This
+    is a page read once an hour, so the second search costs a second of
+    latency and buys a materially fuller page: Tavily returns a handful of
+    well-formed dated articles, DuckDuckGo returns more of them with fewer
+    dates, and neither on its own is the day's news. The chat keeps the
+    fallback chain, where the same trade is many searches a conversation for
+    results nobody reads as a list.
     """
     now = now or pd.Timestamp.now("UTC").tz_convert(None)
     cutoff = now - pd.Timedelta(hours=hours)
@@ -173,11 +188,17 @@ def fetch_news(
     for q in queries:
         # `days=1` is the narrowest any backend offers; the real window is
         # the timestamp filter below.
-        results, err = nw.search_web(q, max_results=per_query, days=1)
+        results, err = nw.search_web(q, max_results=per_query, days=1,
+                                     merge=merge_backends)
+        # With a merge, `err` can arrive next to results -- one engine down
+        # and another up. Recording it either way is what keeps a thin page
+        # distinguishable from a full one.
         if err:
             errors.append(f"{q!r}: {err}")
         for r in results:
-            key = (r.url or r.title).strip().lower()
+            # `nw._dedup_key`, so one story does not count twice because two
+            # backends punctuated its title differently.
+            key = nw._dedup_key(r)
             if not key or key in seen:
                 continue
             seen.add(key)
@@ -198,7 +219,8 @@ def fetch_news(
               reverse=True)
     return NewsFeed(hours=hours, fetched_at=now.isoformat(timespec="seconds"),
                     headlines=kept, errors=errors, n_dated=n_dated,
-                    n_undated=n_undated, n_dropped=n_dropped)
+                    n_undated=n_undated, n_dropped=n_dropped,
+                    backends=sorted({r.backend for r in kept if r.backend}))
 
 
 def headlines_block(headlines: Sequence[nw.Result]) -> str:
