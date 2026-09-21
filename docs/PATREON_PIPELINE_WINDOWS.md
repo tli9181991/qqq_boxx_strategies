@@ -29,6 +29,7 @@ Scheduled Tasks below cover the same ground. Go native.
 ```powershell
 winget install Python.Python.3.12
 winget install Gyan.FFmpeg          # both stages need it
+winget install Rclone.Rclone        # how files reach Drive
 winget install Mozilla.Firefox
 ```
 
@@ -62,7 +63,10 @@ Then the five things the installer cannot do for you:
 2. Edit `deploy\windows\patreon.env` — Gmail app password, probe URL.
 3. Edit `C:\ProgramData\PatreonPipeline\config.json` — campaign URLs, Whisper
    vocabulary.
-4. `.\run.ps1 auth` — the one-time Google Drive consent flow.
+4. `rclone config` — the one-time Google Drive authorisation. rclone carries
+   its own registered OAuth client, so there is no Google Cloud project to
+   create and no consent screen to publish. `.\run.ps1 auth` prints the exact
+   answers to give its prompts.
 5. Stop the machine sleeping (below).
 
 ## The Windows-specific traps
@@ -155,6 +159,46 @@ Get-ScheduledTaskInfo -TaskName PatreonPipeline-Work   # last result, last run
 `LastTaskResult` of `3` means the Patreon session expired: log into Patreon in
 Firefox again and the worker picks up by itself on its next restart, with
 nothing lost from the queue.
+
+## Uninstalling
+
+```powershell
+.\uninstall.ps1
+```
+
+By default that does the safe half only: stops and unregisters the four
+Scheduled Tasks, and touches nothing else. "Uninstall" usually means "make it
+stop", and the data left behind is the part that is expensive to get back.
+
+Everything destructive is opt-in, prompts first, and honours `-WhatIf`:
+
+| Flag | Removes |
+| --- | --- |
+| `-RemoveState` | Queue database, staging, logs, `config.json` |
+| `-RemoveModels` | Cached Whisper models (~1.5 GB) |
+| `-RemoveVenv` | The virtualenv |
+| `-RemoveCredentials` | `patreon.env`, plus any leftover Drive API secret or token |
+| `-RemoveRcloneRemote` | Only the pipeline's rclone remote, leaving your others alone |
+| `-All` | All of the above |
+
+See exactly what a full teardown would delete, without deleting anything:
+
+```powershell
+.\uninstall.ps1 -All -WhatIf
+```
+
+Two things worth knowing:
+
+- **`pipeline.db` is the record of every post already downloaded.** Delete it
+  and the next sweep re-downloads everything it finds. That is why it is not
+  part of the default.
+- **Deleting a local credential does not revoke it.** The Gmail app password
+  and the Drive grant stay live in your Google account until you revoke them at
+  [apppasswords](https://myaccount.google.com/apppasswords) and
+  [permissions](https://myaccount.google.com/permissions). The script prints
+  both links when it removes credentials.
+
+The repository, and anything already uploaded to Drive, are never touched.
 
 ## Benchmark Whisper before trusting it
 

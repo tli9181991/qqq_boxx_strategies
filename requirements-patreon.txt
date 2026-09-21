@@ -33,3 +33,11 @@ faster-whisper>=1.0.0
 # yt-dlp's separate audio/video streams and extracts the 16 kHz mono audio
 # Whisper wants.
 #   sudo apt install ffmpeg
+#
+# rclone is the other non-pip runtime dependency: it is the default upload
+# backend, and it ships with its own registered Google OAuth client, which
+# is what removes the need for a Google Cloud project entirely.
+#   winget install Rclone.Rclone   (Windows)
+#   sudo apt install rclone        (Debian/Ubuntu)
+# Then `rclone config` once. Set uploader to "drive" to use the Drive API
+# client instead, which needs no binary but does need a Cloud project.

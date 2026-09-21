@@ -23,7 +23,7 @@ import os
 import sys
 from typing import List, Optional
 
-from . import drive, mail, store, transcribe as transcribe_mod, worker
+from . import drive, mail, store, transcribe as transcribe_mod, upload, worker
 from .config import PipelineConfig
 from .worker import EXIT_AUTH, EXIT_CONFIG, EXIT_ERROR, EXIT_OK
 
@@ -221,6 +221,11 @@ def main(argv=None) -> int:
 
     if args.command == "config":
         print(cfg.describe())
+        try:
+            upload.backend(cfg).check()
+            print(f"\nuploader: {cfg.uploader} -- OK")
+        except upload.UploadError as exc:
+            print(f"\nuploader: {cfg.uploader} -- NOT READY: {exc}")
         return EXIT_OK
 
     problems = cfg.validate(need_mail=args.command == "watch")
@@ -231,6 +236,30 @@ def main(argv=None) -> int:
 
     try:
         if args.command == "auth":
+            if cfg.uploader == "rclone":
+                # Nothing for this program to do: rclone owns its own
+                # credentials, and duplicating its setup wizard would only
+                # create a second place for it to go wrong.
+                print(
+                    "This install uploads through rclone, which keeps its own\n"
+                    "credentials -- there is no token for the pipeline to fetch.\n"
+                    "\n"
+                    "Run rclone's own setup once:\n"
+                    "\n"
+                    "    rclone config\n"
+                    "\n"
+                    f"  n) New remote\n"
+                    f"  name> {cfg.rclone_remote}\n"
+                    "  Storage> drive\n"
+                    "  client_id / client_secret> (leave both blank)\n"
+                    "  scope> 1   (full access)\n"
+                    "  Edit advanced config? n\n"
+                    "  Use web browser to automatically authenticate? y\n"
+                    "\n"
+                    "Then check it with:\n"
+                    "\n"
+                    f"    rclone lsd {cfg.rclone_remote}:\n")
+                return EXIT_OK
             path = drive.authorize(cfg, console=args.console)
             print(f"authorised; token saved to {path}")
             return EXIT_OK

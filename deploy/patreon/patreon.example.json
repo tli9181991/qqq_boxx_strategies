@@ -10,7 +10,10 @@
 
   "cookies_from_browser": "firefox",
 
-  "drive_folder_name": "Patreon",
+  "_uploads": "rclone carries its own registered Google OAuth client, so there is no Cloud project to create, no consent screen to publish and no seven-day token expiry. Run `rclone config` once and name the remote to match rclone_remote below. Set uploader to 'drive' instead to use a Drive API client you register yourself.",
+  "uploader": "rclone",
+  "rclone_remote": "gdrive",
+  "rclone_base_path": "Patreon",
   "drive_subfolder_per_creator": true,
 
   "_transcription": "Both artefacts are uploaded by default, so you can hand Gemini either the video or the transcript. Set upload_media false for a transcript-only archive (megabytes instead of terabytes); set transcribe false to skip Whisper entirely.",
