@@ -29,11 +29,13 @@ and reports what it skipped, so `GOOGLE_API_KEY=... python -m qbs.agent` does
 what you would expect even with a `.env` sitting next to it. Pass
 `override=True` only if you mean the opposite.
 
-The kill switch
----------------
-`QBS_DISABLE_ANALYST=1` -- here rather than in `analyst.py` because it is read
-the same way as the keys, from the environment or a `.env`, and `--check`
-reports all of them together. See `analyst_disabled`.
+The kill switches
+-----------------
+`QBS_DISABLE_ANALYST=1` stops every Gemini call in the package;
+`QBS_DISABLE_CHAT=1` stops only the Analyst tab's chat and leaves the news
+read running. Both live here rather than in `analyst.py` because they are
+read the same way as the keys, from the environment or a `.env`, and
+`--check` reports them together. See `analyst_disabled` and `chat_disabled`.
 
 Secrets
 -------
@@ -52,14 +54,19 @@ from typing import Dict, List, Optional, Tuple
 # The repository root: qbs/agent/env.py -> qbs/agent -> qbs -> root
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# The kill switch. Set it and no Gemini call is made from anywhere in this
-# package -- see `analyst_disabled`.
+# The kill switches. `QBS_DISABLE_ANALYST` is the master -- set it and no
+# Gemini call is made from anywhere in this package. `QBS_DISABLE_CHAT` is
+# narrower: it stops the Analyst tab's chat while leaving the news read
+# working, which is what you want when testing one feature at a time or when
+# the chat is the expensive half and the daily summary is not.
 DISABLE_VAR = "QBS_DISABLE_ANALYST"
+DISABLE_CHAT_VAR = "QBS_DISABLE_CHAT"
 
 # The keys this package looks for. Listed so `--check` can report on all of
 # them, and so a typo in a `.env` can be pointed out rather than ignored.
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
-              "QBS_GEMINI_MODEL", DISABLE_VAR)
+              "QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL", "QBS_THINKING_BUDGET",
+              "QBS_DASH_WATCHLIST", DISABLE_VAR, DISABLE_CHAT_VAR)
 
 # Values that mean "switch is off, carry on". Everything else non-empty
 # disables -- see `analyst_disabled` for why this is not `_env_bool`.
@@ -257,6 +264,29 @@ def analyst_disabled(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
     return (f"the analyst is switched off by {DISABLE_VAR}={raw!r}. "
             f"Unset it (or set it to 0) to turn Gemini back on; everything "
             f"that does not call the model is unaffected.")
+
+
+def chat_disabled(environ: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Why the Analyst tab's CHAT is switched off, or None if it is not.
+
+    The master switch wins and is reported as the reason: someone who set
+    `QBS_DISABLE_ANALYST` needs to be told that, not handed a message about a
+    chat switch they never touched.
+
+    Same fail-safe reading as `analyst_disabled` -- only an explicit off-word
+    re-enables, so an unrecognised value stops the spending rather than
+    quietly leaving it on.
+    """
+    env = os.environ if environ is None else environ
+    master = analyst_disabled(env)
+    if master:
+        return master
+    raw = (env.get(DISABLE_CHAT_VAR) or "").strip()
+    if not raw or raw.lower() in OFF_VALUES:
+        return None
+    return (f"the chat is switched off by {DISABLE_CHAT_VAR}={raw!r}. "
+            f"Unset it (or set it to 0) to turn it back on; the news "
+            f"sentiment read is unaffected and still runs.")
 
 
 def resolve_google_key(environ: Optional[Dict[str, str]] = None) -> Optional[str]:

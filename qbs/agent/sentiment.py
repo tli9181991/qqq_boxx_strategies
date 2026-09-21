@@ -334,11 +334,18 @@ def summarise(
                        error="no headlines were retrieved, so there is nothing "
                              "to summarise")
 
-    from .analyst import DEFAULT_MODEL, build_model
+    from .analyst import DEFAULT_SUMMARY_MODEL, build_model
 
-    name = model or DEFAULT_MODEL
+    # The SUMMARY model, not the chat one. This is a single call a day over
+    # ~30 headlines, so the stronger model costs pennies a month and the
+    # cost argument that shapes the chat does not apply here.
+    #
+    # `thinking_budget=None` sends no budget at all: this is extraction into
+    # a fixed JSON shape, not multi-step reasoning, and paying for thinking
+    # tokens to restate headlines is spending without buying anything.
+    name = model or DEFAULT_SUMMARY_MODEL
     try:
-        llm = build_model(name)
+        llm = build_model(name, thinking_budget=None)
         reply = llm.invoke(PROMPT + headlines_block(headlines))
     except Exception as exc:              # noqa: BLE001 -- API, quota, network
         return Summary(as_of=as_of, hours=feed.hours, model=name,

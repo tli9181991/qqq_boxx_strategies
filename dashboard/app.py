@@ -44,12 +44,14 @@ from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
-from qbs.config import BreakoutParams, Config, FinvizScreenParams
+from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
+                        MomentumParams)
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_us_universe,
                         load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.screens import finviz_momentum_screen
+from qbs.shadow import parse_watchlist, watchlist_rows
 from qbs.strategies import cross_sectional_momentum
 from qbs.universe import load_universe, load_universe_prices
 
@@ -187,6 +189,58 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
         out[key] = pd.DataFrame(rows).set_index("date")
 
     return out, volume_applied
+
+
+@st.cache_data(show_spinner="Loading watchlist prices…")
+def load_watch_prices(tickers: tuple, download_start: str, online: bool,
+                      through: str, _token: int):
+    """Closes for watched names that are NOT in the ranking universe.
+
+    Returns `(frame, errors)`. Each name is fetched on its own and a failure
+    is reported by name rather than raised: a typo in a watchlist is the
+    common case, and it should cost that one row, not the panel.
+
+    The cache is read first and re-downloaded only when it ends before
+    `through` (the universe's last bar). A watched name a week behind the
+    book would be ranked on a week-old price against today's constituents,
+    which is a comparison of two different days dressed up as one.
+    """
+    rows: Dict[str, pd.Series] = {}
+    errors: Dict[str, str] = {}
+    last = pd.Timestamp(through)
+    for t in tickers:
+        s, err = None, None
+        try:
+            s = load_prices([t], start=download_start, offline=True)[t]
+        except Exception as exc:  # noqa: BLE001
+            err = f"{type(exc).__name__}: {exc}"
+        if online and (s is None or s.index.max() < last):
+            try:
+                s = load_prices([t], start=download_start, refresh=True,
+                                offline=False)[t]
+                err = None
+            except Exception as exc:  # noqa: BLE001
+                if s is None:
+                    err = f"{type(exc).__name__}: {exc}"
+        if s is None:
+            errors[t] = err or "no data"
+        else:
+            rows[t] = s
+    return (pd.DataFrame(rows) if rows else pd.DataFrame()), errors
+
+
+@st.cache_data(show_spinner="Ranking the watchlist…")
+def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _watch: pd.DataFrame,
+               names: str, n_hold: int, exit_rank: int, asof: pd.Timestamp):
+    """`watchlist_rows` behind a cache.
+
+    `names` is in the signature only to be hashed -- the frames are passed
+    with a leading underscore, so without it the cache key would not change
+    when the watchlist does and editing the box would show the old ranking.
+    """
+    return watchlist_rows(_uni, _safe, _watch,
+                          MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
+                          asof=asof)
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -382,6 +436,32 @@ n_screen = st.sidebar.number_input(
     help="How many names the high-momentum screen ranks down to. On the "
          "Nasdaq-100 universe fewer than this usually qualify, so the column "
          "shows everyone who passed.")
+
+# Loaded here, not with the Analyst settings further down, because the
+# default below reads the environment and this box is rendered first. The
+# load is cached per file, so the later call is free.
+from qbs.agent.env import load_env as _load_env
+_load_env()
+# Deliberately NOT `QBS_WATCHLIST`. That one belongs to the live runner and
+# lives in deploy/docker/.env on the trading host; this one belongs to the
+# dashboard and lives in the repo root's .env. Different files already, but
+# the same NAME would collide the moment both run on one host with the
+# runner's env exported into the shell -- and then changing what the
+# dashboard charts would quietly change what the runner logs. Two names, no
+# fallback between them: a fallback is the coupling this is removing.
+WATCHLIST_VAR = "QBS_DASH_WATCHLIST"
+watch_raw = st.sidebar.text_input(
+    "Watchlist", os.environ.get(WATCHLIST_VAR, ""),
+    help="Names to rank beside the book without letting the book buy them — "
+         "comma or space separated. Anything outside the index is "
+         f"interpolated into the constituents' ranking. Set {WATCHLIST_VAR} "
+         "in the repo root's .env to seed this box. The live runner's own "
+         "watchlist (QBS_WATCHLIST, in deploy/docker/.env) is separate and "
+         "nothing here touches it.")
+# The runner's parser, not a second one that agrees with it today. The two
+# watchlists are different lists; they should still mean the same thing by
+# "TSM, googl".
+WATCHLIST = parse_watchlist(watch_raw)
 
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
 # app force-refreshed on EVERY start -- re-downloading the whole universe
@@ -648,29 +728,58 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 # needs `model_name` for its news summary, and a sidebar control created in a
 # later tab does not exist yet when an earlier one reads it.
 
-from qbs.agent.analyst import DEFAULT_MODEL, analyse, check_requirements
-from qbs.agent.env import DISABLE_VAR, analyst_disabled, load_env
+from qbs.agent.analyst import (DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL,
+                               _default_thinking_budget, analyse,
+                               check_requirements)
+from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_VAR, analyst_disabled,
+                           chat_disabled, load_env)
 from qbs.agent.evidence import Book
 from qbs.agent.news import available_backends
 from qbs.agent.sentiment import parse_published as snt_parse_published
 
 env_load = load_env()
 switched_off = analyst_disabled()
-blocker = check_requirements()
+chat_off = chat_disabled()
+# Two blockers, because the two features can be switched off independently:
+# the chat has its own kill switch and the news read does not answer to it.
+chat_blocker = check_requirements(role="chat")
+news_blocker = check_requirements(role="summary")
+blocker = chat_blocker                    # the Analyst tab's own gate
 backends = available_backends()
 
 with st.sidebar:
     st.markdown("---")
     st.markdown("**Analyst**")
+    # The controls below stay editable on purpose -- you can line the model and
+    # the toggles up while something is off -- but without this they read as an
+    # analyst that is simply misbehaving.
     if switched_off:
-        # The controls below stay editable on purpose -- you can line the model
-        # and the toggles up while it is off -- but without this they read as
-        # an analyst that is simply misbehaving.
-        st.caption(f"⏸️ switched off by `{DISABLE_VAR}`. These settings are "
-                   "saved for when it is switched back on.")
-    model_name = st.text_input("Gemini model", DEFAULT_MODEL,
-                               help="Model names move faster than this app. "
-                                    "Override here or set QBS_GEMINI_MODEL.")
+        st.caption(f"⏸️ everything switched off by `{DISABLE_VAR}`. These "
+                   "settings are saved for when it is switched back on.")
+    elif chat_off:
+        st.caption(f"⏸️ chat only, switched off by `{DISABLE_CHAT_VAR}`. "
+                   "The news read still runs.")
+    # Two models, because they are not the same job: the chat reasons over
+    # tool output turn after turn (~17x the news panel's token usage), while
+    # the news read is one call a day. Cheap-and-thinking for the first,
+    # strong for the second.
+    model_name = st.text_input("Chat model", DEFAULT_MODEL,
+                               help="The Analyst tab's chat. Reasons over tool "
+                                    "output every turn, so it is the expensive "
+                                    "one. Override here or set QBS_GEMINI_MODEL.")
+    thinking = st.number_input(
+        "Thinking budget", min_value=-1, max_value=32768,
+        value=int(_default_thinking_budget() or -1), step=512,
+        help="Chat model only. −1 lets it decide, 0 turns thinking off, a "
+             "positive number caps it in tokens. The accepted range is "
+             "model-specific — the API rejects a bad one, this app does not "
+             "second-guess it. Or set QBS_THINKING_BUDGET.")
+    summary_model = st.text_input(
+        "News summary model", DEFAULT_SUMMARY_MODEL,
+        help="The News tab. One call a day over ~30 headlines, so the stronger "
+             "model costs pennies a month. No thinking budget is sent — this "
+             "is extraction into a fixed shape, not multi-step reasoning. "
+             "Or set QBS_SUMMARY_MODEL.")
     allow_web = st.checkbox("Allow web search", value=bool(backends),
                             disabled=not backends,
                             help=("Search backends found: "
@@ -680,7 +789,7 @@ with st.sidebar:
         "Fetch fundamentals live", value=True,
         help="Off reads only what is already cached in data/fundamentals/.")
     daily_news = st.checkbox(
-        "News sentiment analysis", value=True, disabled=bool(blocker),
+        "News sentiment analysis", value=True, disabled=bool(news_blocker),
         help="One Gemini call per day on the News tab, cached to "
              "data/sentiment/. Off still shows the headlines — only the "
              "model's read of them goes away.")
@@ -759,6 +868,97 @@ with tab_picks:
         f"{', '.join(sorted(common)) if common else 'no overlap'} "
         f"({len(common)} of {len(picks['momentum']) or '—'} momentum names)"
     )
+
+    # ---- watchlist: where a name places, without the book buying it -----
+    st.divider()
+    st.markdown("#### Watchlist rank")
+    if not WATCHLIST:
+        st.caption(md(
+            "Nothing watched. Put tickers in the sidebar box (or set "
+            f"`{WATCHLIST_VAR}` in the repo root's `.env`) to see where they "
+            "place in the ranking the book acts on. A name outside the index "
+            "is interpolated into that ranking without joining it."))
+    else:
+        outsiders = tuple(t for t in WATCHLIST if t not in uni.columns)
+        watch_px, watch_err = load_watch_prices(
+            outsiders, download_start, bool(online), f"{LAST_BAR:%Y-%m-%d}",
+            st.session_state["refresh_token"])
+
+        # Constituents are read from the universe frame that was ranked, not
+        # re-downloaded: the row has to report the rank the book acted on,
+        # and a second copy of the same prices is how the two drift apart.
+        watch_cols: Dict[str, pd.Series] = {}
+        for t in WATCHLIST:
+            if t in uni.columns:
+                watch_cols[t] = uni[t]
+            elif t in watch_px.columns:
+                watch_cols[t] = watch_px[t].reindex(uni.index).ffill()
+
+        if watch_err:
+            # The remedy depends on the mode. Telling someone to go online
+            # when they already are, and the download is what failed, sends
+            # them to fix the wrong thing.
+            remedy = ("Check the spelling — a name the provider does not "
+                      "know cannot be ranked."
+                      if online else
+                      "Offline mode reads only the CSV cache in `data/`. "
+                      "Switch **Source** to Online to fetch a name for the "
+                      "first time.")
+            st.warning(md("No prices for " + ", ".join(
+                f"**{t}** ({e})" for t, e in watch_err.items())
+                + ". " + remedy), icon="⚠️")
+
+        rows = (watch_rows(uni, px["BOXX"], pd.DataFrame(watch_cols),
+                           ",".join(WATCHLIST), int(n_hold), int(exit_rank),
+                           asof)
+                if watch_cols else [])
+        if not rows:
+            st.info("Nothing on the watchlist could be ranked on this date.")
+        else:
+            wf = pd.DataFrame(rows)
+            # NaN sorts last: a name with too little history is unranked, not
+            # top of the list.
+            wf = wf.sort_values("rank", na_position="last").reset_index(drop=True)
+            show_w = pd.DataFrame({
+                "Ticker": wf["symbol"],
+                "Rank": [fmt(r, "{:.0f}") for r in wf["rank"]],
+                "Placed": ["in index" if c else "interpolated"
+                           for c in wf["constituent"]],
+                "Score": [fmt(v, "{:+.3f}") for v in wf["score"]],
+                f"Book cutoff (#{int(n_hold)})":
+                    [fmt(v, "{:+.3f}") for v in wf["book_cutoff"]],
+                f"Band cutoff (#{int(exit_rank)})":
+                    [fmt(v, "{:+.3f}") for v in wf["band_cutoff"]],
+                "Beats the book": ["✅" if b else "—" for b in wf["beats_book"]],
+            })
+            beats = list(wf["beats_book"])
+            st.dataframe(
+                show_w.style.apply(
+                    lambda _col: [f"background-color: {UP}" if b else ""
+                                  for b in beats],
+                    subset=["Rank"]),
+                hide_index=True, width="stretch",
+                height=min(420, 38 + 35 * len(show_w)))
+            n_out = int((~wf["constituent"]).sum())
+            # Said only when there is an interpolated row to say it about.
+            # "the 0 outsiders are interpolated" explains a distinction the
+            # table is not currently making.
+            outsider_note = (
+                f" The {n_out} interpolated "
+                f"{'row shows' if n_out == 1 else 'rows show'} where a "
+                f"non-constituent would sit, so a rank inside the top "
+                f"{int(n_hold)} means the book *would* hold it **if it were "
+                "a constituent** — not that the book should."
+                if n_out else "")
+            st.caption(md(
+                f"Ranked on {asof:%Y-%m-%d} against the {uni.shape[1]} "
+                "constituents alone, so two watched names never shift each "
+                "other's row, and nothing here changes a holding. A "
+                "constituent shows the rank it already has."
+                + outsider_note
+                + " A blank rank means the name was filtered out (too little "
+                "history, or it lost to BOXX over the same window), not that "
+                "it placed last."))
 
     st.divider()
     st.markdown("#### Selection history")
@@ -1086,7 +1286,7 @@ with tab_news:
     # The model is optional here, and that is the point of this tab: the
     # headlines are worth reading with no key and no spend. `run_llm` gates
     # only the read on top.
-    run_llm = bool(daily_news) and not blocker
+    run_llm = bool(daily_news) and not news_blocker
 
     top = st.columns([3, 1])
     with top[1]:
@@ -1098,14 +1298,14 @@ with tab_news:
             st.rerun()
 
     feed, summary, from_cache = load_news(
-        _today, NEWS_HOURS, model_name.strip(),
+        _today, NEWS_HOURS, summary_model.strip(),
         st.session_state["news_token"], run_llm)
 
     # ---- the read, when there is a model to do it ------------------------
     with top[0]:
         if not run_llm:
             why = ("switched off in the sidebar" if not daily_news
-                   else blocker.split(" — ")[0])
+                   else news_blocker.split(" — ")[0])
             st.info(
                 f"**Headlines only — no sentiment analysis** ({why}). "
                 "Everything below is the news itself, which needs no model.",
@@ -1235,6 +1435,23 @@ with tab_analyst:
             "Streamlit reads the environment once at start-up, so **restart "
             "the app** after changing this — a rerun alone will not pick it up."
         )
+    elif chat_off:
+        # A chat switched off on purpose is not a misconfiguration, and the
+        # "install this, paste a key there" advice below would send someone to
+        # fix something that is not broken.
+        st.info(
+            f"**The chat is switched off.** `{DISABLE_CHAT_VAR}` is set, so "
+            "this tab makes no Gemini call. **The News tab's sentiment read "
+            "is unaffected and still runs** — that is what this switch is "
+            "for, bringing one feature up at a time.", icon="⏸️")
+        st.markdown(
+            "```bash\n"
+            f"unset {DISABLE_CHAT_VAR}          # or set it to 0\n"
+            "python -m qbs.agent --check\n"
+            "```")
+        st.caption(
+            "Streamlit reads the environment once at start-up, so **restart "
+            "the app** after changing this — a rerun alone will not pick it up.")
     elif blocker:
         st.warning(
             f"**The analyst is not configured.** {blocker}\n\n"
@@ -1333,6 +1550,7 @@ with tab_analyst:
             with st.spinner(f"Asking {model_name}…"):
                 answer = analyse(
                     asked, model=model_name.strip() or None, history=history,
+                    thinking_budget=int(thinking),
                     book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
                     offline_fundamentals=not live_fundamentals)
 

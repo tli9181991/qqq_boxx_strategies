@@ -345,6 +345,97 @@ def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
     assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
 
 
+def test_the_dashboard_watchlist_is_not_the_runners(tmp_path):
+    """Two watchlists, two names, and the root `.env` knows only its own.
+
+    The dashboard's list seeds a box someone edits while looking at charts;
+    the runner's decides what goes into var/watchlist_log.csv on the trading
+    host. One name for both would mean a host running both hands one list to
+    two programs -- and a rename back to `QBS_WATCHLIST` would do exactly
+    that silently, which is what this pins.
+    """
+    assert "QBS_DASH_WATCHLIST" in env.KNOWN_KEYS
+    assert "QBS_WATCHLIST" not in env.KNOWN_KEYS, (
+        "the runner's watchlist lives in deploy/docker/.env and is read by "
+        "qbs.live.config, not by this loader")
+
+    path = _write_env(tmp_path, "QBS_DASH_WATCHLIST=TSM,GOOGL\n")
+    load = env.load_env(path, environ={})
+    assert load.unknown == [] and load.applied == ["QBS_DASH_WATCHLIST"]
+
+    # And the runner's name in the DASHBOARD's file is the mix-up worth
+    # naming out loud, so it has to read as unrecognised rather than work.
+    path = _write_env(tmp_path, "QBS_WATCHLIST=TSM\n")
+    assert env.load_env(path, environ={}).unknown == ["QBS_WATCHLIST"]
+
+
+def test_the_chat_switch_leaves_the_news_read_running(monkeypatch):
+    """The point of having two switches: bring one feature up at a time. A
+    chat-only shutdown must not silence the daily read."""
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert env.chat_disabled() and env.DISABLE_CHAT_VAR in env.chat_disabled()
+    assert env.analyst_disabled() is None, "the news read answers to the master"
+
+
+def test_the_master_switch_outranks_the_chat_switch(monkeypatch):
+    """Someone who set QBS_DISABLE_ANALYST needs to be told THAT, not handed a
+    message about a chat switch they never touched."""
+    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
+
+    reason = env.chat_disabled()
+    assert reason and env.DISABLE_VAR in reason
+    assert env.DISABLE_CHAT_VAR not in reason
+
+
+def test_the_chat_switch_fails_safe_like_the_master(monkeypatch):
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    for value in ("", "0", "false", "off", "none", "disabled"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled() is None, value
+    for value in ("1", "true", "yes", "disable", "temporarily"):
+        monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
+        assert env.chat_disabled(), value
+
+
+def test_the_two_roles_are_checked_separately(monkeypatch):
+    from qbs.agent import analyst
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+
+    assert analyst.check_requirements(role="summary") is None, "news is ready"
+    chat = analyst.check_requirements(role="chat")
+    assert chat and env.DISABLE_CHAT_VAR in chat
+
+
+def test_a_chat_switched_off_still_summarises(monkeypatch):
+    """`build_model` must NOT answer to the chat switch -- the news read goes
+    through it, and enforcing there would take both features down together."""
+    from qbs.agent import analyst, sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
+    monkeypatch.setenv("GOOGLE_API_KEY", "present")
+
+    reached = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        reached["model"] = model
+        raise RuntimeError("far enough -- the switch did not stop us")
+
+    monkeypatch.setattr(analyst, "build_model", spy)
+    out = snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert reached, "the chat switch blocked the news read"
+    assert env.DISABLE_CHAT_VAR not in (out.error or "")
+
+    # And the chat itself is stopped.
+    assert analyst.analyse("anything").disabled
+
+
 def test_either_google_key_name_resolves():
     """Google's own docs use both names, and people copy whichever they read.
     Accepting one and ignoring the other reports a missing key that is
@@ -853,6 +944,103 @@ def test_analyse_without_a_key_returns_an_answer_not_an_exception(monkeypatch):
     answer = analyst.analyse("what do we hold?")
     assert answer.error and "GOOGLE_API_KEY" in answer.text
     assert answer.tool_calls == []
+
+
+def test_the_two_roles_get_two_models():
+    """The chat and the news read are different jobs with different volumes:
+    ~1.2M tokens a month against ~73k. One default for both would price the
+    cheap one like the expensive one, or vice versa."""
+    from qbs.agent.analyst import DEFAULT_MODEL, DEFAULT_SUMMARY_MODEL
+
+    assert DEFAULT_MODEL != DEFAULT_SUMMARY_MODEL
+    assert "flash" in DEFAULT_MODEL, "the chat is the token-heavy one"
+    assert "pro" in DEFAULT_SUMMARY_MODEL, "the daily read can afford it"
+
+
+def test_one_variable_can_point_both_roles_at_one_model(monkeypatch):
+    """Running a single model everywhere should be one variable, not two --
+    and setting both must still split them."""
+    import importlib
+    from qbs.agent import analyst
+
+    def reload_with(**env_vars):
+        for k in ("QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env_vars.items():
+            monkeypatch.setenv(k, v)
+        return importlib.reload(analyst)
+
+    one = reload_with(QBS_GEMINI_MODEL="some-new-model")
+    assert one.DEFAULT_MODEL == one.DEFAULT_SUMMARY_MODEL == "some-new-model"
+
+    both = reload_with(QBS_GEMINI_MODEL="chatty", QBS_SUMMARY_MODEL="thinky")
+    assert (both.DEFAULT_MODEL, both.DEFAULT_SUMMARY_MODEL) == ("chatty", "thinky")
+
+    plain = reload_with()
+    assert plain.DEFAULT_MODEL != plain.DEFAULT_SUMMARY_MODEL, \
+        "with nothing set, the built-in split stands"
+    importlib.reload(analyst)          # leave the module as the suite found it
+
+
+def test_the_thinking_budget_reads_its_env_var(monkeypatch):
+    from qbs.agent.analyst import _default_thinking_budget
+
+    monkeypatch.delenv("QBS_THINKING_BUDGET", raising=False)
+    assert _default_thinking_budget() == -1, "dynamic unless told otherwise"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "0")
+    assert _default_thinking_budget() == 0, "0 must survive -- it means OFF"
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "2048")
+    assert _default_thinking_budget() == 2048
+    monkeypatch.setenv("QBS_THINKING_BUDGET", "lots")
+    assert _default_thinking_budget() == -1, "junk falls back, never raises"
+
+
+def test_the_budget_is_sent_to_the_chat_model(monkeypatch):
+    """`0` is a real value meaning "no thinking", which is why the sentinel is
+    the string "default" and not None -- collapsing them would make one of
+    "send nothing" and "use the configured budget" unreachable."""
+    pytest.importorskip("langchain_google_genai")
+    import langchain_google_genai as ggenai
+    from qbs.agent import analyst
+
+    seen = {}
+
+    class Spy:
+        def __init__(self, **kwargs):
+            seen.clear()
+            seen.update(kwargs)
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "x")
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(ggenai, "ChatGoogleGenerativeAI", Spy)
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=1024)
+    assert seen["thinking_budget"] == 1024
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=0)
+    assert seen["thinking_budget"] == 0, "0 must be SENT, not treated as unset"
+
+    analyst.build_model("gemini-2.5-flash", thinking_budget=None)
+    assert "thinking_budget" not in seen, "None sends nothing at all"
+
+
+def test_the_news_read_uses_the_summary_model_without_thinking(monkeypatch):
+    """Extraction into a fixed JSON shape is not multi-step reasoning, and
+    paying for thinking tokens to restate headlines buys nothing."""
+    from qbs.agent import analyst, sentiment as snt
+
+    seen = {}
+
+    def spy(model, temperature=0.0, thinking_budget="default", **kw):
+        seen["model"] = model
+        seen["thinking_budget"] = thinking_budget
+        raise RuntimeError("stop here -- the call itself is not the point")
+
+    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.setattr(analyst, "build_model", spy)
+    snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
+    assert seen["model"] == analyst.DEFAULT_SUMMARY_MODEL
+    assert seen["thinking_budget"] is None
 
 
 def test_the_prompt_names_the_lookback_the_ranker_actually_uses():

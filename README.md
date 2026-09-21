@@ -1104,10 +1104,39 @@ and a notebook all pick it up with nothing further to do. `.env` is gitignored;
 
 ```
 GOOGLE_API_KEY=...          # GEMINI_API_KEY works too — Google's docs use both
-QBS_GEMINI_MODEL=gemini-2.5-flash    # optional
+QBS_GEMINI_MODEL=gemini-2.5-flash    # the chat
+QBS_THINKING_BUDGET=-1               # chat only: -1 dynamic, 0 off, N caps it
+QBS_SUMMARY_MODEL=gemini-2.5-pro     # the news read
 TAVILY_API_KEY=...                   # optional, better search than the default
 QBS_DISABLE_ANALYST=1                # optional kill switch, see below
 ```
+
+**Two models, because they are not the same job.** The chat reasons over tool output
+turn after turn and re-sends its transcript each time — measured at roughly **17×** the
+news panel's token usage — so it runs a cheap-per-token model with **thinking on**,
+which is what buys the multi-step care tool use actually needs. The news read is **one
+call a day over ~30 headlines**, about **73k tokens a month**; that is pennies at any
+price, so it gets the stronger model and the cost argument never enters. It sends **no
+thinking budget** — extraction into a fixed JSON shape is not multi-step reasoning, and
+paying for thinking tokens to restate headlines buys nothing.
+
+Both are overridable in the sidebar as well as by env var, and `python -m qbs.agent
+--check` prints both with the budget in force.
+
+**To run one model for everything**, set `QBS_GEMINI_MODEL` alone — the summary follows
+it unless `QBS_SUMMARY_MODEL` is also set. One variable for one model, two for a split.
+
+**Model names move faster than this repo.** Rather than trusting a table here, ask the
+API what your key can actually serve:
+
+```bash
+python -m qbs.agent --models
+```
+
+It lists every content-generating model the key sees, marks the ones you have
+configured, and warns if a configured name is missing from the list — which is the
+difference between finding out now and finding out as a 404 three layers down inside
+LangChain.
 
 **A real environment variable always wins**, so `GOOGLE_API_KEY=... python -m qbs.agent
 ...` overrides the file for one run. `--check` says which source supplied each key,
@@ -1151,7 +1180,19 @@ check, and nothing is billed. **Everything that does not need the model keeps wo
 `python -m qbs.agent --report ...`. That is the point of a switch rather than an
 uninstall.
 
-Only an explicit off-word re-enables it — `0`, `false`, `no`, `off`, `none`,
+**There is a narrower switch too.** `QBS_DISABLE_CHAT=1` stops only the Analyst tab's
+chat and **leaves the news read running** — which is what you want when bringing one
+feature up at a time, or when the chat is the token-heavy half and the daily summary is
+not. It is enforced in `build_analyst`/`analyse` rather than in `build_model`, because
+the news read goes through `build_model` and has to survive it. The master switch wins
+and is reported as the reason, so someone who set `QBS_DISABLE_ANALYST` is told *that*
+rather than handed a message about a switch they never touched.
+
+`--check` reports the two separately, and its exit code means **broken**, not
+*switched off* — a deliberate shutdown is a working configuration, and a script asking
+"is this install OK?" should not be told no because you turned a feature off on purpose.
+
+Only an explicit off-word re-enables either — `0`, `false`, `no`, `off`, `none`,
 `disabled`. **Any other non-empty value switches it off.** That is deliberately not
 `qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
 as false: for a flag whose job is to stop spending money, an unrecognised value has to

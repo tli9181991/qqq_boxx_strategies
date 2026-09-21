@@ -35,6 +35,12 @@ this package without uninstalling anything. `check_requirements` reports it,
 -- so nothing reaches the API even from a caller that skipped the check.
 Everything that does not need the model keeps working.
 
+`QBS_DISABLE_CHAT=1` is the narrower one: it stops this chat and leaves the
+news read running, which is what you want when bringing one feature up at a
+time. It is enforced in `build_analyst` and `analyse` rather than in
+`build_model`, because the news read goes through `build_model` and must
+survive it.
+
 Requirements
 ------------
 `pip install -r requirements-agent.txt` and a Google AI Studio key, either
@@ -50,9 +56,45 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .env import analyst_disabled, load_env, resolve_google_key
+from .env import (analyst_disabled, chat_disabled, load_env,
+                  resolve_google_key)
 
-DEFAULT_MODEL = os.environ.get("QBS_GEMINI_MODEL", "gemini-2.5-pro")
+# Two roles, two models, because they are not the same job.
+#
+# The CHAT reasons over tool output turn after turn and re-sends its
+# transcript every time -- measured at roughly 17x the news panel's usage. A
+# thinking Flash model is the right shape there: cheap per token, and the
+# thinking budget buys the multi-step care that tool use actually needs.
+#
+# The NEWS READ is one call a day over ~30 headlines, about 73k tokens a
+# month. That is pennies at any price, so it gets the stronger model and the
+# cost argument never enters.
+DEFAULT_MODEL = os.environ.get("QBS_GEMINI_MODEL", "gemini-2.5-flash")
+
+# The summary FOLLOWS the chat model when only that one is set, so pointing
+# the whole app at a single model is one variable rather than two. Set both
+# to split them again. With neither set, the built-in split above applies.
+DEFAULT_SUMMARY_MODEL = (os.environ.get("QBS_SUMMARY_MODEL")
+                         or os.environ.get("QBS_GEMINI_MODEL")
+                         or "gemini-2.5-pro")
+
+
+def _default_thinking_budget() -> Optional[int]:
+    """`QBS_THINKING_BUDGET`, or None to leave the model's own default alone.
+
+    -1 asks for a dynamic budget, 0 turns thinking off, a positive number caps
+    it in tokens. The accepted range is model-specific and the API is the
+    authority on it -- this does not validate the number, it passes it
+    through, so a rejected budget surfaces as the API's own error rather than
+    as a guess made here.
+    """
+    raw = (os.environ.get("QBS_THINKING_BUDGET") or "").strip()
+    if not raw:
+        return -1          # dynamic: let the model decide how long to think
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
 DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
 
 
@@ -151,8 +193,11 @@ class Answer:
         return self.text
 
 
-def check_requirements() -> Optional[str]:
-    """What is missing before an agent can run, or None if nothing is.
+def check_requirements(role: str = "chat") -> Optional[str]:
+    """What is missing before `role` can run, or None if nothing is.
+
+    `role` is "chat" (the Analyst tab, also stopped by QBS_DISABLE_CHAT) or
+    "summary" (the news read, stopped only by the master switch).
 
     Returned rather than raised so a UI can render the remedy next to a
     disabled button instead of catching an exception to read its message.
@@ -162,7 +207,10 @@ def check_requirements() -> Optional[str]:
     # different remedies, and "put a key in .env" is actively wrong advice
     # for someone who turned the analyst off on purpose.
     load_env()
-    off = analyst_disabled()
+    # `role` picks WHICH switch applies. The news read only cares about the
+    # master switch; the chat is also stopped by its own. One function, so a
+    # caller cannot accidentally ask about the wrong one.
+    off = chat_disabled() if role == "chat" else analyst_disabled()
     if off:
         return off
     try:
@@ -188,11 +236,17 @@ def check_requirements() -> Optional[str]:
 
 
 def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
-                **kwargs):
+                thinking_budget: object = "default", **kwargs):
     """The Gemini chat model.
 
     Temperature defaults to 0. This agent reports numbers; there is nothing
     here that creative sampling improves and a great deal it can corrupt.
+
+    `thinking_budget` takes the env default when left alone, None to pass
+    nothing at all (the model's own behaviour), or a number. The sentinel is
+    the string "default" rather than None because None is itself a meaningful
+    value here -- "send no budget" and "use the configured budget" are
+    different requests and collapsing them would make one unreachable.
     """
     # Enforced here as well as in `check_requirements`, because this is the
     # last line before a billable call: a caller that builds the model
@@ -207,6 +261,10 @@ def build_model(model: str = DEFAULT_MODEL, temperature: float = 0.0,
     # lookup, so a key supplied as GEMINI_API_KEY -- the name half of Google's
     # docs use -- works instead of reporting itself as missing.
     kwargs.setdefault("google_api_key", resolve_google_key())
+    budget = (_default_thinking_budget() if thinking_budget == "default"
+              else thinking_budget)
+    if budget is not None:
+        kwargs.setdefault("thinking_budget", int(budget))
     return ChatGoogleGenerativeAI(model=model, temperature=temperature, **kwargs)
 
 
@@ -214,10 +272,11 @@ def build_analyst(
     tools: Optional[List] = None,
     model: Optional[str] = None,
     system_prompt: str = SYSTEM_PROMPT,
+    thinking_budget: object = "default",
     **tool_kwargs,
 ):
     """A compiled tool-calling agent. Raises with a remedy if unusable."""
-    missing = check_requirements()
+    missing = check_requirements(role="chat")
     if missing:
         raise RuntimeError(f"Cannot build the analyst: {missing}")
     from langchain.agents import create_agent
@@ -226,7 +285,8 @@ def build_analyst(
         from .tools import build_tools
         tools = build_tools(**tool_kwargs)
     name = model or DEFAULT_MODEL
-    return create_agent(build_model(name), tools, system_prompt=system_prompt)
+    return create_agent(build_model(name, thinking_budget=thinking_budget),
+                        tools, system_prompt=system_prompt)
 
 
 def analyse(
@@ -236,6 +296,7 @@ def analyse(
     recursion_limit: int = DEFAULT_RECURSION_LIMIT,
     history: Optional[List[Dict[str, str]]] = None,
     max_history: int = 20,
+    thinking_budget: object = "default",
     **tool_kwargs,
 ) -> Answer:
     """Ask the analyst one question. Returns an `Answer`, never raises.
@@ -258,12 +319,17 @@ def analyse(
     name = model or DEFAULT_MODEL
     # Checked before building anything: a switched-off analyst should not
     # spend a second loading a universe it is never going to reason about.
-    off = analyst_disabled()
+    # The chat switch, not the master one -- this is the chat. `chat_disabled`
+    # reports the master switch when that is what is set, so the message names
+    # the thing actually switched off.
+    off = chat_disabled()
     if off:
-        return Answer(text=f"The analyst is disabled — {off}", model=name,
+        return Answer(text=f"The chat is disabled — {off}", model=name,
                       error=off, disabled=True)
     try:
-        agent = agent or build_analyst(model=name, **tool_kwargs)
+        agent = agent or build_analyst(model=name,
+                                       thinking_budget=thinking_budget,
+                                       **tool_kwargs)
     except Exception as exc:              # noqa: BLE001
         return Answer(text=str(exc), model=name, error=str(exc))
 

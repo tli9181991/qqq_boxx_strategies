@@ -105,6 +105,18 @@ class LiveConfig:
     # book holds 6 and exits past 10, so 25 shows the names queued behind
     # them -- enough to see a rotation coming rather than only arriving.
     ranking_log_top: int = 25
+    # Candidate ranking rules to score beside the live book, in a log, holding
+    # nothing. Empty turns the shadow log off. See qbs/shadow.py for why a
+    # candidate is observed for a year rather than backtested into production:
+    # the cached history holds twelve independent blocks and has already been
+    # asked ~60 questions. Not computed in the trade phase -- a few seconds of
+    # arithmetic has no business anywhere near the MOC cutoff.
+    shadow_weights: List[float] = field(default_factory=lambda: [0.5, 1.25, 2.0])
+    # Names to score beside the ranking without making them buyable -- a stock
+    # outside the Nasdaq-100 whose strength you want to read against the book's.
+    # They are ranked in a copy of the universe; the book is computed from the
+    # index constituents and never sees them.
+    watchlist: List[str] = field(default_factory=list)
 
     # ---- safety guards ---------------------------------------------------
     max_order_notional: float = 40_000.0   # per single order
@@ -228,6 +240,16 @@ class LiveConfig:
         return os.path.join(self.state_dir, "ranking_log.csv")
 
     @property
+    def watchlist_csv_path(self) -> str:
+        """Where a watched non-constituent would have ranked each day."""
+        return os.path.join(self.state_dir, "watchlist_log.csv")
+
+    @property
+    def shadow_csv_path(self) -> str:
+        """What the candidate rules would have held each day. Observation only."""
+        return os.path.join(self.state_dir, "shadow_log.csv")
+
+    @property
     def trade_csv_path(self) -> str:
         """Every trading event, rewritten from the database on each run."""
         return os.path.join(self.state_dir, "trade_log.csv")
@@ -285,6 +307,12 @@ class LiveConfig:
                                              cfg.position_source)
         cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
         cfg.ranking_log_top = _env_int("QBS_RANKING_TOP", cfg.ranking_log_top)
+        if os.environ.get("QBS_WATCHLIST") is not None:
+            from ..shadow import parse_watchlist
+            cfg.watchlist = parse_watchlist(os.environ["QBS_WATCHLIST"])
+        if os.environ.get("QBS_SHADOW_WEIGHTS") is not None:
+            raw = os.environ["QBS_SHADOW_WEIGHTS"].replace(",", " ").split()
+            cfg.shadow_weights = [float(w) for w in raw]
         cfg.sheets_id = os.environ.get("QBS_SHEETS_ID", cfg.sheets_id)
         cfg.sheets_key_file = os.environ.get("QBS_SHEETS_KEY", cfg.sheets_key_file)
         cfg.__post_init__()
