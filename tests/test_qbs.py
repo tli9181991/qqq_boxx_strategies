@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -2450,6 +2451,40 @@ def test_the_market_close_helpers_track_dst_and_the_weekend():
         == pd.Timestamp("2026-09-21").date()
     assert next_market_close(_et("2026-09-21 16:00")).date() \
         == pd.Timestamp("2026-09-22").date()
+
+
+def test_no_strftime_directive_is_glibc_only():
+    """`%-d` and `%#d` are platform extensions, not strftime.
+
+    The no-padding modifier is `%-d` on glibc and `%#d` on Windows, and each
+    is a hard error on the other: the Windows C runtime raises "Invalid
+    format string" rather than ignoring it. This repo is developed on Linux
+    and run on Windows, so a directive that works here and not there is a
+    crash nobody sees until it is in somebody else's hands -- which is
+    exactly how one shipped, in a date inside a status line that took the
+    whole dashboard down.
+
+    Scanned rather than exercised, because the failure only appears on the
+    platform the test is not running on. The pattern deliberately only looks
+    inside strftime calls and f-string format specs, so prose like
+    "the 4%-mover count" in a docstring does not trip it.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    pattern = re.compile(
+        r"""(?:strftime\(\s*["'][^"']*|\{[^{}]*:[^{}]*)%[-#][a-zA-Z]""")
+
+    offenders = []
+    for path in sorted(list((root / "qbs").rglob("*.py"))
+                       + list((root / "dashboard").rglob("*.py"))):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
+
+    assert not offenders, (
+        "platform-specific strftime directive(s) — build the value in Python "
+        "instead, e.g. f\"{ts:%b} {ts.day}\":\n  " + "\n  ".join(offenders))
 
 
 def test_the_fetch_gate_allows_the_first_run(tmp_path):

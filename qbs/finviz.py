@@ -183,9 +183,13 @@ def due_for_fetch(stamp_path: str = FETCH_STAMP,
                       f"{last_et:%Y-%m-%d %H:%M} ET, before the "
                       f"{close:%Y-%m-%d} close")
     nxt = next_market_close(now)
-    return False, (f"already fetched since the {close:%b %-d} close "
+    # `{close.day}` rather than a `%-d` in the format spec: the no-padding
+    # modifier is a glibc extension. Windows' C runtime rejects it outright
+    # with "Invalid format string", so a date in a status line took the whole
+    # dashboard down on the platform it was not developed on.
+    return False, (f"already fetched since the {close:%b} {close.day} close "
                    f"(at {last_et:%H:%M} ET) — next automatic attempt after "
-                   f"the {nxt:%b %-d} close, or use Refresh now")
+                   f"the {nxt:%b} {nxt.day} close, or use Refresh now")
 
 
 
