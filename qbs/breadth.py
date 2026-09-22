@@ -319,6 +319,81 @@ def sector_breakdown(
             .reset_index(drop=True))
 
 
+def sector_leaders(
+    closes: pd.DataFrame,
+    sector_map: Dict[str, str],
+    asof: Optional[pd.Timestamp] = None,
+    volumes: Optional[pd.DataFrame] = None,
+    per_sector: int = 5,
+    p: Optional[BreadthParams] = None,
+    momentum: Optional[MomentumParams] = None,
+) -> pd.DataFrame:
+    """The strongest momentum leaders inside each sector, on one date.
+
+    `sector_breakdown` says WHERE the leadership is. This says WHO it is, at
+    the same moment and under the same rule -- a concentration reading nobody
+    can name the members of is a number to nod at rather than act on.
+
+    Columns: `sector`, `symbol`, `score` (the same 6-1 momentum the ranker
+    uses), `rank_in_sector`, and `n_sector` -- every leader that sector has,
+    not just the ones listed, so a truncated list is visibly truncated.
+
+    Ordered by sector size and then by score, which is `sector_breakdown`'s
+    own order, so the two tables read down the page in the same sequence.
+
+    `per_sector` caps each sector's list; 0 means no cap. The cap exists
+    because the US universe produces leaders in the hundreds and a page
+    listing all of them is a page nobody reads. A name with too little
+    history to score is dropped rather than sorted last -- an unscored name
+    is not a weak one.
+    """
+    p = p or BreadthParams()
+    cols = ["sector", "symbol", "score", "rank_in_sector", "n_sector"]
+    if not sector_map or closes.empty:
+        return pd.DataFrame(columns=cols)
+
+    px = closes.sort_index()
+    asof = pd.Timestamp(asof) if asof is not None else px.index[-1]
+    if asof not in px.index:
+        prior = px.index[px.index <= asof]
+        if len(prior) == 0:
+            return pd.DataFrame(columns=cols)
+        asof = prior[-1]
+    px = px.loc[:asof]
+
+    leaders = leader_mask(px, volumes, p).loc[asof]
+    named = [t for t in px.columns if bool(leaders.get(t, False))]
+    if not named:
+        return pd.DataFrame(columns=cols)
+
+    # The ranker's own measure, from the ranker's own window helper: the
+    # table's order has to be the order the strategy would put them in, and
+    # a second expression for "6-1 momentum" is how that stops being true.
+    look, skip = _momentum_window(momentum)
+    if len(px) <= look:
+        return pd.DataFrame(columns=cols)
+    score = px.iloc[-1 - skip] / px.iloc[-1 - look] - 1.0
+
+    rows = []
+    for t in named:
+        sc = score.get(t, np.nan)
+        if sc != sc:                      # unscored, not weak
+            continue
+        rows.append({"sector": sector_map.get(t, "Unclassified"),
+                     "symbol": t, "score": float(sc)})
+    if not rows:
+        return pd.DataFrame(columns=cols)
+
+    out = pd.DataFrame(rows)
+    out["n_sector"] = out.groupby("sector")["symbol"].transform("size")
+    out = out.sort_values(["n_sector", "sector", "score"],
+                          ascending=[False, True, False])
+    out["rank_in_sector"] = out.groupby("sector").cumcount() + 1
+    if per_sector:
+        out = out[out["rank_in_sector"] <= int(per_sector)]
+    return out[cols].reset_index(drop=True)
+
+
 # --------------------------------------------------------------------------
 # The daily table
 # --------------------------------------------------------------------------

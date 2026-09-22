@@ -42,7 +42,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
-                         pulse_cell, pulse_class, sector_breakdown)
+                         pulse_cell, pulse_class, sector_breakdown,
+                         sector_leaders)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams)
@@ -532,6 +533,54 @@ def names_on(key: str, when) -> list:
     return [t for t in str(raw).split(", ") if t]
 
 
+def rank_table(rows, n_hold: int, exit_rank: int,
+               lead: Optional[Dict[str, Dict[str, str]]] = None,
+               sort: bool = True):
+    """The watchlist / sector-leaders table, as one Styler.
+
+    Two panels show these same seven columns about different sets of names --
+    the picks tab's watchlist and the market tab's sector leaders -- and a
+    second copy of the formatting would drift from the first the moment
+    either is touched. `rows` is `qbs.shadow.watchlist_rows` output.
+
+    `lead` adds columns in FRONT of Ticker, each a `{symbol: value}` map
+    rather than a list, so a caller cannot get its extra column out of step
+    with the rows it is labelling.
+
+    `sort=False` keeps the caller's order, which the sector panel needs: it
+    groups by sector first and ranks inside it, so a global sort by rank
+    would shuffle the groups apart.
+    """
+    wf = pd.DataFrame(rows)
+    if sort:
+        # NaN last: a name with too little history is unranked, not top.
+        wf = wf.sort_values("rank", na_position="last")
+    wf = wf.reset_index(drop=True)
+
+    cols: Dict[str, list] = {}
+    for label, by_symbol in (lead or {}).items():
+        cols[label] = [by_symbol.get(t, "—") for t in wf["symbol"]]
+    cols["Ticker"] = list(wf["symbol"])
+    cols["Rank"] = [fmt(r, "{:.0f}") for r in wf["rank"]]
+    cols["Placed"] = ["in index" if c else "interpolated"
+                      for c in wf["constituent"]]
+    cols["Score"] = [fmt(v, "{:+.3f}") for v in wf["score"]]
+    cols[f"Book cutoff (#{int(n_hold)})"] = [fmt(v, "{:+.3f}")
+                                             for v in wf["book_cutoff"]]
+    cols[f"Band cutoff (#{int(exit_rank)})"] = [fmt(v, "{:+.3f}")
+                                                for v in wf["band_cutoff"]]
+    cols["Beats the book"] = ["✅" if b else "—" for b in wf["beats_book"]]
+
+    show = pd.DataFrame(cols)
+    beats = list(wf["beats_book"])
+    # The tint is on the rank cell only: it is the one number the row is
+    # about, and a whole green row reads as an endorsement of the name.
+    styler = show.style.apply(
+        lambda _col: [f"background-color: {UP}" if b else "" for b in beats],
+        subset=["Rank"])
+    return styler, show, wf
+
+
 # Loaded once, above the tabs, because two of them need it: the picks tab
 # ranks the watchlist and the analyst tab charts it. Inside one tab it would
 # be a second download the moment the other wanted the same prices.
@@ -977,30 +1026,9 @@ with tab_picks:
         if not rows:
             st.info("Nothing on the watchlist could be ranked on this date.")
         else:
-            wf = pd.DataFrame(rows)
-            # NaN sorts last: a name with too little history is unranked, not
-            # top of the list.
-            wf = wf.sort_values("rank", na_position="last").reset_index(drop=True)
-            show_w = pd.DataFrame({
-                "Ticker": wf["symbol"],
-                "Rank": [fmt(r, "{:.0f}") for r in wf["rank"]],
-                "Placed": ["in index" if c else "interpolated"
-                           for c in wf["constituent"]],
-                "Score": [fmt(v, "{:+.3f}") for v in wf["score"]],
-                f"Book cutoff (#{int(n_hold)})":
-                    [fmt(v, "{:+.3f}") for v in wf["book_cutoff"]],
-                f"Band cutoff (#{int(exit_rank)})":
-                    [fmt(v, "{:+.3f}") for v in wf["band_cutoff"]],
-                "Beats the book": ["✅" if b else "—" for b in wf["beats_book"]],
-            })
-            beats = list(wf["beats_book"])
-            st.dataframe(
-                show_w.style.apply(
-                    lambda _col: [f"background-color: {UP}" if b else ""
-                                  for b in beats],
-                    subset=["Rank"]),
-                hide_index=True, width="stretch",
-                height=min(420, 38 + 35 * len(show_w)))
+            styler, show_w, wf = rank_table(rows, int(n_hold), int(exit_rank))
+            st.dataframe(styler, hide_index=True, width="stretch",
+                         height=min(420, 38 + 35 * len(show_w)))
             n_out = int((~wf["constituent"]).sum())
             # Said only when there is an interpolated row to say it about.
             # "the 0 outsiders are interpolated" explains a distinction the
@@ -1323,6 +1351,86 @@ with tab_market:
                 "is the finding. Pool % is that sector's own weight — the bar it "
                 "has to beat. Penetration is leaders ÷ analysed names in the sector."
             )
+
+        # ---- who the leadership actually is -----------------------------
+        # The table above says WHERE the leadership sits. A concentration
+        # reading nobody can name the members of is a number to nod at
+        # rather than act on, so this names them, in the same sector order.
+        st.markdown("##### High-momentum names by sector")
+        per_sector = st.number_input(
+            "Names per sector", 1, 20, 5, key="sec_leaders_n",
+            help="The strongest N leaders in each sector by 6-1 momentum. "
+                 "The US universe throws up leaders in the hundreds, so the "
+                 "list is capped; the sector label says how many it has.")
+        lead_rows = sector_leaders(m_uni, mkt_sectors, asof=tbl.index[-1],
+                                   volumes=m_vols,
+                                   per_sector=int(per_sector))
+        if lead_rows.empty:
+            st.info("No leader on this date could be scored over the "
+                    f"{momentum_label()} window — that needs more history "
+                    "than this cache holds for them.", icon="ℹ️")
+        else:
+            # Ranked against the Nasdaq-100 book, NOT against the US
+            # universe these names came from, and deliberately: the two
+            # cutoff columns are the score holding slot n_hold and slot
+            # exit_rank of the book that actually trades. "Beats the book"
+            # has to mean the same thing here as it does on the picks tab,
+            # or the same words carry two readings one scroll apart.
+            in_book = uni.index[uni.index <= tbl.index[-1]]
+            rank_asof = in_book[-1] if len(in_book) else None
+            lead_names = [t for t in lead_rows["symbol"] if t in m_uni.columns]
+            lead_frame = pd.DataFrame({
+                t: m_uni[t].reindex(uni.index).ffill() for t in lead_names})
+            rows_l = (watch_rows(uni, px["BOXX"], lead_frame,
+                                 ",".join(lead_names), int(n_hold),
+                                 int(exit_rank), rank_asof)
+                      if lead_names and rank_asof is not None else [])
+            if not rows_l:
+                st.info("These names could not be placed in the book's "
+                        "ranking on this date.", icon="ℹ️")
+            else:
+                # The sector panel's own order, kept: grouped by sector,
+                # strongest first inside it. A global sort by rank would
+                # shuffle the groups apart, which is the one thing this
+                # table is for.
+                order = {t: i for i, t in enumerate(lead_rows["symbol"])}
+                rows_l.sort(key=lambda r: order.get(r["symbol"], 1 << 30))
+                sec_of = {r.symbol: f"{r.sector} ({int(r.n_sector)})"
+                          for r in lead_rows.itertuples()}
+                styler_l, show_l, _ = rank_table(
+                    rows_l, int(n_hold), int(exit_rank),
+                    lead={"Sector": sec_of}, sort=False)
+                st.dataframe(styler_l, hide_index=True, width="stretch",
+                             height=min(620, 38 + 35 * len(show_l)))
+                shown = len(show_l)
+                total = int(lead_rows["n_sector"].groupby(
+                    lead_rows["sector"]).first().sum())
+                st.caption(md(
+                    f"The strongest {int(per_sector)} per sector — "
+                    f"**{shown} of {total}** leaders on "
+                    f"{tbl.index[-1]:%Y-%m-%d}. The number beside each sector "
+                    "is how many leaders it has in total. "
+                    f"**Ranked against the {uni.shape[1]} Nasdaq-100 "
+                    "constituents**, the universe the book trades — not "
+                    "against the US universe these names were screened from. "
+                    "A leader outside the index is *interpolated* into that "
+                    "ranking, so **Beats the book** means it would place in "
+                    f"the top {int(n_hold)} **if it were a constituent**, not "
+                    "that anything holds it."
+                    # A leader with no rank is the one cell here that looks
+                    # like a bug and is not: the two rules disagree on
+                    # purpose, and the row is listed because the leader rule
+                    # passed it.
+                    + " A **blank rank** is a name the leader rule passed and "
+                    "the ranker then filtered out — it lost to BOXX over the "
+                    f"same {momentum_label()} window, or has too little "
+                    "history. The leader rule tests a quarterly gain against "
+                    "a threshold; the ranker tests the same name against "
+                    "cash. Neither is a stricter version of the other."
+                    + (f" Leaders read on {tbl.index[-1]:%Y-%m-%d}, ranks on "
+                       f"{rank_asof:%Y-%m-%d} — the two caches are not "
+                       "equally fresh."
+                       if rank_asof != tbl.index[-1] else "")))
 
 
 # ==========================================================================

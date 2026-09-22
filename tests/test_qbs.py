@@ -1897,6 +1897,126 @@ def test_sector_breakdown_without_a_map_returns_empty():
     assert sector_breakdown(_breadth_frame(), {}).empty
 
 
+def _leader_fixture():
+    """Three sectors, known relative strength inside each.
+
+    Built long enough to be scorable over the ranker's own 6-1 window, and
+    priced so every name clears the leader rule -- the point of these tests
+    is the ordering and the grouping, not the filter, which `leader_mask`
+    has its own tests for.
+    """
+    from qbs.breadth import _momentum_window
+
+    look, _ = _momentum_window()
+    idx = pd.bdate_range("2024-01-01", periods=look + 90)
+    n = len(idx)
+    # COMPOUNDING, not a straight line. A linear ramp's trailing-quarter
+    # return shrinks as the base grows, so the slower names would fail the
+    # leader rule's 28% quarterly gate and drop out of a fixture that is
+    # supposed to be testing the grouping. A constant daily rate keeps every
+    # name's quarterly gain constant and above the gate, while the rates
+    # still order them.
+    rates = {"AAA": 0.020, "BBB": 0.015, "CCC": 0.010,   # Tech
+             "DDD": 0.025, "EEE": 0.006,                  # Health
+             "FFF": 0.012}                                # Energy
+    px = pd.DataFrame({t: 10.0 * (1.0 + r) ** np.arange(n)
+                       for t, r in rates.items()}, index=idx)
+    vols = pd.DataFrame(1e7, index=idx, columns=px.columns)
+    sectors = {"AAA": "Tech", "BBB": "Tech", "CCC": "Tech",
+               "DDD": "Health", "EEE": "Health", "FFF": "Energy"}
+    return px, vols, sectors
+
+
+def test_sector_leaders_group_by_sector_and_rank_inside_it():
+    """The naming half of the concentration reading: a sector share nobody
+    can name the members of is a number to nod at rather than act on."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    out = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+
+    assert set(out["symbol"]) == set(px.columns), "every leader is named"
+    # Sector order follows `sector_breakdown`: biggest group first.
+    assert list(out["sector"].unique()) == ["Tech", "Health", "Energy"]
+    # And strongest first inside each group.
+    tech = out[out["sector"] == "Tech"]
+    assert list(tech["symbol"]) == ["AAA", "BBB", "CCC"]
+    assert list(tech["rank_in_sector"]) == [1, 2, 3]
+    assert tech["score"].is_monotonic_decreasing
+    assert list(out[out["sector"] == "Health"]["symbol"]) == ["DDD", "EEE"]
+    # n_sector counts the whole sector, not the rows shown.
+    assert set(out[out["sector"] == "Tech"]["n_sector"]) == {3}
+
+
+def test_sector_leaders_cap_is_per_sector_not_overall():
+    """A global cap would hand the whole list to the biggest sector and
+    report the others as leaderless."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    out = sector_leaders(px, sectors, volumes=vols, per_sector=1)
+
+    assert len(out) == 3, "one per sector, all three sectors present"
+    assert list(out["symbol"]) == ["AAA", "DDD", "FFF"], "each sector's best"
+    # Truncated, and visibly so: the count is of the sector, not the rows.
+    assert list(out[out["sector"] == "Tech"]["n_sector"]) == [3]
+
+
+def test_sector_leaders_order_matches_the_breakdown_it_sits_under():
+    """The two tables read down the page together, so a sector cannot be
+    third in one and first in the other."""
+    from qbs.breadth import sector_breakdown, sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    breakdown = sector_breakdown(px, sectors, volumes=vols)
+    leaders = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+
+    assert (list(breakdown["sector"])
+            == list(leaders["sector"].unique())), "same sequence"
+    # And the member counts agree with the breakdown's own n.
+    counts = leaders.groupby("sector")["n_sector"].first()
+    for row in breakdown.itertuples():
+        assert counts[row.sector] == row.n
+
+
+def test_sector_leaders_needs_a_map_and_enough_history():
+    """Both gaps fail empty rather than inventing a label or a score. An
+    unscored name is not a weak one, and 'Unclassified' rendered as a sector
+    is a classification this package did not make."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    assert sector_leaders(px, {}, volumes=vols).empty, "no map, no table"
+    assert sector_leaders(px.iloc[:5], sectors, volumes=vols).empty, \
+        "too short to score over the 6-1 window"
+    assert sector_leaders(pd.DataFrame(), sectors).empty
+
+    # A name with no sector is labelled, not dropped -- it IS a leader, and
+    # silently losing it would understate the leadership count.
+    partial = {k: v for k, v in sectors.items() if k != "FFF"}
+    out = sector_leaders(px, partial, volumes=vols, per_sector=0)
+    assert "Unclassified" in set(out["sector"])
+    assert "FFF" in set(out["symbol"])
+
+
+def test_sector_leaders_accept_a_date_the_frame_does_not_hold():
+    """The dashboard reads leaders on the market cache's last bar and ranks
+    on the book cache's, and the two are not always the same day."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    asof = px.index[-1] + pd.Timedelta(days=3)
+    out = sector_leaders(px, sectors, volumes=vols, asof=asof, per_sector=0)
+    assert not out.empty, "it falls back to the last bar at or before asof"
+
+    before = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+    assert list(out["symbol"]) == list(before["symbol"])
+
+    # Earlier than anything in the frame is empty, not the first bar.
+    assert sector_leaders(px, sectors, volumes=vols,
+                          asof=px.index[0] - pd.Timedelta(days=1)).empty
+
+
 def test_breadth_classifiers_hit_their_thresholds():
     from qbs.breadth import BreadthParams, atr_class, ma_class, pulse_class
 
