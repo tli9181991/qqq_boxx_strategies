@@ -3485,3 +3485,153 @@ def test_shadow_books_swallow_a_broken_candidate():
         assert shadow_books(uni, safe, MomentumParams(), weights=[1.0]) == []
     finally:
         shadow_mod.turn_score = original
+
+
+# --------------------------------------------------------------------------
+# Universe providers (qbs/universe_source.py, qbs/tradingview.py)
+# --------------------------------------------------------------------------
+
+def test_the_two_filter_vocabularies_agree():
+    """`UniverseFilters` says the same thing twice, in two languages.
+
+    The strings are Finviz's own filter enum, which takes "Over $5" and has
+    no general numeric form, so they cannot be derived from the numbers. That
+    makes drift possible, and a definition that says one thing to one
+    provider and another to the next produces two universes and one number on
+    screen.
+    """
+    from qbs.finviz import UniverseFilters
+
+    f = UniverseFilters()
+    assert f.price == f"Over ${f.min_price:g}"
+    assert f.avg_volume == f"Over {f.min_avg_volume / 1000:g}K"
+    assert "ex-Funds" in f.industry, "both sides exclude funds"
+    assert f.include_dr, "and both keep ADRs — the label says so"
+
+
+def test_the_source_switch_defaults_to_finviz():
+    """Every number in this repo has been measured against Finviz, so a
+    different provider is a change of measurement and not a preference."""
+    from qbs.universe_source import DEFAULT_SOURCE, resolve_source
+
+    assert DEFAULT_SOURCE == "finviz"
+    assert resolve_source(environ={}) == "finviz"
+    assert resolve_source(environ={"QBS_UNIVERSE_SOURCE": "tradingview"}) \
+        == "tradingview"
+    # Case and padding are how people actually type it.
+    assert resolve_source(environ={"QBS_UNIVERSE_SOURCE": " TradingView "}) \
+        == "tradingview"
+    # An explicit argument beats the environment.
+    assert resolve_source("finviz",
+                          environ={"QBS_UNIVERSE_SOURCE": "tradingview"}) \
+        == "finviz"
+
+
+def test_an_unknown_source_falls_back_and_says_so():
+    """Read on a dashboard's start-up path, so a typo must cost a line on
+    screen rather than a page that will not load."""
+    from qbs.universe_source import resolve_source, source_note
+
+    env = {"QBS_UNIVERSE_SOURCE": "tradinview"}      # missing the 'g'
+    assert resolve_source(environ=env) == "finviz"
+    note = source_note(environ=env)
+    assert note and "tradinview" in note and "finviz" in note
+    assert source_note(environ={"QBS_UNIVERSE_SOURCE": "tradingview"}) is None
+    assert source_note(environ={}) is None
+
+
+def test_fetch_universe_reports_which_provider_ran(monkeypatch):
+    """Two providers are two universes. A breadth count that steps because
+    the source changed, on a screen that does not say the source changed,
+    reads as a market event."""
+    import qbs.universe_source as us
+
+    called = {}
+
+    def fake(filters, **kw):
+        called["filters"] = filters
+        return pd.DataFrame({"Ticker": ["AAA"], "Sector": ["Tech"]}), None
+
+    monkeypatch.setattr(us, "_provider", lambda name: fake)
+
+    uni, err, src = us.fetch_universe(source="tradingview")
+    assert src == "tradingview" and err is None and len(uni) == 1
+
+    # And the typo note rides out on the error channel, not in silence.
+    monkeypatch.setenv("QBS_UNIVERSE_SOURCE", "nope")
+    uni, err, src = us.fetch_universe()
+    assert src == "finviz" and err and "nope" in err
+
+
+def test_the_tradingview_provider_matches_the_finviz_signature():
+    """One seam, two implementations. A caller holds either behind one name,
+    so every argument the other takes has to be accepted here -- including
+    `sleep_sec`, which paces Finviz's 120 page requests and has nothing to
+    pace in a single POST."""
+    import inspect
+
+    from qbs import finviz, tradingview
+
+    a = inspect.signature(finviz.fetch_us_universe).parameters
+    b = inspect.signature(tradingview.fetch_us_universe).parameters
+    assert set(a) == set(b), f"signatures diverged: {set(a) ^ set(b)}"
+
+
+def test_the_tradingview_provider_needs_no_network_to_fail_politely(tmp_path):
+    """`(None, reason)`, never a raise: the caller is a dashboard that falls
+    back, and a failure it cannot read off the screen cannot be fixed."""
+    from qbs.tradingview import fetch_us_universe
+
+    uni, err = fetch_us_universe(offline=True, verbose=False,
+                                 cache_path=str(tmp_path / "none.csv"))
+    assert uni is None and err and "offline" in err
+
+
+def test_the_tradingview_provider_caches_separately():
+    """Sharing Finviz's cache file would mean a switch silently reads the
+    other provider's answer and reports it as this one's."""
+    from qbs.finviz import UNIVERSE_CSV as FINVIZ_CSV
+    from qbs.tradingview import UNIVERSE_CSV as TV_CSV
+
+    assert FINVIZ_CSV != TV_CSV
+    assert "tradingview" in TV_CSV
+
+
+def test_the_scanner_frame_is_shaped_like_the_finviz_one():
+    """Same columns, same ticker spelling. The two universes have to produce
+    keys that match the same yfinance price frame, so BRK.B normalises to
+    BRK-B on both sides."""
+    from qbs.tradingview import _shape
+
+    raw = pd.DataFrame({
+        "name": ["AAPL", "BRK.B", "TSM", "AAPL"],
+        "ticker": ["NASDAQ:AAPL", "NYSE:BRK.B", "NYSE:TSM", "NASDAQ:AAPL"],
+        "sector": ["Technology", "Finance", "Technology", "Technology"],
+        "industry": ["Hardware", "Insurance", "Semis", "Hardware"],
+        "country": ["US", "US", "TW", "US"],
+    })
+    out = _shape(raw)
+    assert list(out.columns) == ["Ticker", "Sector", "Industry", "Country"]
+    assert list(out["Ticker"]) == ["AAPL", "BRK-B", "TSM"], "dots and dupes"
+
+    # `name` can go missing between versions; the exchange-qualified form is
+    # the fallback and has to give the same answer.
+    out2 = _shape(raw.drop(columns=["name"]))
+    assert list(out2["Ticker"]) == ["AAPL", "BRK-B", "TSM"]
+
+    with pytest.raises(RuntimeError, match="no symbol column"):
+        _shape(raw.drop(columns=["name", "ticker"]))
+
+
+def test_the_tradingview_provider_does_not_apply_the_momentum_rule():
+    """`Perf.3M` is a calendar quarter and this package's rule is 63
+    SESSIONS. Close enough to look interchangeable, not the same number --
+    so the rule stays in `leader_mask`, measured on the bars, and the
+    provider's only job is membership."""
+    from qbs import tradingview
+
+    src = Path(tradingview.__file__).read_text(encoding="utf-8")
+    assert "Perf.3M" not in tradingview.COLUMNS
+    assert "col(\"Perf" not in src and "col('Perf" not in src
+    # It filters on membership and liquidity only.
+    assert "average_volume_90d_calc" in src, "the AVERAGE, as Finviz does"

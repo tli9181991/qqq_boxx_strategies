@@ -11,5 +11,14 @@ streamlit>=1.40
 # Support/resistance levels for the breakout strategy's picks.
 scipy>=1.10
 
-# Finviz screener for the broad US universe (market-breadth tab)
+# Finviz screener for the broad US universe (market-breadth tab). The default
+# source, and the one every number in this repo has been measured against.
 finvizfinance>=1.0
+
+# TradingView's scanner, the alternative source for the same universe. Opt in
+# with QBS_UNIVERSE_SOURCE=tradingview. Optional on purpose: it is one POST
+# instead of Finviz's ~120 paginated requests, but it is an undocumented
+# endpoint whose terms restrict automated access, and a different listings
+# database — so it is a different universe, not a faster copy of the same one.
+# Uncomment to install.
+# tradingview-screener>=3.2

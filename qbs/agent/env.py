@@ -93,7 +93,7 @@ RETIRED_VARS = {
 # them, and so a typo in a `.env` can be pointed out rather than ignored.
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
               "QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL", "QBS_THINKING_BUDGET",
-              "QBS_DASH_WATCHLIST", DISABLE_CHAT_VAR,
+              "QBS_DASH_WATCHLIST", "QBS_UNIVERSE_SOURCE", DISABLE_CHAT_VAR,
               DISABLE_NEWS_ANALYSIS_VAR, DISABLE_NEWS_READ_VAR)
 
 # Values that mean "switch is off, carry on". Everything else non-empty

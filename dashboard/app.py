@@ -50,8 +50,9 @@ from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
 from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
                       load_prices, sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
-                        fetch_us_universe, load_universe_bars,
-                        record_fetch_attempt, sector_map)
+                        load_universe_bars, record_fetch_attempt, sector_map)
+from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
+                                 resolve_source)
 from qbs.screens import finviz_momentum_screen
 from qbs.shadow import parse_watchlist, watchlist_rows
 from qbs.strategies import cross_sectional_momentum
@@ -90,9 +91,15 @@ PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
 # Data
 # --------------------------------------------------------------------------
 
-def _read_cache(download_start: str, fetch_universe: bool = False):
-    """Whatever is on disk, without touching the network."""
-    tickers = load_universe(fetch=fetch_universe, warn=False)
+def _read_cache(download_start: str, fetch_members: bool = False):
+    """Whatever is on disk, without touching the network.
+
+    `fetch_members` is about the INDEX membership list, not the US universe
+    that `qbs.universe_source.fetch_universe` supplies -- it was called
+    `fetch_universe` and shadowed that import, which is a rename waiting to
+    turn into a bug the day someone uses the function here.
+    """
+    tickers = load_universe(fetch=fetch_members, warn=False)
     uni = load_universe_prices(tickers, start=download_start, verbose=False)
     px = load_prices(["QQQ", "VEU", "BOXX"], start=download_start, offline=True)
     return uni, px
@@ -307,7 +314,7 @@ def load_us_market(download_start: str, online: bool, force: bool,
     """
     filters = UniverseFilters()
     if not online:
-        uni, uni_err = fetch_us_universe(filters, offline=True, verbose=False)
+        uni, uni_err, src = fetch_universe(filters, offline=True, verbose=False)
         auto, why = False, "offline"
     else:
         auto, why = due_for_fetch()
@@ -317,10 +324,11 @@ def load_us_market(download_start: str, online: bool, force: bool,
         # rerun -- which is the loop this gate exists to prevent.
         if auto:
             record_fetch_attempt()
-        uni, uni_err = fetch_us_universe(filters, refresh=force, offline=False,
-                                         verbose=False)
+        uni, uni_err, src = fetch_universe(filters, refresh=force, offline=False,
+                                           verbose=False)
     if uni is None or uni.empty:
-        return None, None, {}, filters.label, uni_err or "unknown failure", False
+        return None, None, {}, f"{filters.label} · via {src}", (
+            uni_err or "unknown failure"), False
 
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
@@ -337,7 +345,11 @@ def load_us_market(download_start: str, online: bool, force: bool,
     # current and the download that would replace it never runs. Its reason
     # arrives in `bars_err`.
     warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
-    note = f"{filters.label} · {why}"
+    # The source is named in the note because two providers apply the same
+    # rules to different listings databases and will not agree on the last
+    # hundred names. A breadth count that steps when the source changed, on a
+    # screen that does not say the source changed, reads as a market event.
+    note = f"{filters.label} · via {src} · {why}"
     return closes, volumes, sector_map(uni), note, warn, auto
 
 
@@ -553,6 +565,18 @@ def freshness_banner():
 
 SRC = "downloaded" if data_status["downloaded"] else "cache"
 UNIVERSE_NOTE = f"{uni.shape[1]} Nasdaq-100 constituents (closes only)"
+# Which provider the market tab will ask, named before anything is fetched.
+# Two sources are two universes; a reader comparing today's breadth with
+# last week's needs to know whether the measurement changed underneath it.
+_SRC = resolve_source()
+_SRC_STATE = available_sources().get(_SRC, "unknown")
+st.sidebar.caption(md(f"US universe source: **{_SRC}** (`{SOURCE_VAR}`)"))
+if not _SRC_STATE.startswith("installed"):
+    st.sidebar.warning(md(
+        f"`{_SRC}` is selected but {_SRC_STATE}. The market tab will fall "
+        "back to the Nasdaq-100 until it is installed **for this "
+        "interpreter**."), icon="🔌")
+
 st.sidebar.caption(f"Picks universe: {UNIVERSE_NOTE}")
 st.sidebar.caption("The market tab has its own universe selector.")
 st.sidebar.caption(f"Data through {LAST_BAR:%Y-%m-%d} ({SRC})")

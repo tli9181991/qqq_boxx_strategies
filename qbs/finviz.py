@@ -197,10 +197,30 @@ def due_for_fetch(stamp_path: str = FETCH_STAMP,
 
 @dataclass
 class UniverseFilters:
-    """The screener filters defining "the US market" for breadth purposes."""
+    """The screener filters defining "the US market" for breadth purposes.
+
+    Two vocabularies for one definition, because the providers do not speak
+    the same language. `min_price` and `min_avg_volume` are the DEFINITION --
+    numbers, provider-neutral, what the TradingView scanner is handed and
+    what anything new should read. The three strings are Finviz's own filter
+    enum, which takes "Over $5" and not 5.0 and has no general numeric form,
+    so they cannot be derived.
+
+    They must agree, and `test_the_two_filter_vocabularies_agree` is what
+    keeps them agreeing: a definition that says one thing to one provider and
+    another to the next produces two different universes and one number on
+    screen.
+    """
     industry: str = "Stocks only (ex-Funds)"   # excludes ETFs and closed-end funds
     price: str = "Over $5"
     avg_volume: str = "Over 300K"
+
+    # The same three rules as numbers. `include_dr` keeps ADRs, which the
+    # Finviz "Stocks only (ex-Funds)" industry filter also keeps -- the label
+    # has always said "US common + ADR".
+    min_price: float = 5.0
+    min_avg_volume: float = 300_000.0
+    include_dr: bool = True
 
     def as_dict(self) -> Dict[str, str]:
         return {"Industry": self.industry, "Price": self.price,
