@@ -2013,3 +2013,39 @@ def test_the_trade_timer_would_be_refused_on_a_half_day():
     # And the real clock helper agrees with the arithmetic above.
     assert past_moc_cutoff("America/New_York", "00:00")
     assert not past_moc_cutoff("America/New_York", "23:59")
+
+
+def test_the_trade_phase_sits_out_a_half_day_without_doing_any_work(monkeypatch, tmp_path):
+    """Skipped cleanly at the top, not failed at the cutoff.
+
+    The distinction matters operationally: a systemd unit that exits non-zero
+    three times a year looks like a broken trader, and the thing it is
+    reporting is a normal, expected, quiet day.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from qbs.live import runner
+
+    live = LiveConfig()
+    live.state_dir = str(tmp_path)
+    live.__post_init__()
+
+    calls = []
+    monkeypatch.setattr(runner, "_load_and_compute",
+                        lambda *a, **k: calls.append("loaded"))
+
+    def at(y, m, d):
+        return lambda tz: datetime(y, m, d, 15, 30, tzinfo=ZoneInfo(tz))
+
+    monkeypatch.setattr(runner, "market_today", at(2026, 11, 27))   # half day
+    assert runner.phase_trade(Config(), live) == runner.EXIT_OK
+    assert calls == [], "a skipped day must not download or rank anything"
+
+    last = st.last_run(live.state_path, "trade") if hasattr(st, "last_run") else None
+    if last is not None:
+        assert last.get("status") == "skipped"
+
+    # An ordinary Tuesday must still get as far as the work.
+    monkeypatch.setattr(runner, "market_today", at(2026, 12, 1))
+    runner.phase_trade(Config(), live)
+    assert calls == ["loaded"], "a normal session must not be skipped"

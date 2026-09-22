@@ -426,14 +426,31 @@ Half days are the one case that test cannot catch, because the market really
 did open and there really is a bar. On July 3rd, the Friday after Thanksgiving
 and Christmas Eve the auction is at 13:00 ET, while the trade timer fires at
 15:30 — so the run would submit MOC into an auction that finished two and a
-half hours earlier. On those dates the cutoff drops to `QBS_EARLY_CLOSE_HHMM`
-(12:45 by default) and the phase refuses instead:
+half hours earlier.
+
+The trade phase sits those sessions out, at the top, before downloading or
+ranking anything:
 
 ```
-past the 12:45 MOC cutoff in America/New_York (now 15:30) -- today is an early
-close, the auction was at 13:00; not submitting. Tomorrow's run recomputes from
-scratch and will correct the book.
+2026-11-27 is an early close (auction 13:00 America/New_York) -- sitting it
+out; tomorrow's run recomputes from scratch
 ```
+
+It exits 0, because a half day is a normal expected quiet day and a unit that
+fails three times a year looks like a broken trader.
+
+**Sitting out is not going to cash.** Nothing is sold; the book holds whatever
+it held into the shortened session and through the holiday. The only thing
+skipped is the *rebalance*, which on those days would have to clear a thin,
+widely-quoted closing auction — the one place a shortened session costs real
+money. Over the six years in the cache the book has averaged +0.79% on a half
+day against +0.07% on every other day, so holding through them has been the
+right side of the trade; the sample is twelve sessions, which is not enough to
+lean on, but it is certainly no argument for being flat.
+
+`QBS_EARLY_CLOSE_HHMM` (12:45) remains as a backstop under `--force`: forcing
+a run overrides the calendar, so a shortened session can be traded deliberately
+before 12:45, but no flag brings back an auction that has already happened.
 
 The three dates are derived from the date itself, so there is no list that
 expires at the end of the year. The derivation knows that when the 4th of July

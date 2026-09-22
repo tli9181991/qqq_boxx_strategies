@@ -382,6 +382,21 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
         log.info("weekend in %s -- nothing to do", live.market_tz)
         return EXIT_OK
 
+    # Half days are sat out entirely, before any of the work. The auction is at
+    # 13:00 and this phase fires at 15:30, so there is nothing to submit into
+    # -- but the reason to skip rather than move the timer earlier is the
+    # session itself. A shortened pre-holiday session is thinly traded and
+    # widely quoted, and the closing auction is where that costs most. The
+    # book recomputes from scratch tomorrow, so a skipped rebalance is not a
+    # position left wrong, only a day older.
+    today = market_today(live.market_tz).date()
+    if moc_cutoff_for(live, today) != live.moc_cutoff_hhmm and not force:
+        log.info("%s is an early close (auction 13:00 %s) -- sitting it out; "
+                 "tomorrow's run recomputes from scratch", today, live.market_tz)
+        st.record_run(live.state_path, "trade", "skipped",
+                      {"reason": "early close", "session": f"{today}"})
+        return EXIT_OK
+
     try:
         _, book = _load_and_compute(cfg, live, refresh=True)
     except Exception as exc:
@@ -439,14 +454,17 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
             # Checked here, immediately before sending, not at the top of the
             # phase: the download and ranking take real time, and it is the
             # submission that has to beat the cutoff.
-            # The cutoff is not a constant: on a half day the auction is at
-            # 13:00, and the timer that fires this phase at 15:30 knows nothing
-            # about that. Without this the run would sail past a closed market
-            # and submit into an auction that happened hours ago.
-            today = market_today(live.market_tz).date()
+            # On a half day the auction is at 13:00, and the phase has already
+            # returned before reaching this -- so this only sees a half day
+            # under --force. Force overrides the calendar, which is its job:
+            # an operator who really wants to trade a shortened session can,
+            # by running before 12:45. It does not override the clock. Once
+            # that auction has happened no flag brings it back, and submitting
+            # MOC into it would be rejected while the log claimed success.
             cutoff = moc_cutoff_for(live, today)
-            if orders and past_moc_cutoff(live.market_tz, cutoff) and not force:
-                early = cutoff != live.moc_cutoff_hhmm
+            early = cutoff != live.moc_cutoff_hhmm
+            if orders and past_moc_cutoff(live.market_tz, cutoff) \
+                    and not (force and not early):
                 raise BrokerError(
                     f"past the {cutoff} MOC cutoff in {live.market_tz} "
                     f"(now {market_today(live.market_tz):%H:%M})"
