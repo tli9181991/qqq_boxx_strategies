@@ -53,8 +53,9 @@ import numpy as np
 import pandas as pd
 
 from .config import DOWNLOAD_START
-from .data import (MARKET_CLOSE, MARKET_TZ, last_market_close,
-                   next_market_close, sessions_behind)
+from .data import (MARKET_CLOSE, MARKET_TZ, drop_partial_bars,
+                   last_market_close, next_market_close,
+                   sessions_behind)
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -308,6 +309,23 @@ def sector_map(universe: Optional[pd.DataFrame]) -> Dict[str, str]:
     return dict(zip(pairs["Ticker"], pairs["Sector"]))
 
 
+def _torn_note(torn: List[pd.Timestamp]) -> Optional[str]:
+    """What to say about a bar the provider had not finished publishing.
+
+    Named rather than dropped in silence: a session that vanishes with no
+    explanation reads as a failed download, and the remedy for the two is
+    not the same.
+    """
+    if not torn:
+        return None
+    days = ", ".join(f"{d:%Y-%m-%d}" for d in sorted(set(torn)))
+    return (f"dropped {days} — the download landed before the provider had "
+            f"published most of the universe, so that bar held only a handful "
+            f"of names. It is not counted as a session and does not count as "
+            f"a fresh cache; the next fetch will pick it up, or press "
+            f"**Refresh now**.")
+
+
 def load_universe_bars(
     tickers: List[str],
     start: str = DOWNLOAD_START,
@@ -342,6 +360,26 @@ def load_universe_bars(
     os.makedirs(cache_dir, exist_ok=True)
     c_path = os.path.join(cache_dir, f"{prefix}_closes.csv")
     v_path = os.path.join(cache_dir, f"{prefix}_volumes.csv")
+    torn: List[pd.Timestamp] = []
+
+    def _whole(c, v):
+        """Trailing rows the provider had not finished publishing, removed.
+
+        Applied BEFORE the staleness check below, not after, and that
+        ordering is the whole point. A torn bar carries the current date, so
+        a cache holding one reports itself current, the download that would
+        replace it never runs, and the app sits on the last good session
+        until somebody presses the button. The check has to be asked about
+        the last WHOLE bar, not the last row.
+        """
+        if c is None or c.empty:
+            return c, v
+        c, dropped = drop_partial_bars(c)
+        if dropped:
+            torn.extend(dropped)
+            if v is not None and not v.empty:
+                v = v.loc[:c.index.max()]
+        return c, v
 
     def _read():
         if not (os.path.exists(c_path) and os.path.exists(v_path)):
@@ -356,10 +394,12 @@ def load_universe_bars(
     if offline or not refresh:
         c, v = _read()
         if offline:
+            c, v = _whole(c, v)
             err = None if c is not None else (
                 "offline and no cached price frames on disk — run once with "
                 "Source set to Online to build them")
-            return c, v, err
+            return c, v, err or _torn_note(torn)
+        c, v = _whole(c, v)
         if c is not None and not c.empty:
             # A cache HIT that never asks how old it is pins the app to
             # whatever is on disk for ever. `stale_after` is the number of
@@ -367,10 +407,10 @@ def load_universe_bars(
             # keeps the old behaviour for callers that manage freshness
             # themselves.
             if stale_after is None:
-                return c, v, None
+                return c, v, _torn_note(torn)
             behind = sessions_behind(c.index.max())
             if behind < stale_after:
-                return c, v, None
+                return c, v, _torn_note(torn)
             if verbose:
                 print(f"[finviz] price cache is {behind} session(s) behind "
                       f"(limit {stale_after}) — re-downloading")
@@ -433,15 +473,20 @@ def load_universe_bars(
         vdf.index.name = "Date"
         vdf = vdf.reindex(columns=cdf.columns)
 
+    # The cache keeps what arrived; the caller gets what is whole. Writing
+    # the trimmed frame would throw away the dozen names that DID report,
+    # and they are the head of a real bar -- the next fetch fills the rest
+    # in rather than starting over.
     cdf.to_csv(c_path)
     if vdf is not None:
         vdf.to_csv(v_path)
+    cdf, vdf = _whole(cdf, vdf)
     if verbose:
         print(f"[finviz] {cdf.shape[1]} tickers, {len(cdf)} rows"
               + (f" · no data for {len(set(failed))}" if failed else ""))
     warn = (f"{len(set(failed))} of {len(tickers)} tickers returned no data"
             if failed else None)
-    return cdf, vdf, warn
+    return cdf, vdf, "; ".join(x for x in (warn, _torn_note(torn)) if x) or None
 
 
 # --------------------------------------------------------------------------

@@ -2766,6 +2766,72 @@ def test_a_stale_bars_cache_stops_counting_as_a_hit(tmp_path):
     assert err2, "a rejected cache and a failed download must report something"
 
 
+def test_a_torn_cached_bar_does_not_pass_as_a_fresh_cache(tmp_path):
+    """The bar that made the dashboard sit on Friday's numbers all Monday.
+
+    A torn bar carries the current date, so `c.index.max()` says the cache is
+    current, `stale_after` is satisfied, and the download that would replace
+    it never runs. Cleaning the frame AFTER this function returns fixes what
+    is drawn and not what is decided -- the check has to be asked about the
+    last WHOLE bar.
+    """
+    import os
+
+    from qbs.finviz import load_universe_bars
+
+    idx = pd.bdate_range("2026-09-01", "2026-09-21")
+    names = [f"T{i:04d}" for i in range(200)]
+    closes = pd.DataFrame(100.0, index=idx, columns=names)
+    # Monday's bar arrived for twelve names out of two hundred.
+    closes.loc[pd.Timestamp("2026-09-21")] = np.nan
+    closes.loc[pd.Timestamp("2026-09-21"), names[:12]] = 100.0
+
+    d = str(tmp_path)
+    closes.rename_axis("Date").to_csv(os.path.join(d, "us_closes.csv"))
+    (closes * 0 + 1e6).rename_axis("Date").to_csv(
+        os.path.join(d, "us_volumes.csv"))
+
+    c, v, err = load_universe_bars(names, cache_dir=d, offline=True,
+                                   verbose=False)
+    assert c.index.max() == pd.Timestamp("2026-09-18"), "the torn bar is gone"
+    assert v.index.max() == pd.Timestamp("2026-09-18"), "volumes follow it"
+    assert err and "2026-09-21" in err, "and it is named, not dropped in silence"
+    assert "handful" in err
+
+    # The cache file itself is untouched: those twelve names are the head of a
+    # real bar, and the next fetch fills the rest in rather than starting over.
+    on_disk = pd.read_csv(os.path.join(d, "us_closes.csv"),
+                          parse_dates=["Date"], index_col="Date")
+    assert on_disk.index.max() == pd.Timestamp("2026-09-21")
+
+    # And with a staleness limit the cache is now correctly judged one session
+    # behind, so the loader goes to the network instead of serving the tear.
+    c2, _, err2 = load_universe_bars(names, cache_dir=d, verbose=False,
+                                     stale_after=1)
+    assert err2, "a torn cache must not satisfy stale_after"
+
+
+def test_a_complete_cache_is_still_served_untouched(tmp_path):
+    """The guard must be invisible on every normal day, or it turns into a
+    second source of unnecessary 2,400-name downloads."""
+    import os
+
+    from qbs.finviz import load_universe_bars
+
+    idx = pd.bdate_range("2026-09-01", "2026-09-21")
+    names = [f"T{i:04d}" for i in range(200)]
+    closes = pd.DataFrame(100.0, index=idx, columns=names)
+    d = str(tmp_path)
+    closes.rename_axis("Date").to_csv(os.path.join(d, "us_closes.csv"))
+    (closes * 0 + 1e6).rename_axis("Date").to_csv(
+        os.path.join(d, "us_volumes.csv"))
+
+    c, _, err = load_universe_bars(names, cache_dir=d, offline=True,
+                                   verbose=False)
+    assert c.index.max() == pd.Timestamp("2026-09-21")
+    assert err is None
+
+
 def test_fetch_us_universe_names_a_missing_package():
     """The commonest failure by far: installed in a notebook or on Colab, not
     for the interpreter running Streamlit. The message has to say that."""

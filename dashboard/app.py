@@ -331,22 +331,12 @@ def load_us_market(download_start: str, online: bool, force: bool,
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
             f"{bars_err}"), False
 
-    # A bar the provider had not finished publishing is not a session. Left
-    # in, breadth counts the 4% movers among the dozen names that arrived and
-    # reports zero, which reads as a flat tape rather than an empty one.
-    closes, torn = drop_partial_bars(closes)
-    if torn and volumes is not None:
-        volumes = volumes.loc[:closes.index.max()]
-
-    # A partial fetch is usable; a silent one is not. Carry the warning up.
+    # A bar the provider had not finished publishing is dropped inside
+    # `load_universe_bars` now, not here -- it has to happen before that
+    # function's own staleness check, or a torn bar makes the cache look
+    # current and the download that would replace it never runs. Its reason
+    # arrives in `bars_err`.
     warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
-    if torn:
-        days = ", ".join(f"{d:%Y-%m-%d}" for d in torn)
-        warn = "; ".join(x for x in (warn, (
-            f"dropped {days} — the download landed before the provider had "
-            f"published most of the universe, so that bar held only a "
-            f"handful of names. Press **Refresh now** after the settling "
-            f"window to pick it up.")) if x)
     note = f"{filters.label} · {why}"
     return closes, volumes, sector_map(uni), note, warn, auto
 
