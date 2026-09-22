@@ -414,6 +414,53 @@ An excluded name the strategy already holds is **sold** on the next run: it has
 no target, and excluded names deliberately stay tradeable so the position can
 be closed rather than stranded.
 
+### Holidays and half days
+
+The trader does not carry a holiday calendar and does not need one. The trade
+phase asks the price feed instead: if there is no bar dated today, the market
+is shut and it refuses to submit, logging `market closed or data late`. That
+covers every holiday, and — unlike any fixed list — the unscheduled closures a
+list cannot predict, such as a state funeral or a hurricane.
+
+Half days are the one case that test cannot catch, because the market really
+did open and there really is a bar. On July 3rd, the Friday after Thanksgiving
+and Christmas Eve the auction is at 13:00 ET, while the trade timer fires at
+15:30 — so the run would submit MOC into an auction that finished two and a
+half hours earlier.
+
+The trade phase sits those sessions out, at the top, before downloading or
+ranking anything:
+
+```
+2026-11-27 is an early close (auction 13:00 America/New_York) -- sitting it
+out; tomorrow's run recomputes from scratch
+```
+
+It exits 0, because a half day is a normal expected quiet day and a unit that
+fails three times a year looks like a broken trader.
+
+**Sitting out is not going to cash.** Nothing is sold; the book holds whatever
+it held into the shortened session and through the holiday. The only thing
+skipped is the *rebalance*, which on those days would have to clear a thin,
+widely-quoted closing auction — the one place a shortened session costs real
+money. Over the six years in the cache the book has averaged +0.79% on a half
+day against +0.07% on every other day, so holding through them has been the
+right side of the trade; the sample is twelve sessions, which is not enough to
+lean on, but it is certainly no argument for being flat.
+
+`QBS_EARLY_CLOSE_HHMM` (12:45) remains as a backstop under `--force`: forcing
+a run overrides the calendar, so a shortened session can be traded deliberately
+before 12:45, but no flag brings back an auction that has already happened.
+
+The three dates are derived from the date itself, so there is no list that
+expires at the end of the year. The derivation knows that when the 4th of July
+or Christmas Day falls on a Saturday the holiday moves *back* onto the 3rd or
+the 24th and the market is shut rather than early. For anything the rules
+cannot know about, `QBS_EARLY_CLOSE_DATES` takes `YYYY-MM-DD` entries.
+
+Missing one auction costs nothing structural: the strategy recomputes from
+scratch every session, so the next run corrects the book.
+
 ### The CSV logs in `var/`
 
 Six files, so the run log can be read with `cat` and no tooling:
