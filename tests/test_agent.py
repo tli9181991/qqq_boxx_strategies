@@ -800,8 +800,11 @@ def test_headlines_are_returned_with_no_model_at_all(monkeypatch, tmp_path):
         raise AssertionError("the model must not be called")
 
     monkeypatch.setattr(snt, "summarise", explode)
+    # `now=now` pins the window. Without it the fixture's timestamp is
+    # measured against the wall clock and this passes on the day it is
+    # written, then fails the next morning.
     feed, summary, cached = snt.read_news(summarise_it=False,
-                                          cache_dir=str(tmp_path))
+                                          cache_dir=str(tmp_path), now=now)
     assert feed.total == 1 and summary is None and cached
 
 
@@ -818,7 +821,7 @@ def test_switching_the_read_off_still_serves_a_paid_for_summary(monkeypatch, tmp
              cache_dir=str(tmp_path))
 
     _, summary, _ = snt.read_news(summarise_it=False, cache_dir=str(tmp_path),
-                                  as_of=as_of)
+                                  as_of=as_of, now=now)
     assert summary is not None and summary.label == "mixed"
 
 

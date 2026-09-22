@@ -47,8 +47,8 @@ from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams)
-from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
-                      sessions_behind)
+from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
+                      load_prices, sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
                         fetch_us_universe, load_universe_bars,
                         record_fetch_attempt, sector_map)
@@ -120,7 +120,7 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
     numbers is fine; showing them while claiming to be live is not.
     """
     status = {"mode": "online" if online else "offline", "downloaded": False,
-              "error": None}
+              "error": None, "partial": []}
 
     uni, px = None, None
     try:
@@ -144,6 +144,13 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
             status["error"] = str(exc)
             if uni is None or px is None:
                 raise
+
+    # BEFORE the reindex-and-ffill, which would paper a torn bar over with
+    # yesterday's prices and make every name look unchanged on the day.
+    uni, torn = drop_partial_bars(uni)
+    status["partial"] = [f"{d:%Y-%m-%d}" for d in torn]
+    if torn:
+        px = px.loc[:uni.index.max()]
 
     uni = uni.reindex(px.index).ffill()
     uni = uni.loc[:, uni.notna().sum() >= 260]
@@ -324,8 +331,22 @@ def load_us_market(download_start: str, online: bool, force: bool,
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
             f"{bars_err}"), False
 
+    # A bar the provider had not finished publishing is not a session. Left
+    # in, breadth counts the 4% movers among the dozen names that arrived and
+    # reports zero, which reads as a flat tape rather than an empty one.
+    closes, torn = drop_partial_bars(closes)
+    if torn and volumes is not None:
+        volumes = volumes.loc[:closes.index.max()]
+
     # A partial fetch is usable; a silent one is not. Carry the warning up.
     warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
+    if torn:
+        days = ", ".join(f"{d:%Y-%m-%d}" for d in torn)
+        warn = "; ".join(x for x in (warn, (
+            f"dropped {days} — the download landed before the provider had "
+            f"published most of the universe, so that bar held only a "
+            f"handful of names. Press **Refresh now** after the settling "
+            f"window to pick it up.")) if x)
     note = f"{filters.label} · {why}"
     return closes, volumes, sector_map(uni), note, warn, auto
 
@@ -514,6 +535,17 @@ def freshness_banner():
     if failed:
         st.error(f"**Download failed — showing the cached data instead.** "
                  f"{data_status['error']}", icon="🚫")
+    if data_status.get("partial"):
+        # Said out loud rather than quietly dropped. Someone looking for
+        # yesterday's session needs to know it was there and was thrown
+        # away, or they will read the gap as a missing download.
+        days = ", ".join(data_status["partial"])
+        st.warning(md(
+            f"**{days} dropped — the provider had not finished publishing "
+            "it.** Only a handful of names carried that bar, and a session "
+            "counted over a handful is not a session: every 4%-mover count "
+            "and every rank would have been computed from it. Press "
+            "**Refresh now** once the data has settled."), icon="🧩")
     if FRESH_LEVEL == "warn":
         # The remedy depends on why it is stale. Do not tell someone to go
         # online when they already are and the download is what broke.

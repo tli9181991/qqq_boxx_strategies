@@ -438,6 +438,7 @@ def read_news(
     model: Optional[str] = None,
     cache_dir: Optional[str] = None,
     as_of: Optional[str] = None,
+    now: Optional[pd.Timestamp] = None,
 ) -> Tuple[NewsFeed, Optional[Summary], bool]:
     """`(feed, summary, summary_from_cache)` -- the dashboard's entry point.
 
@@ -448,9 +449,16 @@ def read_news(
     `summarise_it=False` never calls the model. It still returns a cached
     summary if one is on disk, so turning the switch off does not blank a
     read that has already been paid for.
+
+    `now` pins the clock the `hours` window is measured against. It reaches
+    `fetch_news`, which otherwise reads the wall clock -- so without it a
+    test that stamps a headline at a fixed time passes on the day it is
+    written and fails the next morning, when that headline has aged out of
+    the window.
     """
-    as_of = as_of or pd.Timestamp.now("UTC").tz_convert(None).strftime("%Y-%m-%d")
-    feed = fetch_news(hours=hours)
+    now = now if now is not None else pd.Timestamp.now("UTC").tz_convert(None)
+    as_of = as_of or now.strftime("%Y-%m-%d")
+    feed = fetch_news(hours=hours, now=now)
 
     if not summarise_it:
         return feed, load_cached(as_of, cache_dir), True
