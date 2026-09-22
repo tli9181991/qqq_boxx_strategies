@@ -2134,10 +2134,144 @@ def _et(stamp):
     return pd.Timestamp(stamp, tz="America/New_York")
 
 
+def _wide(n_rows=60, n_cols=100, seed=0):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2026-06-01", periods=n_rows)
+    steps = rng.normal(0.0005, 0.01, size=(n_rows, n_cols))
+    px = 100 * np.exp(np.cumsum(steps, axis=0))
+    return pd.DataFrame(px, index=idx,
+                        columns=[f"T{i:03d}" for i in range(n_cols)])
+
+
+def test_a_torn_trailing_bar_is_dropped():
+    """The bug this exists for: a download landing while the provider is
+    still publishing puts a session-shaped row with twelve names in it into
+    a frame of two and a half thousand."""
+    from qbs.data import drop_partial_bars
+
+    px = _wide()
+    torn = px.copy()
+    nxt = px.index[-1] + pd.Timedelta(days=1)
+    torn.loc[nxt] = np.nan
+    torn.loc[nxt, list(px.columns[:12])] = 100.0
+
+    out, dropped = drop_partial_bars(torn)
+    assert [d.date() for d in dropped] == [nxt.date()]
+    assert out.index[-1] == px.index[-1]
+    assert out.equals(px), "and nothing else is touched"
+
+
+def test_a_complete_frame_is_returned_unchanged():
+    """The guard must be invisible on every normal day, or it becomes a
+    second source of missing sessions."""
+    from qbs.data import drop_partial_bars
+
+    px = _wide()
+    out, dropped = drop_partial_bars(px)
+    assert dropped == [] and out is px
+
+    # A handful of names legitimately absent is not a torn bar -- names get
+    # delisted, and a threshold tight enough to catch that would eat real
+    # sessions.
+    gappy = px.copy()
+    gappy.iloc[-1, :5] = np.nan
+    out, dropped = drop_partial_bars(gappy)
+    assert dropped == [], "95% coverage is a session, not a tear"
+
+
+def test_consecutive_torn_bars_all_go():
+    """Two reruns inside the settling window leave two of them."""
+    from qbs.data import drop_partial_bars
+
+    px = _wide()
+    torn = px.copy()
+    for i, k in enumerate((12, 5), start=1):
+        day = px.index[-1] + pd.Timedelta(days=i)
+        torn.loc[day] = np.nan
+        torn.loc[day, list(px.columns[:k])] = 100.0
+
+    out, dropped = drop_partial_bars(torn)
+    assert len(dropped) == 2
+    assert out.index[-1] == px.index[-1]
+
+
+def test_early_history_is_not_mistaken_for_a_tear():
+    """Measured against the recent median, not the column count. A universe
+    grows over years, so a fixed fraction of the frame's width would delete
+    its own early history."""
+    from qbs.data import drop_partial_bars
+
+    px = _wide(n_rows=120, n_cols=100)
+    # The first 60 sessions only ever had ten names listed.
+    px.iloc[:60, 10:] = np.nan
+
+    out, dropped = drop_partial_bars(px)
+    assert dropped == [], "thin history is history, not a torn bar"
+    assert len(out) == len(px)
+
+
+def test_drop_partial_bars_survives_a_frame_too_short_to_judge():
+    from qbs.data import drop_partial_bars
+
+    one = _wide(n_rows=1)
+    assert drop_partial_bars(one)[1] == []
+    assert drop_partial_bars(pd.DataFrame())[1] == []
+
+
+def test_breadth_over_a_torn_bar_reports_zero_movers():
+    """Why the guard is at the data layer and not in the chart.
+
+    Nothing downstream can tell a torn bar from a flat one: the 4%-mover
+    counts come back 0 and 0 on a day the market rose, which is exactly what
+    a quiet session looks like.
+    """
+    from qbs.breadth import daily_breadth
+    from qbs.data import drop_partial_bars
+
+    px = _wide(n_rows=80)
+    qqq = px.mean(axis=1)
+
+    nxt = px.index[-1] + pd.Timedelta(days=1)
+    torn = px.copy()
+    torn.loc[nxt] = np.nan
+    torn.loc[nxt, list(px.columns[:12])] = px.iloc[-1][:12] * 1.012
+    qqq2 = pd.concat([qqq, pd.Series({nxt: qqq.iloc[-1] * 1.012})])
+
+    bad = daily_breadth(torn, qqq=qqq2).table.tail(1).iloc[0]
+    assert bad["n_stocks"] == 12
+    assert bad["up4"] == 0 and bad["dn4"] == 0, "the symptom, reproduced"
+
+    # With the row dropped first, the table simply ends at the last real one.
+    clean, _ = drop_partial_bars(torn)
+    good = daily_breadth(clean, qqq=qqq2).table
+    assert good.index[-1] == px.index[-1]
+    assert (good["n_stocks"] == 100).all()
+
+
+def test_a_bar_is_not_collectable_the_moment_the_bell_rings():
+    """The settling margin. The close is when the session ends, not when a
+    provider has finished publishing it -- fetching at 16:01 is how the torn
+    bar got in."""
+    from qbs.data import BAR_SETTLE, last_market_close
+
+    assert BAR_SETTLE > pd.Timedelta(0)
+    friday = pd.Timestamp("2026-09-18").date()
+    monday = pd.Timestamp("2026-09-21").date()
+
+    assert last_market_close(_et("2026-09-21 16:01")).date() == friday
+    assert last_market_close(_et("2026-09-21 16:59")).date() == friday
+    assert last_market_close(_et("2026-09-21 17:00")).date() == monday
+
+    # The exchange close itself is still available, and is a different
+    # question from what a provider has published.
+    assert last_market_close(_et("2026-09-21 16:01"),
+                             settle=pd.Timedelta(0)).date() == monday
+
+
 def test_sessions_behind_counts_weekdays_only():
     from qbs.data import sessions_behind
 
-    now = _et("2026-09-15 16:30")             # a Tuesday, after the close
+    now = _et("2026-09-15 17:30")   # a Tuesday, past the settling window
     assert sessions_behind(pd.Timestamp("2026-09-15"), now) == 0
     assert sessions_behind(pd.Timestamp("2026-09-14"), now) == 1
     assert sessions_behind(pd.Timestamp("2026-09-11"), now) == 2   # Fri -> Mon,Tue
@@ -2155,12 +2289,15 @@ def test_sessions_behind_is_measured_from_the_last_close():
 
     monday = pd.Timestamp("2026-09-14")
     tuesday = pd.Timestamp("2026-09-15")
-    # Tuesday morning, holding Monday's close: nothing newer exists.
+    # Tuesday, holding Monday's close: nothing newer is collectable yet.
+    # That stays true through the close itself and the settling window after
+    # it -- see `test_a_bar_is_not_collectable_the_moment_the_bell_rings`.
     assert sessions_behind(monday, _et("2026-09-15 09:30")) == 0
     assert sessions_behind(monday, _et("2026-09-15 15:59")) == 0
-    # The close lands and Monday's cache is now genuinely one bar short.
-    assert sessions_behind(monday, _et("2026-09-15 16:00")) == 1
-    assert sessions_behind(tuesday, _et("2026-09-15 16:00")) == 0
+    assert sessions_behind(monday, _et("2026-09-15 16:30")) == 0
+    # Once it settles, Monday's cache is genuinely one bar short.
+    assert sessions_behind(monday, _et("2026-09-15 17:00")) == 1
+    assert sessions_behind(tuesday, _et("2026-09-15 17:00")) == 0
 
 
 def test_sessions_behind_does_not_depend_on_the_utc_date():
@@ -2188,24 +2325,24 @@ def test_sessions_behind_ignores_the_weekend():
     from qbs.data import sessions_behind
 
     friday = pd.Timestamp("2026-09-11")
-    assert sessions_behind(friday, _et("2026-09-11 16:30")) == 0   # Fri, post
+    assert sessions_behind(friday, _et("2026-09-11 17:30")) == 0   # Fri, post
     assert sessions_behind(friday, _et("2026-09-12 12:00")) == 0   # Sat
     assert sessions_behind(friday, _et("2026-09-13 12:00")) == 0   # Sun
     assert sessions_behind(friday, _et("2026-09-14 09:30")) == 0   # Mon, pre
-    assert sessions_behind(friday, _et("2026-09-14 16:30")) == 1   # Mon, post
+    assert sessions_behind(friday, _et("2026-09-14 17:30")) == 1   # Mon, post
 
 
 def test_sessions_behind_never_goes_negative():
     from qbs.data import sessions_behind
 
     assert sessions_behind(pd.Timestamp("2026-09-15"),
-                           _et("2026-09-10 16:30")) == 0
+                           _et("2026-09-10 17:30")) == 0
 
 
 def test_freshness_note_levels():
     from qbs.data import freshness_note
 
-    now = _et("2026-09-15 16:30")
+    now = _et("2026-09-15 17:30")
     assert freshness_note(pd.Timestamp("2026-09-15"), now)[1] == "ok"
     assert freshness_note(pd.Timestamp("2026-09-14"), now)[1] == "info"
     assert freshness_note(pd.Timestamp("2026-09-08"), now)[1] == "warn"
@@ -2221,7 +2358,7 @@ def test_freshness_note_carries_no_remedy():
     from qbs.data import freshness_note
 
     _, _, msg = freshness_note(pd.Timestamp("2026-09-08"),
-                               _et("2026-09-15 16:30"))
+                               _et("2026-09-15 17:30"))
     assert "5 sessions behind" in msg
     for word in ("Online", "refresh", "Refresh"):
         assert word not in msg
@@ -2433,15 +2570,15 @@ def test_the_market_close_helpers_track_dst_and_the_weekend():
 
     # The close is 20:00 UTC in summer and 21:00 in winter, which is why the
     # boundary is written in exchange time and not in UTC.
-    summer = last_market_close(_et("2026-09-21 16:30"))
-    winter = last_market_close(_et("2026-01-21 16:30"))
+    summer = last_market_close(_et("2026-09-21 17:30"))
+    winter = last_market_close(_et("2026-01-21 17:30"))
     assert str(summer.tz_convert("UTC").time()) == "20:00:00"
     assert str(winter.tz_convert("UTC").time()) == "21:00:00"
 
-    # A minute before the close, the newest bar is still the previous day's.
+    # Before the day's bar has settled, the newest one is the previous day's.
     assert last_market_close(_et("2026-09-21 15:59")).date() \
         == pd.Timestamp("2026-09-18").date()
-    assert last_market_close(_et("2026-09-21 16:00")).date() \
+    assert last_market_close(_et("2026-09-21 17:00")).date() \
         == pd.Timestamp("2026-09-21").date()
 
     # Weekends resolve back to, and forward from, the weekday closes.
@@ -2449,7 +2586,7 @@ def test_the_market_close_helpers_track_dst_and_the_weekend():
         == pd.Timestamp("2026-09-18").date()
     assert next_market_close(_et("2026-09-19 12:00")).date() \
         == pd.Timestamp("2026-09-21").date()
-    assert next_market_close(_et("2026-09-21 16:00")).date() \
+    assert next_market_close(_et("2026-09-21 17:00")).date() \
         == pd.Timestamp("2026-09-22").date()
 
 
@@ -2502,7 +2639,7 @@ def test_the_fetch_gate_closes_until_the_next_close(tmp_path):
     from qbs.finviz import due_for_fetch, record_fetch_attempt
 
     stamp = str(tmp_path / "stamp.txt")
-    now = _et("2026-09-21 16:30")
+    now = _et("2026-09-21 17:30")
     record_fetch_attempt(stamp, now=now)
 
     due, why = due_for_fetch(stamp, now=now + pd.Timedelta(minutes=5))
@@ -2513,7 +2650,9 @@ def test_the_fetch_gate_closes_until_the_next_close(tmp_path):
     # And it stays shut through the next morning, because nothing new has
     # been published yet.
     assert not due_for_fetch(stamp, now=_et("2026-09-22 09:30"))[0]
-    assert due_for_fetch(stamp, now=_et("2026-09-22 16:00"))[0]
+    assert not due_for_fetch(stamp, now=_et("2026-09-22 16:30"))[0], \
+        "not the instant the bell rings -- the tape is still settling"
+    assert due_for_fetch(stamp, now=_et("2026-09-22 17:00"))[0]
 
 
 def test_a_pre_close_fetch_does_not_consume_the_days_attempt(tmp_path):
@@ -2535,11 +2674,16 @@ def test_a_pre_close_fetch_does_not_consume_the_days_attempt(tmp_path):
     # Mid-session: nothing new, so no second download.
     assert not due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 13:30"))[0]
 
-    # Half an hour after the close, 9/21's bar exists and MUST be collectable.
-    due, why = due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 20:30"))
+    # Still inside the settling window: asking here is how the torn bar got
+    # in, so the gate holds.
+    assert not due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 20:30"))[0]
+
+    # Once it has settled, 9/21's bar MUST be collectable -- on 9/21, not
+    # after the UTC date has rolled over.
+    due, why = due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 21:30"))
     assert due, "the post-close attempt is the one that gets the new bar"
     assert "before the 2026-09-21 close" in why
-    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 20:30"))
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 21:30"))
 
     # Having collected it, it does not go round again.
     for t in ("2026-09-21 23:59", "2026-09-22 01:00", "2026-09-22 13:30"):
@@ -2570,11 +2714,12 @@ def test_the_epoch_key_changes_only_on_a_close():
 
     pre = fetch_epoch(_et("2026-09-21 09:30"))
     assert pre == fetch_epoch(_et("2026-09-21 15:59")), "steady all session"
-    post = fetch_epoch(_et("2026-09-21 16:00"))
-    assert post != pre, "the close is the only thing that moves it"
+    assert pre == fetch_epoch(_et("2026-09-21 16:30")), "and while it settles"
+    post = fetch_epoch(_et("2026-09-21 17:00"))
+    assert post != pre, "a settled bar is the only thing that moves it"
     assert post == fetch_epoch(_et("2026-09-21 23:59"))
     assert post == fetch_epoch(_et("2026-09-22 09:30")), "and overnight"
-    assert fetch_epoch(_et("2026-09-22 16:00")) != post
+    assert fetch_epoch(_et("2026-09-22 17:00")) != post
 
 
 def test_an_unwritable_stamp_does_not_break_the_fetch(tmp_path):

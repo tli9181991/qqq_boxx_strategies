@@ -138,14 +138,81 @@ def load_daily_ohlc(
 MARKET_TZ = "America/New_York"
 MARKET_CLOSE = (16, 0)            # 16:00 ET, the regular-session close
 
+# How long after the close before the day's bar counts as collectable.
+#
+# The bell is when the session ends, not when a provider has finished
+# publishing it. Fetching at 16:01 returns a row that a handful of tickers
+# have and the rest do not, and a union of per-ticker series turns that into
+# a session-shaped row with twelve names in it -- see `drop_partial_bars`,
+# which catches the ones that get through. This margin is the cheaper half of
+# the fix: ask later and mostly do not get a torn read at all.
+#
+# An hour is a guess at a provider's settling time, not a documented SLA. It
+# is a knob for that reason, and the coverage check is what actually
+# guarantees correctness.
+BAR_SETTLE = pd.Timedelta(minutes=60)
 
-def last_market_close(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
-    """The most recent weekday 16:00 ET at or before `now`, tz-aware.
 
-    The moment the newest daily bar became collectable. Weekdays only, so it
-    over-reports around a holiday in the harmless direction: the fetch runs
-    and finds nothing new, rather than not running when there is.
+def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
+                      lookback: int = 20) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
+    """Remove trailing rows the provider had not finished publishing.
+
+    Returns `(frame, dropped_dates)`.
+
+    A wide download is a union of per-ticker series, so one ticker carrying
+    today's bar puts today's DATE in the index for all of them -- everyone
+    else NaN. Fetch just after the close, while the provider is still
+    settling the tape, and you get a row with twelve names in it out of two
+    and a half thousand.
+
+    Nothing downstream can tell that row from a real session. Breadth counts
+    the 4% movers among the twelve and reports zero, which reads as a flat
+    tape rather than an empty one; the ranker ranks twelve names and calls it
+    the universe. Both produce a confident number from almost no data, which
+    is worse than producing none.
+
+    Trailing rows only, and measured against the median of the `lookback`
+    rows before them rather than against the frame's width. A universe grows
+    and shrinks over years, so early history legitimately has fewer names
+    than today and a fixed fraction of the column count would delete it. The
+    thing being detected is a cliff at the end, not a thin patch.
+
+    `min_coverage` is deliberately loose. A real session has essentially
+    every name; the failure this catches is a factor of a hundred, not a
+    borderline call, and a tight threshold would start eating half-holidays.
     """
+    dropped: List[pd.Timestamp] = []
+    if frame is None or frame.empty or len(frame) < 2:
+        return frame, dropped
+
+    covered = frame.notna().sum(axis=1)
+    end = len(frame)
+    while end > 1:
+        ref = covered.iloc[max(0, end - 1 - lookback):end - 1].median()
+        if ref and covered.iloc[end - 1] < min_coverage * ref:
+            dropped.append(frame.index[end - 1])
+            end -= 1
+        else:
+            break
+    if not dropped:
+        return frame, dropped
+    return frame.iloc[:end], list(reversed(dropped))
+
+
+def last_market_close(now: Optional[pd.Timestamp] = None,
+                      settle: Optional[pd.Timedelta] = None) -> pd.Timestamp:
+    """The newest daily bar that should be collectable, as its close.
+
+    Returns the 16:00 ET timestamp of that bar, so `.date()` is the bar's
+    date, but the bar does not count as available until `settle` after it --
+    see `BAR_SETTLE`. Pass `settle=pd.Timedelta(0)` for the exchange close
+    itself, which is a different question and has no callers here.
+
+    Weekdays only, so it over-reports around a holiday in the harmless
+    direction: the fetch runs and finds nothing new, rather than not running
+    when there is.
+    """
+    settle = BAR_SETTLE if settle is None else settle
     now = (pd.Timestamp.now(MARKET_TZ) if now is None
            else pd.Timestamp(now))
     now = (now.tz_localize("UTC") if now.tzinfo is None
@@ -153,8 +220,8 @@ def last_market_close(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
 
     close = now.normalize() + pd.Timedelta(hours=MARKET_CLOSE[0],
                                            minutes=MARKET_CLOSE[1])
-    # Walk back to the last weekday whose close has actually happened.
-    while close > now or close.weekday() >= 5:
+    # Walk back to the last weekday whose bar has had time to be published.
+    while close + settle > now or close.weekday() >= 5:
         close -= pd.Timedelta(days=1)
     return close
 
