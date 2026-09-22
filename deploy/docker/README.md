@@ -414,6 +414,36 @@ An excluded name the strategy already holds is **sold** on the next run: it has
 no target, and excluded names deliberately stay tradeable so the position can
 be closed rather than stranded.
 
+### Holidays and half days
+
+The trader does not carry a holiday calendar and does not need one. The trade
+phase asks the price feed instead: if there is no bar dated today, the market
+is shut and it refuses to submit, logging `market closed or data late`. That
+covers every holiday, and — unlike any fixed list — the unscheduled closures a
+list cannot predict, such as a state funeral or a hurricane.
+
+Half days are the one case that test cannot catch, because the market really
+did open and there really is a bar. On July 3rd, the Friday after Thanksgiving
+and Christmas Eve the auction is at 13:00 ET, while the trade timer fires at
+15:30 — so the run would submit MOC into an auction that finished two and a
+half hours earlier. On those dates the cutoff drops to `QBS_EARLY_CLOSE_HHMM`
+(12:45 by default) and the phase refuses instead:
+
+```
+past the 12:45 MOC cutoff in America/New_York (now 15:30) -- today is an early
+close, the auction was at 13:00; not submitting. Tomorrow's run recomputes from
+scratch and will correct the book.
+```
+
+The three dates are derived from the date itself, so there is no list that
+expires at the end of the year. The derivation knows that when the 4th of July
+or Christmas Day falls on a Saturday the holiday moves *back* onto the 3rd or
+the 24th and the market is shut rather than early. For anything the rules
+cannot know about, `QBS_EARLY_CLOSE_DATES` takes `YYYY-MM-DD` entries.
+
+Missing one auction costs nothing structural: the strategy recomputes from
+scratch every session, so the next run corrects the book.
+
 ### The CSV logs in `var/`
 
 Six files, so the run log can be read with `cat` and no tooling:

@@ -1936,3 +1936,80 @@ def test_watched_names_are_placed_independently_of_each_other():
         "one outsider's momentum has nothing to do with another's rank"
     # And the cutoffs stay the constituents' own, whoever is being watched.
     assert len({r["book_cutoff"] for r in rows}) == 1
+
+
+# --------------------------------------------------------------------------
+# The market calendar
+# --------------------------------------------------------------------------
+
+def test_the_half_days_are_derived_correctly():
+    """Checked against the published NYSE calendar, 2023-2027.
+
+    The interesting cases are the ones where the rule looks like it should
+    fire and must not: when the 4th of July or Christmas Day lands on a
+    Saturday the holiday moves *back* onto the 3rd or the 24th and the market
+    is shut for the day, not open for half of it.
+    """
+    from datetime import date
+    from qbs.live.runner import us_early_close
+
+    real = {
+        2023: [date(2023, 7, 3), date(2023, 11, 24)],
+        2024: [date(2024, 7, 3), date(2024, 11, 29), date(2024, 12, 24)],
+        2025: [date(2025, 7, 3), date(2025, 11, 28), date(2025, 12, 24)],
+        2026: [date(2026, 11, 27), date(2026, 12, 24)],
+        2027: [date(2027, 11, 26)],
+    }
+    import calendar as _cal
+    for year, expected in real.items():
+        found = [date(year, m, d)
+                 for m in (7, 11, 12)
+                 for d in range(1, _cal.monthrange(year, m)[1] + 1)
+                 if us_early_close(date(year, m, d))]
+        assert found == expected, f"{year}: {found} != {expected}"
+
+    # Spelled out, because these are the ones that would silently go wrong.
+    assert not us_early_close(date(2026, 7, 3)), "the Fourth is a Saturday: shut, not early"
+    assert not us_early_close(date(2023, 12, 24)), "a Sunday"
+    assert not us_early_close(date(2027, 12, 24)), "Christmas is a Saturday: shut, not early"
+    assert not us_early_close(date(2026, 11, 20)), "the Friday *before* Thanksgiving"
+
+
+def test_the_cutoff_moves_on_a_half_day():
+    from datetime import date
+    from qbs.live.runner import moc_cutoff_for
+
+    live = LiveConfig()
+    assert moc_cutoff_for(live, date(2026, 9, 21)) == live.moc_cutoff_hhmm
+    assert moc_cutoff_for(live, date(2026, 11, 27)) == live.early_close_hhmm
+    assert moc_cutoff_for(live, date(2026, 12, 24)) == live.early_close_hhmm
+
+    # A one-off the standing rules cannot know about.
+    live.early_close_dates = ["2026-10-05"]
+    assert moc_cutoff_for(live, date(2026, 10, 5)) == live.early_close_hhmm
+    assert moc_cutoff_for(live, date(2026, 10, 6)) == live.moc_cutoff_hhmm
+
+
+def test_the_trade_timer_would_be_refused_on_a_half_day():
+    """The timer fires at 15:30 ET whatever the calendar says.
+
+    On a normal day that is comfortably inside the 15:45 cutoff. On a half day
+    the auction was at 13:00, and submitting MOC into it two and a half hours
+    later is the failure this guard exists to stop.
+    """
+    from datetime import date
+    from qbs.live.runner import moc_cutoff_for, past_moc_cutoff
+
+    live = LiveConfig()
+    fire = (15, 30)
+
+    def refused(day):
+        hh, mm = (int(x) for x in moc_cutoff_for(live, day).split(":"))
+        return fire >= (hh, mm)
+
+    assert not refused(date(2026, 9, 21)), "an ordinary Monday must still trade"
+    assert refused(date(2026, 11, 27)), "the Friday after Thanksgiving"
+    assert refused(date(2026, 12, 24)), "Christmas Eve"
+    # And the real clock helper agrees with the arithmetic above.
+    assert past_moc_cutoff("America/New_York", "00:00")
+    assert not past_moc_cutoff("America/New_York", "23:59")

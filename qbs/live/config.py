@@ -123,6 +123,13 @@ class LiveConfig:
     max_gross_turnover: float = 1.60       # abort if one session would trade >160% of notional
     max_positions: int = 12                # sanity bound on the book's width
     moc_cutoff_hhmm: str = "15:45"         # refuse to submit MOC after this exchange-local time
+    # The same guard for a half day, when the auction is at 13:00 instead of
+    # 16:00. The trade timer fires at 15:30 whatever the calendar says, so
+    # without this the run would submit into an auction hours past.
+    early_close_hhmm: str = "12:45"
+    # Dates to treat as half days on top of the three standing rules, as
+    # YYYY-MM-DD. For a one-off the rules cannot know about; normally empty.
+    early_close_dates: List[str] = field(default_factory=list)
     max_price_staleness_days: int = 5      # last close must be this recent (covers a long weekend)
     min_universe_coverage: float = 0.85    # fraction of NDX tickers that must have downloaded
     allow_live_account: bool = False       # refuses to run against a non-paper port unless set
@@ -307,6 +314,12 @@ class LiveConfig:
                                              cfg.position_source)
         cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
         cfg.ranking_log_top = _env_int("QBS_RANKING_TOP", cfg.ranking_log_top)
+        cfg.early_close_hhmm = os.environ.get("QBS_EARLY_CLOSE_HHMM",
+                                              cfg.early_close_hhmm)
+        if os.environ.get("QBS_EARLY_CLOSE_DATES") is not None:
+            cfg.early_close_dates = [d.strip() for d in
+                                     os.environ["QBS_EARLY_CLOSE_DATES"]
+                                     .replace(",", " ").split() if d.strip()]
         if os.environ.get("QBS_WATCHLIST") is not None:
             cfg.watchlist = [t.strip().upper() for t in
                              os.environ["QBS_WATCHLIST"].replace(",", " ").split()

@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import date, datetime
 from typing import Dict, List, Optional
 
 # Allow `python qbs/live/runner.py` as well as `python -m qbs.live.runner`.
@@ -107,6 +107,46 @@ def market_today(tz: str) -> datetime:
 
 def is_weekend(tz: str) -> bool:
     return market_today(tz).weekday() >= 5
+
+
+def us_early_close(day: "date") -> bool:
+    """Does the US equity market close at 13:00 ET on this date?
+
+    Three standing rules, unchanged for decades and derivable from the date
+    alone, so this needs neither a calendar package on a 2 GB box nor a list
+    that silently expires at the end of the year:
+
+      * July 3rd, when it falls Monday-Thursday. When the 4th is a Saturday the
+        holiday moves back to the 3rd and the market is *shut*, not early --
+        which is why the weekday test is on the 3rd rather than the 4th.
+      * Christmas Eve, on the same rule and for the same reason: when the 25th
+        is a Saturday the holiday moves to the 24th.
+      * The Friday after Thanksgiving, Thanksgiving being November's fourth
+        Thursday.
+
+    Full closures are not listed here and do not need to be. The trade phase
+    already refuses when the feed has no bar for today, which covers every
+    holiday and, unlike any fixed list, the unscheduled closures too -- a
+    state funeral, a hurricane. A half day is the one case that list cannot
+    catch, because the market really did trade and there really is a bar.
+    """
+    if day.day == 3 and day.month == 7 and day.weekday() <= 3:
+        return True
+    if day.day == 24 and day.month == 12 and day.weekday() <= 3:
+        return True
+    if day.month == 11 and day.weekday() == 4:
+        first = day.replace(day=1)
+        first_thursday = 1 + (3 - first.weekday()) % 7
+        return day.day == first_thursday + 22      # fourth Thursday, plus one
+    return False
+
+
+def moc_cutoff_for(live: "LiveConfig", day: "date") -> str:
+    """The cutoff that applies today: the early one on a half day."""
+    listed = {d.strip() for d in live.early_close_dates if d.strip()}
+    if f"{day:%Y-%m-%d}" in listed or us_early_close(day):
+        return live.early_close_hhmm
+    return live.moc_cutoff_hhmm
 
 
 def past_moc_cutoff(tz: str, cutoff_hhmm: str) -> bool:
@@ -399,11 +439,20 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
             # Checked here, immediately before sending, not at the top of the
             # phase: the download and ranking take real time, and it is the
             # submission that has to beat the cutoff.
-            if orders and past_moc_cutoff(live.market_tz, live.moc_cutoff_hhmm) \
-                    and not force:
+            # The cutoff is not a constant: on a half day the auction is at
+            # 13:00, and the timer that fires this phase at 15:30 knows nothing
+            # about that. Without this the run would sail past a closed market
+            # and submit into an auction that happened hours ago.
+            today = market_today(live.market_tz).date()
+            cutoff = moc_cutoff_for(live, today)
+            if orders and past_moc_cutoff(live.market_tz, cutoff) and not force:
+                early = cutoff != live.moc_cutoff_hhmm
                 raise BrokerError(
-                    f"past the {live.moc_cutoff_hhmm} MOC cutoff in {live.market_tz} "
-                    f"(now {market_today(live.market_tz):%H:%M}); not submitting. "
+                    f"past the {cutoff} MOC cutoff in {live.market_tz} "
+                    f"(now {market_today(live.market_tz):%H:%M})"
+                    + (" -- today is an early close, the auction was at 13:00"
+                       if early else "")
+                    + "; not submitting. "
                     "Tomorrow's run recomputes from scratch and will correct the book.")
 
             if not orders:
