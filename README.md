@@ -932,11 +932,11 @@ Two tabs:
 
 **Refresh now** forces a re-download even when the cache looks current.
 
-Every tab carries a freshness banner: how many sessions behind the data is, and what
-to do about it. The remedy is context-aware — it will not tell you to switch to Online
-while an online download is the thing failing. Staleness is counted in weekdays with no
-exchange-holiday calendar, so around a holiday it nags a day early, which is the safe
-direction.
+Every tab carries a freshness banner: how many published sessions are missing from the
+data, and what to do about it. The remedy is context-aware — it will not tell you to
+switch to Online while an online download is the thing failing. Staleness is counted
+in weekdays against the last 16:00 ET close, with no exchange-holiday calendar, so
+around a holiday it nags a day early, which is the safe direction.
 
 ### The market tab measures the US market
 
@@ -1008,22 +1008,49 @@ only difference being that Finviz averages it and the leader rule reads the sing
 session. That is why the leg barely bites in the US-universe mode: anything that got
 into the universe already clears it on a normal day.
 
-**It refreshes itself, once a day.** On launch the app checks whether an automatic
-fetch has run today; if not, it pulls the screener list and re-downloads any price
-frames more than a session behind. The status line under the toggle says which
-happened — *fetched on this run*, or *already fetched today at HH:MM*.
+**It refreshes itself, once per published bar.** On launch the app checks whether an
+automatic fetch has run since the last close; if not, it pulls the screener list and
+re-downloads any price frame that is missing a published session. The status line
+under the toggle says which happened — *fetched on this run*, or *already fetched
+since the Sep 21 close (at 16:30 ET) — next automatic attempt after the Sep 22 close*.
 
 **The gate counts attempts, not data age**, and that distinction is the whole design.
-Streamlit re-runs the script on every widget interaction, and before the close the
-last bar is always yesterday's — so "is the data stale?" would answer *yes* on every
-rerun and start a 2,400-name download each time, all day. One attempt per calendar
-day, stamped in `data/universe/us_last_fetch.txt` **before** the work starts so a
-download that dies halfway still counts.
+Streamlit re-runs the script on every widget interaction, so a data-age test would
+answer *yes* on every rerun and start a 2,400-name download each time. The attempt is
+stamped in `data/universe/us_last_fetch.txt` **before** the work starts, so a download
+that dies halfway still counts.
 
-The cost of stamping failures too: a fetch that fails at 09:00 will not retry by
-itself until tomorrow. That is deliberate — a silent retry loop against a broken feed
-is worse than a stale number with a button next to it — and **Refresh now** ignores
-the gate entirely.
+**The boundary is the last close, in exchange time** — not a calendar day, and not
+UTC. A per-calendar-day gate loses a session for anybody east of Greenwich: open the
+dashboard at 09:00 in UTC+8 (01:00 UTC) and the day's one automatic attempt is spent
+hours before the close it was meant to collect. The bar appears at 20:00 UTC and the
+gate refuses until the UTC date rolls over, so the app sits a session behind all
+evening with no way forward but the button. Against the close instead, the attempt is
+due exactly when the last one predates the newest published bar: nothing during the
+session, one fetch after 16:00 ET. Exchange time because the close is 20:00 UTC in
+summer and 21:00 in winter, and a rule written in UTC is wrong for half the year.
+
+**Staleness is measured the same way.** `sessions_behind` counts published bars that
+are missing, against the last close — so `0` means current and `1` means a bar exists
+and is not here. It used to compare against the UTC calendar date, which made
+"behind" depend on where you were standing: at 22:00 in New York the UTC date has
+already rolled over, so a cache holding that very afternoon's close reported itself a
+session behind, the banner said *the latest session is not in yet* about a bar six
+hours old, and the loader re-downloaded on every rerun chasing a bar it already had.
+
+**The dashboard's caches are keyed on that same boundary.** `st.cache_data` memoises
+on arguments alone and the price frames are passed unhashed, so a process left running
+across a close would serve the numbers it read on start-up for ever — and the gate
+above would never be consulted, because the function holding it would not run. Every
+cache that holds price data takes a `bar_epoch` key that changes only on a close:
+loaders, selections, breadth and the OHLC bars alike. Fixing only the loaders would be
+worse than leaving it alone, since the banner would say *current* over a table that
+was not.
+
+The cost of stamping failures too: a fetch that fails after the close will not retry by
+itself until the next one. That is deliberate — a silent retry loop against a broken
+feed is worse than a stale number with a button next to it — and **Refresh now**
+ignores the gate, the stamp and the caches entirely.
 
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real
@@ -1108,7 +1135,8 @@ QBS_GEMINI_MODEL=gemini-2.5-flash    # the chat
 QBS_THINKING_BUDGET=-1               # chat only: -1 dynamic, 0 off, N caps it
 QBS_SUMMARY_MODEL=gemini-2.5-pro     # the news read
 TAVILY_API_KEY=...                   # optional, better search than the default
-QBS_DISABLE_ANALYST=1                # optional kill switch, see below
+QBS_DISABLE_NEWS_ANALYSIS=0          # the news read ships OFF; this turns it on
+QBS_DISABLE_CHAT=1                   # optional kill switch, see below
 ```
 
 **Two models, because they are not the same job.** The chat reasons over tool output
@@ -1166,47 +1194,75 @@ skipped, and the other lines still load.
 Streamlit will not re-import a package it has already loaded, so **restart the
 dashboard** after creating `.env`; a rerun alone will not pick the key up.
 
-### Switching it off
+### Switching things off
+
+One switch per thing that can spend, and **no master over them**. A master is a second
+answer to "is this on?", and the two answers disagree the moment somebody sets only one.
+
+| Variable | Guards | Default |
+|---|---|---|
+| `QBS_DISABLE_NEWS_ANALYSIS` | the News tab's Gemini read | **off** — set it to `0` to switch the read on |
+| `QBS_DISABLE_NEWS_READ` | fetching the headlines at all | on (ignored while the analysis is on) |
+| `QBS_DISABLE_CHAT` | the Analyst tab's chat | on |
+
+**The news read ships off, and it is the only one that does.** Every other switch here
+guards something a person starts — typing in the chat, pressing refresh — so leaving it
+on until told otherwise costs nothing until somebody acts. The news read runs on page
+load, once a day, for anybody who happens to have a key in their `.env`. A default that
+bills a fresh checkout for opening the dashboard is not a default anybody chose. So it
+is switched on explicitly:
 
 ```bash
-QBS_DISABLE_ANALYST=1          # environment, or a line in .env
+QBS_DISABLE_NEWS_ANALYSIS=0    # environment, or a line in .env
 ```
 
-No Gemini call is made from anywhere in the package: `check_requirements` reports it,
-`analyse` returns an `Answer` with `disabled=True` before loading anything, and
-`build_model` refuses — so nothing reaches the API even from a caller that skipped the
-check, and nothing is billed. **Everything that does not need the model keeps working**
-— the picks, momentum profiles, breadth, fundamentals, search, and every
+Its message distinguishes **"off by default"** from **"switched off"**. The remedy reads
+the same but the surprise is completely different, and somebody who never touched the
+switch should not be hunting for who did.
+
+**The headlines are not the read.** Fetching them is a web search — free on DuckDuckGo,
+a credit on Tavily — so it runs regardless, and the News tab shows the stories with no
+key and no spend. `QBS_DISABLE_NEWS_READ=1` stops even that. Switching the analysis on
+overrides it: analysing news you are not fetching is not a configuration anybody means,
+and the setting somebody went out of their way to enable is the one that says what they
+wanted.
+
+**The chat is separate.** `QBS_DISABLE_CHAT=1` stops the Analyst tab and leaves the news
+alone; switching the news off leaves the chat alone. `check_requirements(role=...)`
+reports whichever applies, `analyse` returns an `Answer` with `disabled=True` before
+loading anything, and `build_model(role=...)` refuses — so nothing reaches the API even
+from a caller that skipped the check. **Everything that does not need the model keeps
+working**: the picks, momentum profiles, breadth, fundamentals, search, and every
 `python -m qbs.agent --report ...`. That is the point of a switch rather than an
 uninstall.
 
-**There is a narrower switch too.** `QBS_DISABLE_CHAT=1` stops only the Analyst tab's
-chat and **leaves the news read running** — which is what you want when bringing one
-feature up at a time, or when the chat is the token-heavy half and the daily summary is
-not. It is enforced in `build_analyst`/`analyse` rather than in `build_model`, because
-the news read goes through `build_model` and has to survive it. The master switch wins
-and is reported as the reason, so someone who set `QBS_DISABLE_ANALYST` is told *that*
-rather than handed a message about a switch they never touched.
-
-`--check` reports the two separately, and its exit code means **broken**, not
-*switched off* — a deliberate shutdown is a working configuration, and a script asking
-"is this install OK?" should not be told no because you turned a feature off on purpose.
-
-Only an explicit off-word re-enables either — `0`, `false`, `no`, `off`, `none`,
-`disabled`. **Any other non-empty value switches it off.** That is deliberately not
+Only an explicit off-word means off — `0`, `false`, `no`, `off`, `none`, `disabled`.
+**Any other non-empty value reads as on.** That is deliberately not
 `qbs.live.config._env_bool`, which reads anything outside `("1", "true", "yes", "on")`
 as false: for a flag whose job is to stop spending money, an unrecognised value has to
-fail *safe*, so a half-remembered `QBS_DISABLE_ANALYST=disable` stops the spending
-rather than quietly leaving it running.
+fail *safe*, so a half-remembered `QBS_DISABLE_CHAT=disable` stops the spending rather
+than quietly leaving it running.
 
-`python -m qbs.agent --check` prints the switch on its own line and says **"DISABLED on
-purpose"** rather than "not ready", because a deliberate shutdown and a missing key
-have different remedies. The dashboard does the same: a paused notice with `unset`,
-not the "create a `.env`" instructions, which would send you to fix something that is
-not broken.
+`python -m qbs.agent --check` prints each switch on its own line and says **"DISABLED on
+purpose"** rather than "not ready", because a deliberate shutdown and a missing key have
+different remedies. Its exit code means **broken**, not *switched off* — including the
+news read's default, so a script asking "is this install OK?" is not told no because of
+a setting that ships that way. The dashboard does the same: a paused notice with
+`unset`, not the "create a `.env`" instructions, which would send you to fix something
+that is not broken.
+
+#### `QBS_DISABLE_ANALYST` is retired
+
+It was the master over all three and is now read by nothing. A kill switch that has
+quietly stopped being read is the most dangerous kind of dead config — it *looks* like
+it is holding your bill down — so a leftover setting is reported rather than ignored,
+by `load_env`, by `--check`, and by the dashboard sidebar. It is not treated as a typo:
+the name was right, and the remedy is "here is what replaced it", not "check your
+spelling". Replace it with `QBS_DISABLE_NEWS_ANALYSIS` (the news read) and
+`QBS_DISABLE_CHAT` (the chat).
 
 Streamlit reads the environment once at start-up, so **restart the app** after changing
-this — a rerun alone will not pick it up.
+any of these — a rerun alone will not pick it up.
 
 ### What it can look at
 

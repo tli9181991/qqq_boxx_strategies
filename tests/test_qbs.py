@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -1897,6 +1898,126 @@ def test_sector_breakdown_without_a_map_returns_empty():
     assert sector_breakdown(_breadth_frame(), {}).empty
 
 
+def _leader_fixture():
+    """Three sectors, known relative strength inside each.
+
+    Built long enough to be scorable over the ranker's own 6-1 window, and
+    priced so every name clears the leader rule -- the point of these tests
+    is the ordering and the grouping, not the filter, which `leader_mask`
+    has its own tests for.
+    """
+    from qbs.breadth import _momentum_window
+
+    look, _ = _momentum_window()
+    idx = pd.bdate_range("2024-01-01", periods=look + 90)
+    n = len(idx)
+    # COMPOUNDING, not a straight line. A linear ramp's trailing-quarter
+    # return shrinks as the base grows, so the slower names would fail the
+    # leader rule's 28% quarterly gate and drop out of a fixture that is
+    # supposed to be testing the grouping. A constant daily rate keeps every
+    # name's quarterly gain constant and above the gate, while the rates
+    # still order them.
+    rates = {"AAA": 0.020, "BBB": 0.015, "CCC": 0.010,   # Tech
+             "DDD": 0.025, "EEE": 0.006,                  # Health
+             "FFF": 0.012}                                # Energy
+    px = pd.DataFrame({t: 10.0 * (1.0 + r) ** np.arange(n)
+                       for t, r in rates.items()}, index=idx)
+    vols = pd.DataFrame(1e7, index=idx, columns=px.columns)
+    sectors = {"AAA": "Tech", "BBB": "Tech", "CCC": "Tech",
+               "DDD": "Health", "EEE": "Health", "FFF": "Energy"}
+    return px, vols, sectors
+
+
+def test_sector_leaders_group_by_sector_and_rank_inside_it():
+    """The naming half of the concentration reading: a sector share nobody
+    can name the members of is a number to nod at rather than act on."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    out = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+
+    assert set(out["symbol"]) == set(px.columns), "every leader is named"
+    # Sector order follows `sector_breakdown`: biggest group first.
+    assert list(out["sector"].unique()) == ["Tech", "Health", "Energy"]
+    # And strongest first inside each group.
+    tech = out[out["sector"] == "Tech"]
+    assert list(tech["symbol"]) == ["AAA", "BBB", "CCC"]
+    assert list(tech["rank_in_sector"]) == [1, 2, 3]
+    assert tech["score"].is_monotonic_decreasing
+    assert list(out[out["sector"] == "Health"]["symbol"]) == ["DDD", "EEE"]
+    # n_sector counts the whole sector, not the rows shown.
+    assert set(out[out["sector"] == "Tech"]["n_sector"]) == {3}
+
+
+def test_sector_leaders_cap_is_per_sector_not_overall():
+    """A global cap would hand the whole list to the biggest sector and
+    report the others as leaderless."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    out = sector_leaders(px, sectors, volumes=vols, per_sector=1)
+
+    assert len(out) == 3, "one per sector, all three sectors present"
+    assert list(out["symbol"]) == ["AAA", "DDD", "FFF"], "each sector's best"
+    # Truncated, and visibly so: the count is of the sector, not the rows.
+    assert list(out[out["sector"] == "Tech"]["n_sector"]) == [3]
+
+
+def test_sector_leaders_order_matches_the_breakdown_it_sits_under():
+    """The two tables read down the page together, so a sector cannot be
+    third in one and first in the other."""
+    from qbs.breadth import sector_breakdown, sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    breakdown = sector_breakdown(px, sectors, volumes=vols)
+    leaders = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+
+    assert (list(breakdown["sector"])
+            == list(leaders["sector"].unique())), "same sequence"
+    # And the member counts agree with the breakdown's own n.
+    counts = leaders.groupby("sector")["n_sector"].first()
+    for row in breakdown.itertuples():
+        assert counts[row.sector] == row.n
+
+
+def test_sector_leaders_needs_a_map_and_enough_history():
+    """Both gaps fail empty rather than inventing a label or a score. An
+    unscored name is not a weak one, and 'Unclassified' rendered as a sector
+    is a classification this package did not make."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    assert sector_leaders(px, {}, volumes=vols).empty, "no map, no table"
+    assert sector_leaders(px.iloc[:5], sectors, volumes=vols).empty, \
+        "too short to score over the 6-1 window"
+    assert sector_leaders(pd.DataFrame(), sectors).empty
+
+    # A name with no sector is labelled, not dropped -- it IS a leader, and
+    # silently losing it would understate the leadership count.
+    partial = {k: v for k, v in sectors.items() if k != "FFF"}
+    out = sector_leaders(px, partial, volumes=vols, per_sector=0)
+    assert "Unclassified" in set(out["sector"])
+    assert "FFF" in set(out["symbol"])
+
+
+def test_sector_leaders_accept_a_date_the_frame_does_not_hold():
+    """The dashboard reads leaders on the market cache's last bar and ranks
+    on the book cache's, and the two are not always the same day."""
+    from qbs.breadth import sector_leaders
+
+    px, vols, sectors = _leader_fixture()
+    asof = px.index[-1] + pd.Timedelta(days=3)
+    out = sector_leaders(px, sectors, volumes=vols, asof=asof, per_sector=0)
+    assert not out.empty, "it falls back to the last bar at or before asof"
+
+    before = sector_leaders(px, sectors, volumes=vols, per_sector=0)
+    assert list(out["symbol"]) == list(before["symbol"])
+
+    # Earlier than anything in the frame is empty, not the first bar.
+    assert sector_leaders(px, sectors, volumes=vols,
+                          asof=px.index[0] - pd.Timedelta(days=1)).empty
+
+
 def test_breadth_classifiers_hit_their_thresholds():
     from qbs.breadth import BreadthParams, atr_class, ma_class, pulse_class
 
@@ -2008,14 +2129,58 @@ def test_levels_in_view_handles_empty_and_zero():
 # Data freshness (qbs/data.py)
 # --------------------------------------------------------------------------
 
+def _et(stamp):
+    """A moment in exchange time, which is the clock these functions use."""
+    return pd.Timestamp(stamp, tz="America/New_York")
+
+
 def test_sessions_behind_counts_weekdays_only():
     from qbs.data import sessions_behind
 
-    now = pd.Timestamp("2026-09-15")          # a Tuesday
+    now = _et("2026-09-15 16:30")             # a Tuesday, after the close
     assert sessions_behind(pd.Timestamp("2026-09-15"), now) == 0
     assert sessions_behind(pd.Timestamp("2026-09-14"), now) == 1
     assert sessions_behind(pd.Timestamp("2026-09-11"), now) == 2   # Fri -> Mon,Tue
     assert sessions_behind(pd.Timestamp("2026-09-08"), now) == 5
+
+
+def test_sessions_behind_is_measured_from_the_last_close():
+    """Before the close, yesterday's bar IS the newest one published.
+
+    The old reading called that "1 session behind, which is normal during a
+    session" -- a fudge that could not tell a missing bar from one that did
+    not exist yet, and that made every caller treat 1 as ambiguous.
+    """
+    from qbs.data import sessions_behind
+
+    monday = pd.Timestamp("2026-09-14")
+    tuesday = pd.Timestamp("2026-09-15")
+    # Tuesday morning, holding Monday's close: nothing newer exists.
+    assert sessions_behind(monday, _et("2026-09-15 09:30")) == 0
+    assert sessions_behind(monday, _et("2026-09-15 15:59")) == 0
+    # The close lands and Monday's cache is now genuinely one bar short.
+    assert sessions_behind(monday, _et("2026-09-15 16:00")) == 1
+    assert sessions_behind(tuesday, _et("2026-09-15 16:00")) == 0
+
+
+def test_sessions_behind_does_not_depend_on_the_utc_date():
+    """The regression. At 22:00 in New York the UTC date has already rolled
+    over, and comparing against it reported a cache holding that very
+    afternoon's close as a session behind -- so the banner said "not in yet"
+    about a bar six hours old and the loader re-downloaded on every rerun
+    trying to fetch a bar it already had."""
+    from qbs.data import sessions_behind
+
+    evening = _et("2026-09-21 22:50")          # Monday night = Tuesday UTC
+    assert evening.tz_convert("UTC").date() > evening.date(), "fixture premise"
+    assert sessions_behind(pd.Timestamp("2026-09-21"), evening) == 0
+
+    # And the same instant expressed in UTC has to give the same answer.
+    assert sessions_behind(pd.Timestamp("2026-09-21"),
+                           evening.tz_convert("UTC")) == 0
+    # A naive timestamp is read as UTC, which is what the stamp file holds.
+    assert sessions_behind(pd.Timestamp("2026-09-21"),
+                           pd.Timestamp("2026-09-22 02:50")) == 0
 
 
 def test_sessions_behind_ignores_the_weekend():
@@ -2023,24 +2188,30 @@ def test_sessions_behind_ignores_the_weekend():
     from qbs.data import sessions_behind
 
     friday = pd.Timestamp("2026-09-11")
-    assert sessions_behind(friday, pd.Timestamp("2026-09-12")) == 0   # Sat
-    assert sessions_behind(friday, pd.Timestamp("2026-09-13")) == 0   # Sun
-    assert sessions_behind(friday, pd.Timestamp("2026-09-14")) == 1   # Mon
+    assert sessions_behind(friday, _et("2026-09-11 16:30")) == 0   # Fri, post
+    assert sessions_behind(friday, _et("2026-09-12 12:00")) == 0   # Sat
+    assert sessions_behind(friday, _et("2026-09-13 12:00")) == 0   # Sun
+    assert sessions_behind(friday, _et("2026-09-14 09:30")) == 0   # Mon, pre
+    assert sessions_behind(friday, _et("2026-09-14 16:30")) == 1   # Mon, post
 
 
 def test_sessions_behind_never_goes_negative():
     from qbs.data import sessions_behind
 
-    assert sessions_behind(pd.Timestamp("2026-09-15"), pd.Timestamp("2026-09-10")) == 0
+    assert sessions_behind(pd.Timestamp("2026-09-15"),
+                           _et("2026-09-10 16:30")) == 0
 
 
 def test_freshness_note_levels():
     from qbs.data import freshness_note
 
-    now = pd.Timestamp("2026-09-15")
+    now = _et("2026-09-15 16:30")
     assert freshness_note(pd.Timestamp("2026-09-15"), now)[1] == "ok"
     assert freshness_note(pd.Timestamp("2026-09-14"), now)[1] == "info"
     assert freshness_note(pd.Timestamp("2026-09-08"), now)[1] == "warn"
+    # The n == 1 message no longer calls a missing bar normal.
+    msg = freshness_note(pd.Timestamp("2026-09-14"), now)[2]
+    assert "missing" in msg and "normal" not in msg
 
 
 def test_freshness_note_carries_no_remedy():
@@ -2049,7 +2220,8 @@ def test_freshness_note_carries_no_remedy():
     worse than saying nothing."""
     from qbs.data import freshness_note
 
-    _, _, msg = freshness_note(pd.Timestamp("2026-09-08"), pd.Timestamp("2026-09-15"))
+    _, _, msg = freshness_note(pd.Timestamp("2026-09-08"),
+                               _et("2026-09-15 16:30"))
     assert "5 sessions behind" in msg
     for word in ("Online", "refresh", "Refresh"):
         assert word not in msg
@@ -2254,7 +2426,66 @@ def test_load_universe_bars_reads_both_cached_frames():
         assert (v["MSFT"] == 20).all()
 
 
-# ---- the once-a-day auto-fetch gate --------------------------------------
+# ---- the once-per-published-bar auto-fetch gate ---------------------------
+
+def test_the_market_close_helpers_track_dst_and_the_weekend():
+    from qbs.data import last_market_close, next_market_close
+
+    # The close is 20:00 UTC in summer and 21:00 in winter, which is why the
+    # boundary is written in exchange time and not in UTC.
+    summer = last_market_close(_et("2026-09-21 16:30"))
+    winter = last_market_close(_et("2026-01-21 16:30"))
+    assert str(summer.tz_convert("UTC").time()) == "20:00:00"
+    assert str(winter.tz_convert("UTC").time()) == "21:00:00"
+
+    # A minute before the close, the newest bar is still the previous day's.
+    assert last_market_close(_et("2026-09-21 15:59")).date() \
+        == pd.Timestamp("2026-09-18").date()
+    assert last_market_close(_et("2026-09-21 16:00")).date() \
+        == pd.Timestamp("2026-09-21").date()
+
+    # Weekends resolve back to, and forward from, the weekday closes.
+    assert last_market_close(_et("2026-09-20 12:00")).date() \
+        == pd.Timestamp("2026-09-18").date()
+    assert next_market_close(_et("2026-09-19 12:00")).date() \
+        == pd.Timestamp("2026-09-21").date()
+    assert next_market_close(_et("2026-09-21 16:00")).date() \
+        == pd.Timestamp("2026-09-22").date()
+
+
+def test_no_strftime_directive_is_glibc_only():
+    """`%-d` and `%#d` are platform extensions, not strftime.
+
+    The no-padding modifier is `%-d` on glibc and `%#d` on Windows, and each
+    is a hard error on the other: the Windows C runtime raises "Invalid
+    format string" rather than ignoring it. This repo is developed on Linux
+    and run on Windows, so a directive that works here and not there is a
+    crash nobody sees until it is in somebody else's hands -- which is
+    exactly how one shipped, in a date inside a status line that took the
+    whole dashboard down.
+
+    Scanned rather than exercised, because the failure only appears on the
+    platform the test is not running on. The pattern deliberately only looks
+    inside strftime calls and f-string format specs, so prose like
+    "the 4%-mover count" in a docstring does not trip it.
+    """
+    import re
+
+    root = Path(__file__).resolve().parent.parent
+    pattern = re.compile(
+        r"""(?:strftime\(\s*["'][^"']*|\{[^{}]*:[^{}]*)%[-#][a-zA-Z]""")
+
+    offenders = []
+    for path in sorted(list((root / "qbs").rglob("*.py"))
+                       + list((root / "dashboard").rglob("*.py"))):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                offenders.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
+
+    assert not offenders, (
+        "platform-specific strftime directive(s) — build the value in Python "
+        "instead, e.g. f\"{ts:%b} {ts.day}\":\n  " + "\n  ".join(offenders))
+
 
 def test_the_fetch_gate_allows_the_first_run(tmp_path):
     from qbs.finviz import due_for_fetch
@@ -2263,7 +2494,7 @@ def test_the_fetch_gate_allows_the_first_run(tmp_path):
     assert due and "no automatic fetch" in why
 
 
-def test_the_fetch_gate_closes_for_the_rest_of_the_day(tmp_path):
+def test_the_fetch_gate_closes_until_the_next_close(tmp_path):
     """The gate counts ATTEMPTS, not data age. Streamlit re-runs the script on
     every widget interaction, and before the close the last bar is always
     yesterday's -- so a data-based test would start a 2,400-name download on
@@ -2271,24 +2502,79 @@ def test_the_fetch_gate_closes_for_the_rest_of_the_day(tmp_path):
     from qbs.finviz import due_for_fetch, record_fetch_attempt
 
     stamp = str(tmp_path / "stamp.txt")
-    record_fetch_attempt(stamp)
-    due, why = due_for_fetch(stamp)
+    now = _et("2026-09-21 16:30")
+    record_fetch_attempt(stamp, now=now)
+
+    due, why = due_for_fetch(stamp, now=now + pd.Timedelta(minutes=5))
     assert not due
-    assert "already fetched today" in why and "Refresh now" in why
+    assert "already fetched since" in why and "Refresh now" in why
+    assert "Sep 22" in why, "it has to say when it will try again"
+
+    # And it stays shut through the next morning, because nothing new has
+    # been published yet.
+    assert not due_for_fetch(stamp, now=_et("2026-09-22 09:30"))[0]
+    assert due_for_fetch(stamp, now=_et("2026-09-22 16:00"))[0]
 
 
-def test_the_fetch_gate_reopens_on_the_next_calendar_day(tmp_path):
-    """Calendar days, not 24 hours: an app opened at 08:00 and again at 09:00
-    the next morning should refresh, and a 24-hour rule would refuse."""
+def test_a_pre_close_fetch_does_not_consume_the_days_attempt(tmp_path):
+    """The regression, and the whole reason this gate is not a calendar day.
+
+    Open the dashboard at 09:00 in UTC+8 -- 01:00 UTC -- and a per-UTC-day
+    gate spends the day's only automatic attempt hours before the close it
+    was meant to collect. The bar appears at 20:00 UTC and the gate refuses
+    until the UTC date rolls over, so the app sits a session behind all
+    evening with no way forward but the button.
+    """
     from qbs.finviz import due_for_fetch, record_fetch_attempt
 
     stamp = str(tmp_path / "stamp.txt")
-    now = pd.Timestamp("2026-09-18 08:00:00")
-    record_fetch_attempt(stamp, now=now)
+    morning = pd.Timestamp("2026-09-21 01:00")        # naive UTC, as stamped
+    assert due_for_fetch(stamp, now=morning)[0]
+    record_fetch_attempt(stamp, now=morning)
 
-    assert not due_for_fetch(stamp, now=now + pd.Timedelta(hours=15))[0]
-    assert due_for_fetch(stamp, now=now + pd.Timedelta(hours=25))[0], \
-        "09:00 the next morning is a new day even though it is under 24h"
+    # Mid-session: nothing new, so no second download.
+    assert not due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 13:30"))[0]
+
+    # Half an hour after the close, 9/21's bar exists and MUST be collectable.
+    due, why = due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 20:30"))
+    assert due, "the post-close attempt is the one that gets the new bar"
+    assert "before the 2026-09-21 close" in why
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 20:30"))
+
+    # Having collected it, it does not go round again.
+    for t in ("2026-09-21 23:59", "2026-09-22 01:00", "2026-09-22 13:30"):
+        assert not due_for_fetch(stamp, now=pd.Timestamp(t))[0], t
+
+
+def test_the_fetch_gate_compares_the_stamp_in_the_right_zone(tmp_path):
+    """The stamp is written in naive UTC and the boundary is in exchange
+    time. Comparing them without converting is the same bug one layer
+    down."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    # 20:30 UTC on 9/21 == 16:30 ET, i.e. AFTER that day's close.
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 20:30"))
+    assert not due_for_fetch(stamp, now=_et("2026-09-21 17:00"))[0]
+    # 19:30 UTC == 15:30 ET, BEFORE it.
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 19:30"))
+    assert due_for_fetch(stamp, now=_et("2026-09-21 17:00"))[0]
+
+
+def test_the_epoch_key_changes_only_on_a_close():
+    """What the dashboard's caches are keyed on. `st.cache_data` memoises on
+    arguments alone, so without this a process left running across a close
+    serves the numbers it read on start-up for ever -- and the gate above is
+    never consulted, because the function holding it does not run."""
+    from qbs.finviz import fetch_epoch
+
+    pre = fetch_epoch(_et("2026-09-21 09:30"))
+    assert pre == fetch_epoch(_et("2026-09-21 15:59")), "steady all session"
+    post = fetch_epoch(_et("2026-09-21 16:00"))
+    assert post != pre, "the close is the only thing that moves it"
+    assert post == fetch_epoch(_et("2026-09-21 23:59"))
+    assert post == fetch_epoch(_et("2026-09-22 09:30")), "and overnight"
+    assert fetch_epoch(_et("2026-09-22 16:00")) != post
 
 
 def test_an_unwritable_stamp_does_not_break_the_fetch(tmp_path):

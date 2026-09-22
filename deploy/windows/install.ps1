@@ -54,6 +54,15 @@ if (-not $py) {
     throw "No Python found. Install Python 3.10+ from python.org (tick 'Add to PATH')."
 }
 
+if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
+    Write-Warning @"
+rclone is not on PATH. It is how files reach Google Drive, and it carries its
+own registered OAuth client -- which is why this setup needs no Google Cloud
+project at all. Install it with:  winget install Rclone.Rclone
+Then run `rclone config` once to authorise Google Drive.
+"@
+}
+
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Warning @"
 ffmpeg is not on PATH. Both stages need it: yt-dlp merges separate audio and

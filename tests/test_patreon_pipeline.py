@@ -16,7 +16,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from patreon_pipeline import download, mail, store, transcribe
+from patreon_pipeline import download, mail, rclone, store, transcribe, upload
 from patreon_pipeline.config import PipelineConfig
 
 
@@ -299,6 +299,53 @@ def test_default_vocabulary_is_populated():
 
 
 # ----------------------------------------------------------------------
+# Uploads
+# ----------------------------------------------------------------------
+
+def test_rclone_is_the_default_backend():
+    """Chosen because it needs no Cloud project, no consent screen and has no
+    seven-day token expiry."""
+    assert PipelineConfig().uploader == "rclone"
+    assert upload.backend(PipelineConfig()).name == "rclone"
+
+
+def test_drive_backend_is_still_selectable():
+    assert upload.backend(PipelineConfig(uploader="drive")).name == "drive"
+
+
+def test_unknown_uploader_is_refused():
+    try:
+        upload.backend(PipelineConfig(uploader="dropbox"))
+    except upload.UploadError as exc:
+        assert "dropbox" in str(exc)
+    else:
+        raise AssertionError("an unknown uploader should not be accepted")
+
+
+def test_rclone_destination_nests_by_creator():
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon")
+    assert rclone.destination(cfg, "Some Creator") == "gdrive:Patreon/Some Creator"
+
+
+def test_rclone_destination_without_creator_subfolder():
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon",
+                         drive_subfolder_per_creator=False)
+    assert rclone.destination(cfg, "Some Creator") == "gdrive:Patreon"
+
+
+def test_rclone_destination_sanitises_separators_in_a_creator_name():
+    """A slash in a creator name would silently nest an extra remote folder."""
+    cfg = PipelineConfig(rclone_remote="gdrive", rclone_base_path="Patreon")
+    assert rclone.destination(cfg, "A/B") == "gdrive:Patreon/A-B"
+
+
+def test_validate_rejects_a_bad_uploader_and_an_empty_remote():
+    assert any("uploader" in p for p in PipelineConfig(uploader="nope").validate())
+    assert any("rclone_remote" in p
+               for p in PipelineConfig(rclone_remote="").validate())
+
+
+# ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
 
@@ -306,6 +353,43 @@ def test_validate_reports_every_problem_at_once():
     cfg = PipelineConfig(cookies_from_browser="", cookies_file="")
     problems = cfg.validate(need_mail=True)
     assert len(problems) >= 3
+
+
+def test_the_shipped_example_configs_actually_load():
+    """The installer copies these verbatim. Shipping an example the loader
+    rejects means a fresh install fails on its first command -- which is
+    exactly what happened, because the examples carry `_comment` keys."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    example = os.path.join(here, "deploy", "patreon", "patreon.example.json")
+    cfg = PipelineConfig.from_env(example)
+    assert cfg.campaign_urls, "example config should carry a campaign URL"
+
+
+def test_underscore_keys_are_comments_not_settings():
+    """JSON has no comment syntax, so `_note` keys document the file in
+    place and are dropped on load."""
+    import json
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"_comment": "explain something", "max_attempts": 7}, fh)
+    cfg = PipelineConfig.from_env(path)
+    assert cfg.max_attempts == 7
+    assert not hasattr(cfg, "_comment")
+
+
+def test_a_misspelled_setting_is_still_rejected():
+    """The underscore escape hatch must not turn into blanket permissiveness:
+    a typo that silently does nothing is worse than a startup error."""
+    import json
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"campaign_url": "https://www.patreon.com/c/x"}, fh)
+    try:
+        PipelineConfig.from_env(path)
+    except ValueError as exc:
+        assert "campaign_url" in str(exc)
+    else:
+        raise AssertionError("a misspelled key should not be accepted")
 
 
 def test_secrets_are_not_read_from_the_config_file():

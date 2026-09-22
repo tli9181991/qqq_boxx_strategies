@@ -321,9 +321,8 @@ class LiveConfig:
                                      os.environ["QBS_EARLY_CLOSE_DATES"]
                                      .replace(",", " ").split() if d.strip()]
         if os.environ.get("QBS_WATCHLIST") is not None:
-            cfg.watchlist = [t.strip().upper() for t in
-                             os.environ["QBS_WATCHLIST"].replace(",", " ").split()
-                             if t.strip()]
+            from ..shadow import parse_watchlist
+            cfg.watchlist = parse_watchlist(os.environ["QBS_WATCHLIST"])
         if os.environ.get("QBS_SHADOW_WEIGHTS") is not None:
             raw = os.environ["QBS_SHADOW_WEIGHTS"].replace(",", " ").split()
             cfg.shadow_weights = [float(w) for w in raw]

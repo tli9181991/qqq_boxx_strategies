@@ -53,7 +53,8 @@ import numpy as np
 import pandas as pd
 
 from .config import DOWNLOAD_START
-from .data import sessions_behind
+from .data import (MARKET_CLOSE, MARKET_TZ, last_market_close,
+                   next_market_close, sessions_behind)
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -63,7 +64,7 @@ FETCH_STAMP = os.path.join(BARS_DIR, "us_last_fetch.txt")
 
 
 # --------------------------------------------------------------------------
-# "Once a day" -- an ATTEMPT counter, not a success counter
+# "Once per published bar" -- an ATTEMPT counter, not a success counter
 # --------------------------------------------------------------------------
 # Streamlit re-runs the whole script on every widget interaction, and the app
 # is expected to refresh itself when the data is old. Those two together are a
@@ -72,14 +73,58 @@ FETCH_STAMP = os.path.join(BARS_DIR, "us_last_fetch.txt")
 # market has not closed, and the next rerun asks the same question and gets the
 # same answer. The app would download all day.
 #
-# So the gate is on the attempt, not on the data. One automatic try per
-# calendar day, stamped whether it succeeds or fails, and the manual refresh
-# button ignores the stamp entirely.
+# So the gate is on the attempt, not on the data, and it is stamped whether
+# the attempt succeeds or fails. The manual refresh button ignores it.
 #
-# The cost of stamping failures too: if the network is down at 9am it will not
-# retry by itself until tomorrow. That is deliberate -- a silent retry loop on
-# a broken connection is worse than a stale number with a button next to it --
-# and the UI says when the next automatic attempt is due.
+# What the gate counts, and why it is not a calendar day
+# -----------------------------------------------------
+# It was one attempt per UTC calendar day, and that quietly lost a session.
+# Open the dashboard at 09:00 in UTC+8 -- 01:00 UTC -- and the day's only
+# automatic attempt is spent hours before the close it was meant to collect.
+# The bar for that session appears at 20:00 UTC and the gate refuses to fetch
+# it until the UTC date rolls over. The app would report itself one session
+# behind all evening with no way forward but the button.
+#
+# The gate is now the last CLOSE, in exchange time: an automatic attempt is
+# due when the last attempt predates the most recently published bar. That is
+# the honest form of the rule the calendar day was approximating -- fetch when
+# there is something new to fetch, at most once per new bar -- and it fixes
+# both failure modes at once. Before the close, "the most recent bar" is
+# yesterday's, so a fetch that already has it does not run again; after the
+# close it is today's, so the first interaction after 16:00 ET collects it.
+#
+# Exchange time, not UTC, so the boundary does not move with the seasons: the
+# close is 20:00 UTC in summer and 21:00 UTC in winter, and a rule written in
+# UTC is wrong for half the year.
+#
+# The cost of stamping failures too: if the network is down after the close it
+# will not retry by itself until the next one. That is deliberate -- a silent
+# retry loop on a broken connection is worse than a stale number with a button
+# next to it -- and the UI says when the next automatic attempt is due.
+#
+# No holiday calendar here, same as `sessions_behind`. On a holiday the
+# boundary still moves at 16:00 ET, so one attempt is spent finding out that
+# no new bar exists. One wasted fetch a holiday is the right side to err on.
+#
+# `last_market_close` and `next_market_close` live in `qbs.data` beside
+# `sessions_behind`, which measures staleness against the same boundary and
+# is imported by this module -- putting them here would have made the two
+# files import each other.
+
+
+def fetch_epoch(now: Optional[pd.Timestamp] = None) -> str:
+    """A key that changes exactly when a new bar becomes collectable.
+
+    For a caller that memoises a load -- the dashboard's `st.cache_data`
+    wrappers -- passing this in makes the memo expire on the close instead of
+    living for the life of the process. A cache keyed only on its arguments
+    pins a long-running app to whatever it read on start-up, and then the gate
+    below is never even consulted, because the function holding it does not
+    run. A time-based TTL would work too, but it re-reads on a schedule that
+    has nothing to do with when the data changes.
+    """
+    return last_market_close(now).isoformat(timespec="minutes")
+
 
 def last_fetch_attempt(stamp_path: str = FETCH_STAMP) -> Optional[pd.Timestamp]:
     """When the app last TRIED to refresh the US universe, or None."""
@@ -111,17 +156,42 @@ def due_for_fetch(stamp_path: str = FETCH_STAMP,
                   now: Optional[pd.Timestamp] = None) -> Tuple[bool, str]:
     """`(due, why)` -- is an automatic refresh allowed right now?
 
-    Calendar days, not 24 hours: an app opened at 08:00 and again at 09:00 the
-    next morning should refresh, and a 24-hour rule would refuse.
+    Due when the last attempt predates the most recently published bar. See
+    the note above this section for why that, and not a calendar day: a
+    calendar day spends its one attempt at whatever hour the app happens to
+    be opened, which for anybody east of UTC is hours before the close it was
+    supposed to collect.
+
+    `why` is written to be rendered next to a stale date, so it says what the
+    app is waiting for rather than only that it is waiting.
     """
-    now = now or pd.Timestamp.now("UTC").tz_convert(None)
+    now = (pd.Timestamp.now(MARKET_TZ) if now is None else pd.Timestamp(now))
+    now = (now.tz_localize("UTC") if now.tzinfo is None
+           else now).tz_convert(MARKET_TZ)
+    close = last_market_close(now)
+
     last = last_fetch_attempt(stamp_path)
     if last is None:
         return True, "no automatic fetch has run yet"
-    if last.date() < now.date():
-        return True, f"last automatic fetch was {last:%Y-%m-%d %H:%M}"
-    return False, (f"already fetched today at {last:%H:%M} — "
-                   f"use Refresh now to fetch again")
+    # The stamp is written in naive UTC; the boundary is in exchange time.
+    # Comparing them without converting is the bug this whole section is
+    # about, one layer down.
+    last_et = (last.tz_localize("UTC") if last.tzinfo is None
+               else last).tz_convert(MARKET_TZ)
+    if last_et < close:
+        return True, (f"last automatic fetch was "
+                      f"{last_et:%Y-%m-%d %H:%M} ET, before the "
+                      f"{close:%Y-%m-%d} close")
+    nxt = next_market_close(now)
+    # `{close.day}` rather than a `%-d` in the format spec: the no-padding
+    # modifier is a glibc extension. Windows' C runtime rejects it outright
+    # with "Invalid format string", so a date in a status line took the whole
+    # dashboard down on the platform it was not developed on.
+    return False, (f"already fetched since the {close:%b} {close.day} close "
+                   f"(at {last_et:%H:%M} ET) — next automatic attempt after "
+                   f"the {nxt:%b} {nxt.day} close, or use Refresh now")
+
+
 
 
 @dataclass

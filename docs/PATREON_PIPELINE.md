@@ -46,6 +46,7 @@ nothing.
 ### 1. Install
 
 ```bash
+sudo apt install rclone     # the default upload backend
 sudo useradd -r -m -d /home/patreon patreon
 sudo mkdir -p /opt/qbs /var/lib/patreon /etc/patreon
 sudo chown -R patreon:patreon /var/lib/patreon
@@ -87,32 +88,44 @@ Then add a Gmail filter: from `patreon.com`, subject contains "posted", apply
 label `Patreon`. Point `imap_folder` at that label so the watcher is not
 reading your whole inbox.
 
-### 4. Google Drive OAuth
+### 4. Google Drive, via rclone
 
-In the Google Cloud console: new project → enable the Drive API → OAuth
-consent screen → **set publishing status to "In production"** → Credentials →
-create an OAuth client ID of type **Desktop app** → download the JSON to
-`/var/lib/patreon/client_secret.json`.
-
-Then, on the mini-PC, with a browser:
+rclone ships with its own registered OAuth client, so you authorise *rclone* --
+an app Google already knows -- instead of standing up a Cloud project of your
+own. Run its setup once:
 
 ```bash
-sudo -u patreon /opt/qbs/.venv/bin/python -m patreon_pipeline.runner auth
+rclone config
+#   n) New remote
+#   name> gdrive              <- must match rclone_remote in the config
+#   Storage> drive
+#   client_id / client_secret> (leave both blank)
+#   scope> 1                  (full access)
+#   Edit advanced config? n
+#   Use web browser to automatically authenticate? y
 ```
 
-Over SSH, add `--console`.
+Check it:
 
-Two things here bite people:
+```bash
+rclone lsd gdrive:
+```
 
-- **Leave the consent screen in "Testing" and your refresh token dies after
-  seven days.** The uploads stop and nothing says why. "In production" is the
-  fix, and the `drive.file` scope this uses is non-sensitive, so it needs no
-  verification review.
-- **`drive.file` cannot see folders you created by hand in the Drive web UI.**
-  Pasting such a folder's ID into `drive_folder_id` gives a 404 that reads like
-  a permissions bug. Let the pipeline create its own folder by name (the
-  default, `drive_folder_name`). It is an ordinary Drive folder once created —
-  visible, shareable, and readable by Gemini.
+That is the whole credential story for Drive. No Cloud project, no consent
+screen, no verification, and no seven-day token expiry.
+
+**Why not the Drive API directly?** The pipeline can still do that --
+`uploader: "drive"` uses an OAuth client you register yourself. It was the
+original default, and it is a worse deal than it looks: publishing an External
+consent screen requires a homepage URL and a privacy policy URL on a domain you
+control, and an app left in "Testing" is issued refresh tokens that expire
+after seven days. The `drive.file` scope it uses also cannot see folders you
+created by hand in the Drive web UI, which produces a 404 that reads like a
+permissions bug. rclone has none of those problems.
+
+The trade-off is that rclone's client ID is shared across everyone using
+rclone, so it is rate-limited in aggregate. At a few uploads a day that is
+irrelevant; `rclone config` accepts a client ID of your own if it ever matters.
 
 ### 5. Configure and start
 

@@ -111,6 +111,22 @@ def shadow_books(
     return rows
 
 
+def parse_watchlist(raw: Optional[str]) -> List[str]:
+    """Tickers out of a `QBS_WATCHLIST` string: comma- or space-separated.
+
+    One parser, because the live runner and the dashboard read the same
+    variable and a watchlist that means two things in two places is worse
+    than one that means nothing.
+
+    Upper-cased, and de-duplicated in order: a name listed twice is one
+    watched name, not two identical rows reporting the same rank.
+    """
+    if not raw:
+        return []
+    return list(dict.fromkeys(
+        t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()))
+
+
 def watchlist_rows(
     universe: pd.DataFrame,
     safe_prices: pd.Series,

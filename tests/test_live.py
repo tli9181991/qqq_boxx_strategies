@@ -2049,3 +2049,34 @@ def test_the_trade_phase_sits_out_a_half_day_without_doing_any_work(monkeypatch,
     monkeypatch.setattr(runner, "market_today", at(2026, 12, 1))
     runner.phase_trade(Config(), live)
     assert calls == ["loaded"], "a normal session must not be skipped"
+def test_the_watchlist_string_parses_the_same_everywhere():
+    """One parser for QBS_WATCHLIST, because the runner and the dashboard
+    both read it and a list that means two things is worse than none."""
+    import os
+
+    from qbs.live.config import LiveConfig
+    from qbs.shadow import parse_watchlist
+
+    assert parse_watchlist(None) == []
+    assert parse_watchlist("") == []
+    assert parse_watchlist("   ") == []
+    assert parse_watchlist("tsm") == ["TSM"]
+    # Commas, spaces and both at once are the three ways someone will type it.
+    for raw in ("TSM,GOOGL", "TSM GOOGL", " tsm,  googl ", "tsm,,googl"):
+        assert parse_watchlist(raw) == ["TSM", "GOOGL"], raw
+    # Listed twice is one watched name: two identical rows would report the
+    # same rank twice and read as two pieces of evidence.
+    assert parse_watchlist("TSM, googl, tsm") == ["TSM", "GOOGL"]
+
+    # And the environment the runner actually reads goes through it.
+    old = os.environ.get("QBS_WATCHLIST")
+    try:
+        os.environ["QBS_WATCHLIST"] = " tsm, googl  TSM "
+        assert LiveConfig.from_env().watchlist == ["TSM", "GOOGL"]
+        os.environ["QBS_WATCHLIST"] = ""
+        assert LiveConfig.from_env().watchlist == []
+    finally:
+        if old is None:
+            os.environ.pop("QBS_WATCHLIST", None)
+        else:
+            os.environ["QBS_WATCHLIST"] = old

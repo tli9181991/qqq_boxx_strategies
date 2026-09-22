@@ -21,9 +21,13 @@ langchain-core>=1.0
 # tool calling the way create_agent expects.
 langchain-google-genai>=2.0
 
-# Web search, no API key required. Tavily is better and costs money: to use
-# it instead, `pip install tavily-python` and set TAVILY_API_KEY -- qbs.agent
-# .news prefers it automatically when both are present.
+# Web search, no API key required.
+#
+# Tavily is the better index and costs money: `pip install tavily-python` and
+# set TAVILY_API_KEY. It is not an either/or -- the news panel searches BOTH
+# and merges the results, because Tavily returns few stories per query with
+# dates attached and DuckDuckGo returns more of them with fewer dates. The
+# chat still takes the best single one, since it searches far more often.
 ddgs>=9.0
 
 # Fundamentals. Already in requirements.txt for prices; repeated so this file

@@ -265,47 +265,110 @@ def test_the_summary_never_leaks_a_value(tmp_path):
     assert "GOOGLE_API_KEY" in summary, "names are fine, values are not"
 
 
-def test_the_kill_switch_reads_off_words_as_off():
-    """0/false/no/off/none/disabled leave it running; unset and empty too."""
-    for value in ("", "0", "false", "FALSE", "no", "off", "OFF", "none",
-                  "disabled", "  0  "):
-        assert env.analyst_disabled({env.DISABLE_VAR: value}) is None, value
-    assert env.analyst_disabled({}) is None
+def _news_on(monkeypatch):
+    """Switch the news analysis on, the way a `.env` would.
+
+    It ships OFF, so every test that wants to watch the read actually run has
+    to say so -- which is the point of the default and not an inconvenience
+    to work around.
+    """
+    monkeypatch.setenv(env.DISABLE_NEWS_ANALYSIS_VAR, "0")
+    monkeypatch.delenv(env.DISABLE_NEWS_READ_VAR, raising=False)
+    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
 
 
-def test_the_kill_switch_fails_safe_on_anything_else():
-    """It exists to stop spending money, so an unrecognised value must
-    DISABLE. `QBS_DISABLE_ANALYST=disable` is a natural thing to type, and
-    the repo's own `_env_bool` would read it as false and keep billing."""
-    for value in ("1", "true", "yes", "on", "disable", "temporarily", "y"):
-        assert env.analyst_disabled({env.DISABLE_VAR: value}), value
+def test_an_on_by_default_switch_reads_off_words_as_off():
+    """0/false/no/off/none/disabled leave it running; unset and empty too.
+
+    True of the two switches that guard something a person starts. The news
+    analysis is the exception and has its own test.
+    """
+    for var, fn in ((env.DISABLE_CHAT_VAR, env.chat_disabled),
+                    (env.DISABLE_NEWS_READ_VAR, env.news_read_disabled)):
+        for value in ("", "0", "false", "FALSE", "no", "off", "OFF", "none",
+                      "disabled", "  0  "):
+            assert fn({var: value}) is None, (var, value)
+        assert fn({}) is None, var
 
 
-def test_the_kill_switch_says_why_and_how_to_undo_it():
-    reason = env.analyst_disabled({env.DISABLE_VAR: "1"})
-    assert env.DISABLE_VAR in reason
+def test_a_kill_switch_fails_safe_on_anything_else():
+    """They exist to stop spending money, so an unrecognised value must
+    DISABLE. `QBS_DISABLE_CHAT=disable` is a natural thing to type, and the
+    repo's own `_env_bool` would read it as false and keep billing."""
+    for var, fn in ((env.DISABLE_CHAT_VAR, env.chat_disabled),
+                    (env.DISABLE_NEWS_READ_VAR, env.news_read_disabled)):
+        for value in ("1", "true", "yes", "on", "disable", "temporarily", "y"):
+            assert fn({var: value}), (var, value)
+
+
+def test_the_news_analysis_is_off_until_it_is_switched_on():
+    """The one switch that defaults to the disabled position.
+
+    Everything else here guards something a person starts -- typing in the
+    chat, pressing refresh. This one runs on page load for anybody with a key
+    in their `.env`, so a default that bills a fresh checkout for opening the
+    dashboard is not a default anybody chose.
+    """
+    assert env.news_analysis_disabled({}), "unset must mean OFF"
+    for value in ("1", "true", "yes", "on", "disable", "whatever"):
+        assert env.news_analysis_disabled(
+            {env.DISABLE_NEWS_ANALYSIS_VAR: value}), value
+    # Only an explicit off-word switches it on.
+    for value in ("0", "false", "no", "off", "none", "disabled", "  0  "):
+        assert env.news_analysis_disabled(
+            {env.DISABLE_NEWS_ANALYSIS_VAR: value}) is None, value
+
+
+def test_off_by_default_and_switched_off_read_differently():
+    """Same remedy, completely different surprise. Somebody who never touched
+    the switch needs "this ships off", not "something turned it off"."""
+    never = env.news_analysis_disabled({})
+    turned = env.news_analysis_disabled({env.DISABLE_NEWS_ANALYSIS_VAR: "1"})
+    assert "by default" in never
+    assert "by default" not in turned and "'1'" in turned
+    for reason in (never, turned):
+        assert env.DISABLE_NEWS_ANALYSIS_VAR in reason
+        assert "=0" in reason or "to 0" in reason, "the remedy must be there"
+
+
+def test_switching_the_analysis_on_overrides_the_fetch_switch():
+    """Two settings that contradict each other, and the one somebody went out
+    of their way to enable says what they wanted. Analysing news that is not
+    being fetched is not a configuration anybody means."""
+    both = {env.DISABLE_NEWS_ANALYSIS_VAR: "0",
+            env.DISABLE_NEWS_READ_VAR: "1"}
+    assert env.news_read_disabled(both) is None, "the fetch has to run"
+    assert env.news_analysis_disabled(both) is None
+
+    # But with the analysis off, the fetch switch means what it says.
+    assert env.news_read_disabled({env.DISABLE_NEWS_READ_VAR: "1"})
+
+
+def test_the_chat_switch_says_why_and_how_to_undo_it():
+    reason = env.chat_disabled({env.DISABLE_CHAT_VAR: "1"})
+    assert env.DISABLE_CHAT_VAR in reason
     assert "0" in reason or "Unset" in reason, "the remedy must be in the message"
 
 
 def test_a_disabled_analyst_answers_without_calling_anything(monkeypatch):
     from qbs.agent import analyst
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
     monkeypatch.setenv("GOOGLE_API_KEY", "would-work-if-enabled")
 
     answer = analyst.analyse("what do we hold?")
     assert answer.disabled, "the caller must be able to tell this from a fault"
     assert answer.tool_calls == [], "nothing should have run"
-    assert env.DISABLE_VAR in answer.text
+    assert env.DISABLE_CHAT_VAR in answer.text
 
 
 def test_the_switch_outranks_a_missing_key(monkeypatch):
     """Two different remedies. Telling someone who switched the analyst off to
     go and create a `.env` sends them to fix a thing that is not broken."""
     from qbs.agent import analyst
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
     _no_key(monkeypatch)
     blocker = analyst.check_requirements()
-    assert env.DISABLE_VAR in blocker
+    assert env.DISABLE_CHAT_VAR in blocker
     assert "aistudio" not in blocker, "the key remedy must not be offered here"
 
 
@@ -314,18 +377,25 @@ def test_no_gemini_client_can_be_built_while_the_switch_is_on(monkeypatch):
     directly, or a future path that forgets to check, still cannot reach the
     API."""
     from qbs.agent import analyst
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
     monkeypatch.setenv("GOOGLE_API_KEY", "would-work-if-enabled")
     for build in (analyst.build_model, analyst.build_analyst):
         with pytest.raises(RuntimeError) as excinfo:
             build()
-        assert env.DISABLE_VAR in str(excinfo.value)
+        assert env.DISABLE_CHAT_VAR in str(excinfo.value)
+
+    # `role="summary"` checks the OTHER switch, which is what lets the news
+    # read go through `build_model` while the chat is off.
+    monkeypatch.setenv(env.DISABLE_NEWS_ANALYSIS_VAR, "1")
+    with pytest.raises(RuntimeError) as excinfo:
+        analyst.build_model(role="summary")
+    assert env.DISABLE_NEWS_ANALYSIS_VAR in str(excinfo.value)
 
 
 def test_the_switch_leaves_everything_else_working(monkeypatch):
     """The point of a switch rather than an uninstall: the reports under the
     model do not need it and must not notice."""
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
     book = _book()
     assert "CURRENT PICKS" in ev.picks_report(book)
     assert "[Gates each strategy applies]" in ev.name_report(
@@ -339,35 +409,73 @@ def test_the_switch_leaves_everything_else_working(monkeypatch):
 def test_the_switch_is_a_known_key_so_a_typo_is_caught(tmp_path):
     """It is settable from `.env`, so it has to be on the recognised list --
     otherwise the loader would flag the real thing as an unknown key."""
-    assert env.DISABLE_VAR in env.KNOWN_KEYS
-    path = _write_env(tmp_path, f"{env.DISABLE_VAR}=1\n")
+    for var in (env.DISABLE_CHAT_VAR, env.DISABLE_NEWS_ANALYSIS_VAR,
+                env.DISABLE_NEWS_READ_VAR):
+        assert var in env.KNOWN_KEYS
+        path = _write_env(tmp_path, f"{var}=1\n")
+        load = env.load_env(path, environ={})
+        assert load.unknown == [] and load.applied == [var]
+
+
+def test_the_dashboard_watchlist_is_not_the_runners(tmp_path):
+    """Two watchlists, two names, and the root `.env` knows only its own.
+
+    The dashboard's list seeds a box someone edits while looking at charts;
+    the runner's decides what goes into var/watchlist_log.csv on the trading
+    host. One name for both would mean a host running both hands one list to
+    two programs -- and a rename back to `QBS_WATCHLIST` would do exactly
+    that silently, which is what this pins.
+    """
+    assert "QBS_DASH_WATCHLIST" in env.KNOWN_KEYS
+    assert "QBS_WATCHLIST" not in env.KNOWN_KEYS, (
+        "the runner's watchlist lives in deploy/docker/.env and is read by "
+        "qbs.live.config, not by this loader")
+
+    path = _write_env(tmp_path, "QBS_DASH_WATCHLIST=TSM,GOOGL\n")
     load = env.load_env(path, environ={})
-    assert load.unknown == [] and load.applied == [env.DISABLE_VAR]
+    assert load.unknown == [] and load.applied == ["QBS_DASH_WATCHLIST"]
+
+    # And the runner's name in the DASHBOARD's file is the mix-up worth
+    # naming out loud, so it has to read as unrecognised rather than work.
+    path = _write_env(tmp_path, "QBS_WATCHLIST=TSM\n")
+    assert env.load_env(path, environ={}).unknown == ["QBS_WATCHLIST"]
 
 
 def test_the_chat_switch_leaves_the_news_read_running(monkeypatch):
-    """The point of having two switches: bring one feature up at a time. A
+    """The point of separate switches: bring one feature up at a time. A
     chat-only shutdown must not silence the daily read."""
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    _news_on(monkeypatch)
     monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
 
     assert env.chat_disabled() and env.DISABLE_CHAT_VAR in env.chat_disabled()
-    assert env.analyst_disabled() is None, "the news read answers to the master"
+    assert env.news_analysis_disabled() is None, "the news has its own switch"
+    assert env.DISABLE_CHAT_VAR not in (env.news_analysis_disabled() or "")
 
 
-def test_the_master_switch_outranks_the_chat_switch(monkeypatch):
-    """Someone who set QBS_DISABLE_ANALYST needs to be told THAT, not handed a
-    message about a chat switch they never touched."""
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
-    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
+def test_a_retired_switch_is_reported_not_ignored(tmp_path, monkeypatch):
+    """QBS_DISABLE_ANALYST was the master over all of these and is read by
+    nothing now. Somebody who set a kill switch is relying on it, and the
+    failure mode of a silently-retired one is a bill -- so it is named, with
+    what replaced it, rather than passed off as a typo."""
+    assert "QBS_DISABLE_ANALYST" in env.RETIRED_VARS
+    assert "QBS_DISABLE_ANALYST" not in env.KNOWN_KEYS
 
-    reason = env.chat_disabled()
-    assert reason and env.DISABLE_VAR in reason
-    assert env.DISABLE_CHAT_VAR not in reason
+    path = _write_env(tmp_path, "QBS_DISABLE_ANALYST=1\n")
+    load = env.load_env(path, environ={})
+    assert load.retired == ["QBS_DISABLE_ANALYST"]
+    assert load.unknown == [], "retired is not the same as misspelled"
+    summary = load.summary()
+    assert "RETIRED" in summary and env.DISABLE_NEWS_ANALYSIS_VAR in summary
+
+    # And it really does nothing now: setting it must not switch anything off.
+    _news_on(monkeypatch)
+    monkeypatch.setenv("QBS_DISABLE_ANALYST", "1")
+    assert env.retired_vars_in_use() == ["QBS_DISABLE_ANALYST"]
+    assert env.chat_disabled() is None
+    assert env.news_analysis_disabled() is None
 
 
-def test_the_chat_switch_fails_safe_like_the_master(monkeypatch):
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+def test_the_chat_switch_fails_safe(monkeypatch):
     for value in ("", "0", "false", "off", "none", "disabled"):
         monkeypatch.setenv(env.DISABLE_CHAT_VAR, value)
         assert env.chat_disabled() is None, value
@@ -380,7 +488,7 @@ def test_the_two_roles_are_checked_separately(monkeypatch):
     from qbs.agent import analyst
 
     monkeypatch.setenv("GOOGLE_API_KEY", "present")
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    _news_on(monkeypatch)
     monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
 
     assert analyst.check_requirements(role="summary") is None, "news is ready"
@@ -393,7 +501,7 @@ def test_a_chat_switched_off_still_summarises(monkeypatch):
     through it, and enforcing there would take both features down together."""
     from qbs.agent import analyst, sentiment as snt
 
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    _news_on(monkeypatch)
     monkeypatch.setenv(env.DISABLE_CHAT_VAR, "1")
     monkeypatch.setenv("GOOGLE_API_KEY", "present")
 
@@ -515,19 +623,31 @@ def test_the_headline_block_is_numbered_and_fenced():
     assert "[1] headline 1" in block and "[2] headline 2" in block
 
 
-def test_a_switched_off_analyst_writes_no_summary(monkeypatch):
+def test_a_switched_off_news_analysis_writes_no_summary(monkeypatch):
     from qbs.agent import sentiment as snt
 
-    monkeypatch.setenv(env.DISABLE_VAR, "1")
+    monkeypatch.setenv(env.DISABLE_NEWS_ANALYSIS_VAR, "1")
     out = snt.summarise(_headlines())
-    assert out.error and env.DISABLE_VAR in out.error
+    assert out.error and env.DISABLE_NEWS_ANALYSIS_VAR in out.error
+    assert not out.ok
+
+
+def test_the_default_alone_writes_no_summary(monkeypatch):
+    """Off by default means off in fact, not off in the docs. A fresh
+    checkout with a key in it must not bill for opening the dashboard."""
+    from qbs.agent import sentiment as snt
+
+    monkeypatch.delenv(env.DISABLE_NEWS_ANALYSIS_VAR, raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "would-work-if-enabled")
+    out = snt.summarise(_headlines())
+    assert out.error and "by default" in out.error
     assert not out.ok
 
 
 def test_no_headlines_is_an_error_not_an_empty_read(monkeypatch):
     from qbs.agent import sentiment as snt
 
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    _news_on(monkeypatch)
     out = snt.summarise([])
     assert out.error and "nothing to summarise" in out.error
 
@@ -987,7 +1107,7 @@ def test_the_budget_is_sent_to_the_chat_model(monkeypatch):
             seen.update(kwargs)
 
     monkeypatch.setenv("GOOGLE_API_KEY", "x")
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    monkeypatch.delenv(env.DISABLE_CHAT_VAR, raising=False)
     monkeypatch.setattr(ggenai, "ChatGoogleGenerativeAI", Spy)
 
     analyst.build_model("gemini-2.5-flash", thinking_budget=1024)
@@ -1012,7 +1132,7 @@ def test_the_news_read_uses_the_summary_model_without_thinking(monkeypatch):
         seen["thinking_budget"] = thinking_budget
         raise RuntimeError("stop here -- the call itself is not the point")
 
-    monkeypatch.delenv(env.DISABLE_VAR, raising=False)
+    _news_on(monkeypatch)
     monkeypatch.setattr(analyst, "build_model", spy)
     snt.summarise([nw.Result(title="a headline", url="https://x.test/1")])
     assert seen["model"] == analyst.DEFAULT_SUMMARY_MODEL
@@ -1216,3 +1336,213 @@ def test_final_text_skips_the_tool_calling_turn():
         AIMessage(content="the answer"),
     ]}
     assert _final_text(state) == "the answer"
+
+
+def test_a_tavily_key_without_the_package_is_not_silent(monkeypatch):
+    """A key that is set but cannot be used is worse than a missing one.
+
+    The search still works, so nothing looks broken -- the headlines just
+    quietly come from DuckDuckGo. That is not cosmetic here: the 12-hour
+    window is applied on each headline's own timestamp, and most DuckDuckGo
+    results have none.
+    """
+    import builtins
+
+    from qbs.agent import news as nw
+
+    real_import = builtins.__import__
+
+    def no_tavily(name, *a, **k):
+        if name == "tavily":
+            raise ImportError("no module named 'tavily'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_tavily)
+
+    monkeypatch.setenv("TAVILY_API_KEY", "sk-not-a-real-key")
+    note = nw.backend_note()
+    assert note and "tavily-python" in note and "DuckDuckGo" in note
+    assert "sk-not-a-real-key" not in note, "a warning must not echo the key"
+    # And the picker really has dropped it, which is what makes it silent.
+    assert "tavily" not in nw.available_backends()
+
+    # Nothing to say when the key is not set at all: that is a choice, not a
+    # misconfiguration, and warning about it would train people to ignore it.
+    monkeypatch.delenv("TAVILY_API_KEY")
+    assert nw.backend_note() is None
+
+
+def test_the_headlines_load_with_the_analysis_switched_off(monkeypatch, tmp_path):
+    """The news switches stop the MODEL, not the news.
+
+    The whole point of the split in `read_news`: the headlines cost no key
+    and no money, so the master switch must leave them running and take only
+    the read on top.
+    """
+    import pandas as pd
+
+    from qbs.agent import news as nw
+    from qbs.agent import sentiment as snt
+    from qbs.agent.analyst import check_requirements
+
+    monkeypatch.setenv(env.DISABLE_NEWS_ANALYSIS_VAR, "1")
+    monkeypatch.delenv(env.DISABLE_NEWS_READ_VAR, raising=False)
+    assert check_requirements(role="summary"), "the switch must block the read"
+    assert env.news_read_disabled() is None, "but the fetch keeps running"
+
+    def fake_search(query, max_results=6, backend=None, days=None, merge=False):
+        return ([nw.Result(title=f"Story for {query[:10]}",
+                           url=f"https://example.invalid/{abs(hash(query))}",
+                           snippet="", source="example.invalid",
+                           published=pd.Timestamp.now("UTC").isoformat(),
+                           backend="tavily")], None)
+
+    monkeypatch.setattr(snt.nw, "search_web", fake_search)
+    # Not "assert it was not called" -- make calling it impossible to miss.
+    monkeypatch.setattr(snt, "summarise", _never_called)
+
+    feed, summary, _ = snt.read_news(hours=12, summarise_it=False,
+                                     cache_dir=str(tmp_path))
+    assert feed.headlines, "the feed must still be fetched"
+    assert summary is None, "and nothing may have been read on top of it"
+
+
+def _never_called(*a, **k):
+    raise AssertionError("the model was called with the analyst switched off")
+
+
+def _hit(title, url, published="", backend="tavily", source=""):
+    from qbs.agent import news as nw
+    return nw.Result(title=title, url=url, published=published,
+                     backend=backend, source=source or backend)
+
+
+def _two_backends(monkeypatch, tavily, ddg):
+    """Both engines available, each answering with a fixed list."""
+    from qbs.agent import news as nw
+    monkeypatch.setattr(nw, "available_backends",
+                        lambda: ["tavily", "duckduckgo"])
+    monkeypatch.setattr(nw, "_search_tavily", lambda q, n, d: list(tavily))
+    monkeypatch.setattr(nw, "_search_ddg", lambda q, n, d: list(ddg))
+    return nw
+
+
+def test_merge_takes_both_backends_and_fallback_still_takes_one(monkeypatch):
+    """The two modes are different questions, and both have a caller.
+
+    Fallback is for the chat -- many searches a conversation, so stopping at
+    the first engine that answers is the right trade. Merge is for the news
+    page, where one search stocks a page read once an hour and Tavily alone
+    comes back with only a handful of stories.
+    """
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds", "https://reuters.com/a")],
+        ddg=[_hit("Oil slips", "https://cnbc.com/c", backend="duckduckgo")])
+
+    res, err = nw.search_web("q", days=1)
+    assert [r.backend for r in res] == ["tavily"], "fallback stops at the first"
+    assert err is None
+
+    res, err = nw.search_web("q", days=1, merge=True)
+    assert [r.backend for r in res] == ["tavily", "duckduckgo"]
+    assert err is None
+
+
+def test_a_merge_counts_one_story_once(monkeypatch):
+    """Two backends finding the same article is the ordinary case, not an
+    edge one, so `max_results` has to mean distinct stories."""
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds rates", "https://reuters.com/a")],
+        # Same article: a trailing slash and a headline punctuated its way.
+        ddg=[_hit("Fed Holds Rates!", "https://reuters.com/a/",
+                  backend="duckduckgo")])
+
+    res, _ = nw.search_web("q", days=1, merge=True)
+    assert len(res) == 1, "one article, found twice, is one headline"
+
+
+def test_a_dated_duplicate_upgrades_an_undated_one(monkeypatch):
+    """The 12-hour window is applied on these timestamps, so a dated copy of
+    a story we are holding undated is an upgrade, not a repeat."""
+    nw = _two_backends(
+        monkeypatch,
+        tavily=[_hit("Fed holds", "https://reuters.com/a", published="")],
+        ddg=[_hit("Fed holds", "https://reuters.com/a",
+                  published="2026-09-21T11:00:00Z", backend="duckduckgo")])
+
+    res, _ = nw.search_web("q", days=1, merge=True)
+    assert len(res) == 1
+    assert res[0].published == "2026-09-21T11:00:00Z"
+    assert res[0].backend == "tavily", "the kept row is still the one we kept"
+
+
+def test_one_backend_down_returns_the_other_and_says_so(monkeypatch):
+    """A thin page and a full one must not look identical."""
+    from qbs.agent import news as nw
+
+    def dead(q, n, d):
+        raise RuntimeError("rate limited")
+
+    nw_ = _two_backends(monkeypatch, tavily=[],
+                        ddg=[_hit("Oil slips", "https://cnbc.com/c",
+                                  backend="duckduckgo")])
+    monkeypatch.setattr(nw, "_search_tavily", dead)
+
+    res, err = nw_.search_web("q", days=1, merge=True)
+    assert len(res) == 1, "the surviving backend still fills the page"
+    assert err and "tavily" in err and "rate limited" in err
+
+
+def test_the_outlet_is_not_the_search_engine(monkeypatch):
+    """`source` answers "who wrote this" and `backend` answers "how did we
+    find it". They were one field, which put the string "tavily" where the
+    prompt and the UI both read a publisher's name."""
+    from qbs.agent import news as nw
+
+    monkeypatch.setenv("TAVILY_API_KEY", "k")
+    monkeypatch.setattr(
+        nw, "TavilyClient", None, raising=False)
+
+    class FakeClient:
+        def __init__(self, api_key): pass
+        def search(self, query, **kw):
+            return {"results": [{"title": "Fed holds",
+                                 "url": "https://www.reuters.com/markets/x",
+                                 "content": "body",
+                                 "published_date": "2026-09-21"}]}
+
+    import sys
+    import types
+    mod = types.ModuleType("tavily")
+    mod.TavilyClient = FakeClient
+    monkeypatch.setitem(sys.modules, "tavily", mod)
+
+    out = nw._search_tavily("q", 5, 1)
+    assert out[0].backend == "tavily"
+    assert out[0].source == "reuters.com", "the outlet, read off the URL"
+
+
+def test_the_feed_reports_the_backends_that_actually_answered(monkeypatch):
+    """Read off the results, not off the configuration: a key that is set and
+    an engine that answered are different claims."""
+    import pandas as pd
+
+    from qbs.agent import news as nw
+    from qbs.agent import sentiment as snt
+
+    now = pd.Timestamp("2026-09-21T12:00:00")
+
+    def fake(query, max_results=6, backend=None, days=None, merge=False):
+        assert merge, "the news feed asks every engine"
+        return ([_hit("A", f"https://a.invalid/{abs(hash(query))}",
+                      published="2026-09-21T11:00:00Z"),
+                 _hit("B", f"https://b.invalid/{abs(hash(query))}",
+                      published="2026-09-21T11:30:00Z",
+                      backend="duckduckgo")], None)
+
+    monkeypatch.setattr(snt.nw, "search_web", fake)
+    feed = snt.fetch_news(hours=12, now=now)
+    assert feed.backends == ["duckduckgo", "tavily"]
+    assert feed.total == 2 * len(snt.MARKET_QUERIES), "one pair per query"
