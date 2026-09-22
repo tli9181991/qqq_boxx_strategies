@@ -135,25 +135,83 @@ def load_daily_ohlc(
         return cached if cached is not None and not cached.empty else None
 
 
+MARKET_TZ = "America/New_York"
+MARKET_CLOSE = (16, 0)            # 16:00 ET, the regular-session close
+
+
+def last_market_close(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """The most recent weekday 16:00 ET at or before `now`, tz-aware.
+
+    The moment the newest daily bar became collectable. Weekdays only, so it
+    over-reports around a holiday in the harmless direction: the fetch runs
+    and finds nothing new, rather than not running when there is.
+    """
+    now = (pd.Timestamp.now(MARKET_TZ) if now is None
+           else pd.Timestamp(now))
+    now = (now.tz_localize("UTC") if now.tzinfo is None
+           else now).tz_convert(MARKET_TZ)
+
+    close = now.normalize() + pd.Timedelta(hours=MARKET_CLOSE[0],
+                                           minutes=MARKET_CLOSE[1])
+    # Walk back to the last weekday whose close has actually happened.
+    while close > now or close.weekday() >= 5:
+        close -= pd.Timedelta(days=1)
+    return close
+
+
+def next_market_close(now: Optional[pd.Timestamp] = None) -> pd.Timestamp:
+    """The next weekday 16:00 ET strictly after `now`, tz-aware.
+
+    Only used to tell someone when the app will try again. A "nothing to do"
+    message that does not say until when is the one that gets read as a
+    fault.
+    """
+    now = (pd.Timestamp.now(MARKET_TZ) if now is None else pd.Timestamp(now))
+    now = (now.tz_localize("UTC") if now.tzinfo is None
+           else now).tz_convert(MARKET_TZ)
+
+    close = now.normalize() + pd.Timedelta(hours=MARKET_CLOSE[0],
+                                           minutes=MARKET_CLOSE[1])
+    while close <= now or close.weekday() >= 5:
+        close += pd.Timedelta(days=1)
+    return close
+
+
 def sessions_behind(last: pd.Timestamp,
                     now: Optional[pd.Timestamp] = None) -> int:
-    """How many completed weekday sessions sit between `last` and now.
+    """How many PUBLISHED daily bars are missing after `last`.
 
-    0 means the most recent weekday is already in the data. 1 is normal
-    during a session and before the close is published. 2 or more means the
-    cache has genuinely fallen behind.
+    0 means the newest bar the exchange has published is in the data. 1 or
+    more means a bar exists and is not here, which is a real gap and not a
+    time of day.
+
+    Measured against the last close in EXCHANGE time. It used to compare
+    against the UTC calendar date, which made "behind" a function of where
+    you were standing: at 22:00 in New York the UTC date has already rolled
+    over, so a cache holding that very afternoon's close reported itself one
+    session behind, the banner said "the latest session is not in yet" about
+    a bar that had been in for six hours, and the caller re-downloaded on
+    every rerun trying to fetch a bar it already had.
+
+    That also retires the old "1 is normal during a session" fudge, which
+    existed only because the old reading could not tell a missing bar from a
+    bar that did not exist yet. This one can: before the close, the newest
+    published bar is yesterday's, so a cache holding it is current and says
+    so.
 
     Weekdays only -- there is no exchange holiday calendar here. Around a
     market holiday this OVER-reports by a day, which is the safe direction
     for a staleness warning: it nags early rather than staying quiet while
     the data rots. Do not use it to decide whether a session existed.
     """
-    last = pd.Timestamp(last).tz_localize(None).normalize()
-    now = (pd.Timestamp(now) if now is not None
-           else pd.Timestamp.utcnow()).tz_localize(None).normalize()
-    if now <= last:
+    last = pd.Timestamp(last)
+    last = (last.tz_convert(MARKET_TZ) if last.tzinfo is not None
+            else last).tz_localize(None).normalize()
+    # The date of the newest bar the exchange has published.
+    latest = last_market_close(now).tz_localize(None).normalize()
+    if latest <= last:
         return 0
-    return max(0, len(pd.bdate_range(last + pd.Timedelta(days=1), now)))
+    return max(0, len(pd.bdate_range(last + pd.Timedelta(days=1), latest)))
 
 
 def freshness_note(last: pd.Timestamp,
@@ -168,8 +226,12 @@ def freshness_note(last: pd.Timestamp,
     if n == 0:
         return n, "ok", f"Data current through {stamp}."
     if n == 1:
-        return n, "info", (f"Data through {stamp} — the latest session is not in "
-                           "yet, which is normal before the close is published.")
+        # Not "normal before the close" any more: 0 covers that case now, so
+        # reaching 1 means a bar the exchange has published is genuinely not
+        # here. Still only a caption -- the commonest cause is opening the
+        # app in the minutes after a close, before the fetch has run.
+        return n, "info", (f"Data through {stamp} — **the last published "
+                           "session is missing**.")
     # Deliberately no remedy here: what to do about staleness depends on why
     # it happened, and the caller is the only one that knows. Telling someone
     # to "switch to Online" while their online download is failing is worse

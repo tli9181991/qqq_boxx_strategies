@@ -932,11 +932,11 @@ Two tabs:
 
 **Refresh now** forces a re-download even when the cache looks current.
 
-Every tab carries a freshness banner: how many sessions behind the data is, and what
-to do about it. The remedy is context-aware — it will not tell you to switch to Online
-while an online download is the thing failing. Staleness is counted in weekdays with no
-exchange-holiday calendar, so around a holiday it nags a day early, which is the safe
-direction.
+Every tab carries a freshness banner: how many published sessions are missing from the
+data, and what to do about it. The remedy is context-aware — it will not tell you to
+switch to Online while an online download is the thing failing. Staleness is counted
+in weekdays against the last 16:00 ET close, with no exchange-holiday calendar, so
+around a holiday it nags a day early, which is the safe direction.
 
 ### The market tab measures the US market
 
@@ -1008,22 +1008,49 @@ only difference being that Finviz averages it and the leader rule reads the sing
 session. That is why the leg barely bites in the US-universe mode: anything that got
 into the universe already clears it on a normal day.
 
-**It refreshes itself, once a day.** On launch the app checks whether an automatic
-fetch has run today; if not, it pulls the screener list and re-downloads any price
-frames more than a session behind. The status line under the toggle says which
-happened — *fetched on this run*, or *already fetched today at HH:MM*.
+**It refreshes itself, once per published bar.** On launch the app checks whether an
+automatic fetch has run since the last close; if not, it pulls the screener list and
+re-downloads any price frame that is missing a published session. The status line
+under the toggle says which happened — *fetched on this run*, or *already fetched
+since the Sep 21 close (at 16:30 ET) — next automatic attempt after the Sep 22 close*.
 
 **The gate counts attempts, not data age**, and that distinction is the whole design.
-Streamlit re-runs the script on every widget interaction, and before the close the
-last bar is always yesterday's — so "is the data stale?" would answer *yes* on every
-rerun and start a 2,400-name download each time, all day. One attempt per calendar
-day, stamped in `data/universe/us_last_fetch.txt` **before** the work starts so a
-download that dies halfway still counts.
+Streamlit re-runs the script on every widget interaction, so a data-age test would
+answer *yes* on every rerun and start a 2,400-name download each time. The attempt is
+stamped in `data/universe/us_last_fetch.txt` **before** the work starts, so a download
+that dies halfway still counts.
 
-The cost of stamping failures too: a fetch that fails at 09:00 will not retry by
-itself until tomorrow. That is deliberate — a silent retry loop against a broken feed
-is worse than a stale number with a button next to it — and **Refresh now** ignores
-the gate entirely.
+**The boundary is the last close, in exchange time** — not a calendar day, and not
+UTC. A per-calendar-day gate loses a session for anybody east of Greenwich: open the
+dashboard at 09:00 in UTC+8 (01:00 UTC) and the day's one automatic attempt is spent
+hours before the close it was meant to collect. The bar appears at 20:00 UTC and the
+gate refuses until the UTC date rolls over, so the app sits a session behind all
+evening with no way forward but the button. Against the close instead, the attempt is
+due exactly when the last one predates the newest published bar: nothing during the
+session, one fetch after 16:00 ET. Exchange time because the close is 20:00 UTC in
+summer and 21:00 in winter, and a rule written in UTC is wrong for half the year.
+
+**Staleness is measured the same way.** `sessions_behind` counts published bars that
+are missing, against the last close — so `0` means current and `1` means a bar exists
+and is not here. It used to compare against the UTC calendar date, which made
+"behind" depend on where you were standing: at 22:00 in New York the UTC date has
+already rolled over, so a cache holding that very afternoon's close reported itself a
+session behind, the banner said *the latest session is not in yet* about a bar six
+hours old, and the loader re-downloaded on every rerun chasing a bar it already had.
+
+**The dashboard's caches are keyed on that same boundary.** `st.cache_data` memoises
+on arguments alone and the price frames are passed unhashed, so a process left running
+across a close would serve the numbers it read on start-up for ever — and the gate
+above would never be consulted, because the function holding it would not run. Every
+cache that holds price data takes a `bar_epoch` key that changes only on a close:
+loaders, selections, breadth and the OHLC bars alike. Fixing only the loaders would be
+worse than leaving it alone, since the banner would say *current* over a table that
+was not.
+
+The cost of stamping failures too: a fetch that fails after the close will not retry by
+itself until the next one. That is deliberate — a silent retry loop against a broken
+feed is worse than a stale number with a button next to it — and **Refresh now**
+ignores the gate, the stamp and the caches entirely.
 
 **What it costs.** The screener paginates at 20 rows a page, so ~2,400 names is ~120
 requests — minutes, not seconds, cached for a day. Prices for 2,400 names is a real

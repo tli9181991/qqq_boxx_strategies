@@ -49,8 +49,9 @@ from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams)
 from qbs.data import (freshness_note, load_daily_ohlc, load_prices,
                       sessions_behind)
-from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_us_universe,
-                        load_universe_bars, record_fetch_attempt, sector_map)
+from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
+                        fetch_us_universe, load_universe_bars,
+                        record_fetch_attempt, sector_map)
 from qbs.screens import finviz_momentum_screen
 from qbs.shadow import parse_watchlist, watchlist_rows
 from qbs.strategies import cross_sectional_momentum
@@ -98,7 +99,8 @@ def _read_cache(download_start: str, fetch_universe: bool = False):
 
 
 @st.cache_data(show_spinner="Loading prices…")
-def load_data(download_start: str, online: bool, force: bool, _token: int):
+def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
+              _token: int):
     """Closes for the ranking universe plus the core ETFs.
 
     Returns `(uni, px, status)` where `status` explains what actually
@@ -150,7 +152,8 @@ def load_data(download_start: str, online: bool, force: bool, _token: int):
 
 @st.cache_data(show_spinner="Building selections…")
 def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
-                     exit_rank: int, n_screen: int) -> Dict[str, pd.DataFrame]:
+                     exit_rank: int, n_screen: int,
+                     bar_epoch: str = "") -> Dict[str, pd.DataFrame]:
     """Daily holdings for each strategy, plus whether the volume leg ran.
 
     Returns `(frames, volume_applied)`. The screen RAISES on a volume leg it
@@ -246,7 +249,8 @@ def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _watch: pd.DataFrame,
 
 @st.cache_data(show_spinner="Computing breadth…")
 def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
-                  _volumes: Optional[pd.DataFrame] = None):
+                  _volumes: Optional[pd.DataFrame] = None,
+                  bar_epoch: str = ""):
     return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note)
 
 
@@ -278,7 +282,8 @@ def load_news(as_of: str, hours: int, model: str, refresh_token: int,
 
 
 @st.cache_data(show_spinner="Fetching the US universe from Finviz…")
-def load_us_market(download_start: str, online: bool, force: bool, _token: int):
+def load_us_market(download_start: str, online: bool, force: bool,
+                   bar_epoch: str, _token: int):
     """The broad US universe for the breadth tab: closes, volumes, sectors.
 
     Returns `(closes, volumes, sectors, note, error, fetched)`. `error` is not
@@ -334,7 +339,7 @@ CANDLE_UP, CANDLE_DN = "#1b7a4b", "#b02525"
 
 
 @st.cache_data(show_spinner=False)
-def ohlc_for(ticker: str, download_start: str, online: bool, _token: int):
+def ohlc_for(ticker: str, download_start: str, online: bool, bar_epoch: str):
     """Real daily OHLC for one name, or None if it cannot be had.
 
     None is a first-class answer: the chart draws a close line instead and
@@ -464,6 +469,22 @@ watch_raw = st.sidebar.text_input(
 # "TSM, googl".
 WATCHLIST = parse_watchlist(watch_raw)
 
+# Every cache below that holds price data takes this as a key. `st.cache_data`
+# memoises on arguments alone, and the frames are passed with a leading
+# underscore so they are not hashed -- which means a process left running
+# across a close serves the numbers it read on start-up for ever, and the
+# fetch gate inside the loader is never even consulted because the loader
+# does not run. `fetch_epoch` changes exactly when a new bar becomes
+# collectable, so the memo expires on the close and on nothing else. A
+# time-based TTL would also work and would re-read on a schedule that has
+# nothing to do with when the data changes.
+#
+# It has to be threaded through the DERIVED caches too -- selections, breadth,
+# the OHLC bars. Fixing only the loaders would leave them returning yesterday's
+# answer over today's frame, which is worse than being uniformly stale: the
+# banner would say current and the table would not be.
+BAR_EPOCH = fetch_epoch()
+
 # Default to 0, not -1. With -1 the very first page load has 0 > -1, so the
 # app force-refreshed on EVERY start -- re-downloading the whole universe
 # before it had shown anything. "Refresh now" is the only thing that should
@@ -471,6 +492,7 @@ WATCHLIST = parse_watchlist(watch_raw)
 force = st.session_state["refresh_token"] > st.session_state.get("applied_token", 0)
 try:
     uni, px, data_status = load_data(download_start, bool(online), bool(force),
+                                     BAR_EPOCH,
                                      st.session_state["refresh_token"])
     st.session_state["applied_token"] = st.session_state["refresh_token"]
 except Exception as exc:  # noqa: BLE001
@@ -516,8 +538,8 @@ st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
 selections, SCREEN_VOLUME_APPLIED = build_selections(
-    uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen))
-breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE)
+    uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen), BAR_EPOCH)
+breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH)
 
 def names_on(key: str, when) -> list:
     """The tickers a strategy held on a date, from the prebuilt selections.
@@ -672,8 +694,7 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
         # chart falls back to a close line and says so, rather than
         # drawing a wickless body per bar off the close series -- that
         # would assert a session high and low that never happened.
-        ohlc = ohlc_for(ticker, download_start, bool(online),
-                        st.session_state["refresh_token"])
+        ohlc = ohlc_for(ticker, download_start, bool(online), BAR_EPOCH)
         bars = None
         if ohlc is not None and not ohlc.empty:
             win = ohlc.loc[:asof].tail(int(months * 21))
@@ -1088,14 +1109,15 @@ with tab_market:
     if use_us:
         (mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err,
          mkt_fetched) = load_us_market(
-            download_start, bool(online), bool(force),
+            download_start, bool(online), bool(force), BAR_EPOCH,
             st.session_state["refresh_token"])
 
     if use_us and mkt_closes is not None:
         m_uni = mkt_closes
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
-        breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols)
+        breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols,
+                                  bar_epoch=BAR_EPOCH)
         # Say which of the two happened. "Fetched just now" and "served from a
         # cache built at some point" look identical on screen otherwise, and
         # the difference is the whole reason for the auto-refresh.
