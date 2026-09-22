@@ -532,8 +532,34 @@ def names_on(key: str, when) -> list:
     return [t for t in str(raw).split(", ") if t]
 
 
+# Loaded once, above the tabs, because two of them need it: the picks tab
+# ranks the watchlist and the analyst tab charts it. Inside one tab it would
+# be a second download the moment the other wanted the same prices.
+WATCH_OUTSIDERS = tuple(t for t in WATCHLIST if t not in uni.columns)
+WATCH_PX, WATCH_ERR = load_watch_prices(
+    WATCH_OUTSIDERS, download_start, bool(online), f"{LAST_BAR:%Y-%m-%d}",
+    st.session_state["refresh_token"])
+
+# Every watched name that has prices, on the universe's calendar. A
+# constituent is read from the frame that was RANKED rather than
+# re-downloaded: the watchlist row has to report the rank the book acted on,
+# and a second copy of the same prices is how the two drift apart.
+WATCH_FRAME = pd.DataFrame({
+    t: (uni[t] if t in uni.columns else WATCH_PX[t].reindex(uni.index).ffill())
+    for t in WATCHLIST
+    if t in uni.columns or t in WATCH_PX.columns})
+
+# The watched names the universe frame does NOT hold. This is the list that
+# needs `extra` prices to be chartable at all, and the list a caption has to
+# mark as interpolated rather than ranked.
+WATCH_EXTRA = [t for t in WATCH_FRAME.columns if t not in uni.columns]
+
+
 def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
-                default_ticker: Optional[str] = None):
+                default_ticker: Optional[str] = None,
+                extra: Optional[pd.DataFrame] = None,
+                ticker_help: str = "Today's picks come first, then the rest "
+                                   "of the universe."):
     """The price / levels / momentum panel, so two tabs can show one panel.
 
     Extracted rather than copied: it is ~180 lines of chart, level and gate
@@ -543,6 +569,27 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 
     `options` is the ticker list for the combo box, already in the order the
     caller wants it -- this function does not decide what is interesting.
+
+    `extra` carries prices for names that are NOT in `uni` -- the watchlist's
+    non-constituents. One such name is joined into the universe frame for the
+    duration of its own panel, and only then:
+
+    * a CONSTITUENT is profiled against the untouched universe, exactly as
+      before. The join is skipped entirely, so putting a name in the
+      watchlist box cannot move a number the picks tab reports.
+    * an OUTSIDER is interpolated into that universe: it joins, and its own
+      percentile is what the panel reports. The rank means "where it would
+      place among the constituents", not "a book holds it" -- the same claim
+      `qbs.shadow.watchlist_rows` makes, on a different scale (that one is an
+      ordinal position, this one a 1-99 percentile).
+
+    Joined one name at a time, not a whole watchlist at once. Joining them
+    together would rank every watched name against the others, so two
+    outsiders would shift each other and the number would depend on what
+    else happened to be in the box. Adding a 98th name to 97 does still move
+    the other constituents' percentiles by a point, but those are not shown
+    on the outsider's own panel, and they are back to normal on everyone
+    else's.
     """
     st.markdown("**Price & levels**")
     if not options:
@@ -552,7 +599,15 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     c1, c2, c3 = st.columns([2, 1, 1])
     ticker = c1.selectbox(
         "Ticker", options, index=index, key=f"{key_prefix}_ticker",
-        help="Today's picks come first, then the rest of the universe.")
+        help=ticker_help)
+
+    outsider = ticker not in uni.columns
+    if outsider:
+        if extra is None or ticker not in extra.columns:
+            st.info(f"No prices for {ticker} — it is not in the ranking "
+                    "universe and nothing was loaded for it.")
+            return ticker
+        uni = uni.join(extra[[ticker]], how="left")
     months = c2.selectbox("Window", [3, 6, 12, 24], index=2,
                           format_func=lambda m: f"{m}m", key=f"{key_prefix}_win")
     n_lvl = c3.number_input("Levels", 0, 30, 8, key=f"{key_prefix}_levels",
@@ -678,6 +733,11 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 "question a momentum strategy asks is relative, so the number "
                 "only counts next to what every other candidate did. "
                 "*Universe median* is that comparison in one column."
+                + (f" **{ticker} is not in the index**, so it is interpolated "
+                   "into the constituents' ranking — nothing else moved to "
+                   "make room, and a strong rank means it *would* place there "
+                   "if it were a constituent, not that a book holds it."
+                   if outsider else "")
             )
 
             tr = prof["trend"].copy()
@@ -896,22 +956,7 @@ with tab_picks:
             "place in the ranking the book acts on. A name outside the index "
             "is interpolated into that ranking without joining it."))
     else:
-        outsiders = tuple(t for t in WATCHLIST if t not in uni.columns)
-        watch_px, watch_err = load_watch_prices(
-            outsiders, download_start, bool(online), f"{LAST_BAR:%Y-%m-%d}",
-            st.session_state["refresh_token"])
-
-        # Constituents are read from the universe frame that was ranked, not
-        # re-downloaded: the row has to report the rank the book acted on,
-        # and a second copy of the same prices is how the two drift apart.
-        watch_cols: Dict[str, pd.Series] = {}
-        for t in WATCHLIST:
-            if t in uni.columns:
-                watch_cols[t] = uni[t]
-            elif t in watch_px.columns:
-                watch_cols[t] = watch_px[t].reindex(uni.index).ffill()
-
-        if watch_err:
+        if WATCH_ERR:
             # The remedy depends on the mode. Telling someone to go online
             # when they already are, and the download is what failed, sends
             # them to fix the wrong thing.
@@ -922,13 +967,13 @@ with tab_picks:
                       "Switch **Source** to Online to fetch a name for the "
                       "first time.")
             st.warning(md("No prices for " + ", ".join(
-                f"**{t}** ({e})" for t, e in watch_err.items())
+                f"**{t}** ({e})" for t, e in WATCH_ERR.items())
                 + ". " + remedy), icon="⚠️")
 
-        rows = (watch_rows(uni, px["BOXX"], pd.DataFrame(watch_cols),
+        rows = (watch_rows(uni, px["BOXX"], WATCH_FRAME,
                            ",".join(WATCHLIST), int(n_hold), int(exit_rank),
                            asof)
-                if watch_cols else [])
+                if not WATCH_FRAME.empty else [])
         if not rows:
             st.info("Nothing on the watchlist could be ranked on this date.")
         else:
@@ -1511,19 +1556,43 @@ with tab_analyst:
 
     # ---- left: the same panel the picks tab shows ------------------------
     with a_cols[0]:
-        # High-momentum names first, then the momentum book, then everyone
-        # else. Whatever the screen currently holds is what you are most
-        # likely to want to look at while asking about it.
-        hi = [t for t in screen_names if t in uni.columns]
-        mom = [t for t in momentum_names if t in uni.columns and t not in hi]
-        rest = [t for t in uni.columns if t not in hi and t not in mom]
-        a_options = hi + mom + rest
-        st.caption(
-            f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''} first, "
-            f"then {len(mom)} from the momentum book, then the rest of the "
-            f"{len(a_options)}-name universe.")
-        chart_ticker = price_panel(uni, px, asof_analyst, a_options,
-                                   int(n_hold), "analyst")
+        # Your watchlist first, then the high-momentum screen, then the
+        # momentum book, then everyone else. The watchlist leads because it
+        # is the shortest list and the only one you typed yourself -- a name
+        # you went out of your way to watch is the one you came here to ask
+        # about, and it would otherwise be buried in ~100 constituents.
+        watched = [t for t in WATCH_FRAME.columns]
+        hi = [t for t in screen_names
+              if t in uni.columns and t not in watched]
+        mom = [t for t in momentum_names
+               if t in uni.columns and t not in watched and t not in hi]
+        rest = [t for t in uni.columns
+                if t not in watched and t not in hi and t not in mom]
+        a_options = watched + hi + mom + rest
+        bits = []
+        if watched:
+            bits.append(f"**{len(watched)} watched** "
+                        + (f"({len(WATCH_EXTRA)} outside the index) "
+                           if WATCH_EXTRA else "")
+                        + "first")
+        bits.append(f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''}")
+        bits.append(f"{len(mom)} from the momentum book")
+        bits.append(f"then the rest of the {len(a_options)} names")
+        st.caption(md(", ".join(bits) + "."))
+        # `extra` is what makes a non-constituent chartable here at all: its
+        # prices are not in the ranking universe, so without it the panel
+        # would offer the name and then report no history for it.
+        chart_ticker = price_panel(
+            uni, px, asof_analyst, a_options, int(n_hold), "analyst",
+            # WATCH_FRAME, not the raw download: it is already on the
+            # universe's calendar, so a name that does not trade on exactly
+            # the same days joins without punching holes in the series.
+            extra=WATCH_FRAME,
+            ticker_help="Your watchlist first, then today's high-momentum "
+                        "screen, then the momentum book, then the rest of "
+                        "the universe. A watched name outside the index is "
+                        "charted from its own prices and interpolated into "
+                        "the constituents' ranking.")
 
     # ---- right: the chat -------------------------------------------------
     with a_cols[1]:
