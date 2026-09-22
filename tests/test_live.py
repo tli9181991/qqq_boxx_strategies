@@ -1938,6 +1938,117 @@ def test_watched_names_are_placed_independently_of_each_other():
     assert len({r["book_cutoff"] for r in rows}) == 1
 
 
+# --------------------------------------------------------------------------
+# The market calendar
+# --------------------------------------------------------------------------
+
+def test_the_half_days_are_derived_correctly():
+    """Checked against the published NYSE calendar, 2023-2027.
+
+    The interesting cases are the ones where the rule looks like it should
+    fire and must not: when the 4th of July or Christmas Day lands on a
+    Saturday the holiday moves *back* onto the 3rd or the 24th and the market
+    is shut for the day, not open for half of it.
+    """
+    from datetime import date
+    from qbs.live.runner import us_early_close
+
+    real = {
+        2023: [date(2023, 7, 3), date(2023, 11, 24)],
+        2024: [date(2024, 7, 3), date(2024, 11, 29), date(2024, 12, 24)],
+        2025: [date(2025, 7, 3), date(2025, 11, 28), date(2025, 12, 24)],
+        2026: [date(2026, 11, 27), date(2026, 12, 24)],
+        2027: [date(2027, 11, 26)],
+    }
+    import calendar as _cal
+    for year, expected in real.items():
+        found = [date(year, m, d)
+                 for m in (7, 11, 12)
+                 for d in range(1, _cal.monthrange(year, m)[1] + 1)
+                 if us_early_close(date(year, m, d))]
+        assert found == expected, f"{year}: {found} != {expected}"
+
+    # Spelled out, because these are the ones that would silently go wrong.
+    assert not us_early_close(date(2026, 7, 3)), "the Fourth is a Saturday: shut, not early"
+    assert not us_early_close(date(2023, 12, 24)), "a Sunday"
+    assert not us_early_close(date(2027, 12, 24)), "Christmas is a Saturday: shut, not early"
+    assert not us_early_close(date(2026, 11, 20)), "the Friday *before* Thanksgiving"
+
+
+def test_the_cutoff_moves_on_a_half_day():
+    from datetime import date
+    from qbs.live.runner import moc_cutoff_for
+
+    live = LiveConfig()
+    assert moc_cutoff_for(live, date(2026, 9, 21)) == live.moc_cutoff_hhmm
+    assert moc_cutoff_for(live, date(2026, 11, 27)) == live.early_close_hhmm
+    assert moc_cutoff_for(live, date(2026, 12, 24)) == live.early_close_hhmm
+
+    # A one-off the standing rules cannot know about.
+    live.early_close_dates = ["2026-10-05"]
+    assert moc_cutoff_for(live, date(2026, 10, 5)) == live.early_close_hhmm
+    assert moc_cutoff_for(live, date(2026, 10, 6)) == live.moc_cutoff_hhmm
+
+
+def test_the_trade_timer_would_be_refused_on_a_half_day():
+    """The timer fires at 15:30 ET whatever the calendar says.
+
+    On a normal day that is comfortably inside the 15:45 cutoff. On a half day
+    the auction was at 13:00, and submitting MOC into it two and a half hours
+    later is the failure this guard exists to stop.
+    """
+    from datetime import date
+    from qbs.live.runner import moc_cutoff_for, past_moc_cutoff
+
+    live = LiveConfig()
+    fire = (15, 30)
+
+    def refused(day):
+        hh, mm = (int(x) for x in moc_cutoff_for(live, day).split(":"))
+        return fire >= (hh, mm)
+
+    assert not refused(date(2026, 9, 21)), "an ordinary Monday must still trade"
+    assert refused(date(2026, 11, 27)), "the Friday after Thanksgiving"
+    assert refused(date(2026, 12, 24)), "Christmas Eve"
+    # And the real clock helper agrees with the arithmetic above.
+    assert past_moc_cutoff("America/New_York", "00:00")
+    assert not past_moc_cutoff("America/New_York", "23:59")
+
+
+def test_the_trade_phase_sits_out_a_half_day_without_doing_any_work(monkeypatch, tmp_path):
+    """Skipped cleanly at the top, not failed at the cutoff.
+
+    The distinction matters operationally: a systemd unit that exits non-zero
+    three times a year looks like a broken trader, and the thing it is
+    reporting is a normal, expected, quiet day.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from qbs.live import runner
+
+    live = LiveConfig()
+    live.state_dir = str(tmp_path)
+    live.__post_init__()
+
+    calls = []
+    monkeypatch.setattr(runner, "_load_and_compute",
+                        lambda *a, **k: calls.append("loaded"))
+
+    def at(y, m, d):
+        return lambda tz: datetime(y, m, d, 15, 30, tzinfo=ZoneInfo(tz))
+
+    monkeypatch.setattr(runner, "market_today", at(2026, 11, 27))   # half day
+    assert runner.phase_trade(Config(), live) == runner.EXIT_OK
+    assert calls == [], "a skipped day must not download or rank anything"
+
+    last = st.last_run(live.state_path, "trade") if hasattr(st, "last_run") else None
+    if last is not None:
+        assert last.get("status") == "skipped"
+
+    # An ordinary Tuesday must still get as far as the work.
+    monkeypatch.setattr(runner, "market_today", at(2026, 12, 1))
+    runner.phase_trade(Config(), live)
+    assert calls == ["loaded"], "a normal session must not be skipped"
 def test_the_watchlist_string_parses_the_same_everywhere():
     """One parser for QBS_WATCHLIST, because the runner and the dashboard
     both read it and a list that means two things is worse than none."""
