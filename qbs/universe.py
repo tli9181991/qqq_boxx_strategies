@@ -215,6 +215,21 @@ def load_universe_prices(
 
     import yfinance as yf
 
+    from .data import (QUARANTINE_DAYS, load_quarantine,
+                       record_failures)
+
+    # Symbols the provider refused recently are not asked again until the
+    # quarantine expires -- see `qbs.data.load_quarantine` for why it expires
+    # rather than being a permanent blacklist.
+    banned = load_quarantine(cache_dir)
+    skipped = [t for t in tickers if t in banned]
+    if skipped:
+        tickers = [t for t in tickers if t not in banned]
+        if verbose:
+            print(f"[universe] skipping {len(skipped)} quarantined: "
+                  f"{', '.join(skipped[:10])}"
+                  + (" ..." if len(skipped) > 10 else ""))
+
     frames, vframes, failed = [], [], []
     for i in range(0, len(tickers), batch_size):
         batch = tickers[i:i + batch_size]
@@ -255,6 +270,10 @@ def load_universe_prices(
               f"{px.index.min():%Y-%m-%d} to {px.index.max():%Y-%m-%d}")
         if failed:
             print(f"[universe] no data for {len(set(failed))}: {sorted(set(failed))}")
+            print(f"[universe] quarantined for {QUARANTINE_DAYS} days — they "
+                  "will not be requested again until then")
+    if failed:
+        record_failures(cache_dir, failed)
 
     px.to_csv(cache)
     if vframes:

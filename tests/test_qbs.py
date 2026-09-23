@@ -2155,10 +2155,15 @@ def test_a_torn_trailing_bar_is_dropped():
     torn.loc[nxt] = np.nan
     torn.loc[nxt, list(px.columns[:12])] = 100.0
 
-    out, dropped = drop_partial_bars(torn)
+    out, dropped, cover = drop_partial_bars(torn)
     assert [d.date() for d in dropped] == [nxt.date()]
     assert out.index[-1] == px.index[-1]
     assert out.equals(px), "and nothing else is touched"
+
+    # The numbers, so a caller can say 12-of-100 rather than "a handful".
+    # "A handful" cannot be told apart from a guard that is simply too
+    # strict, and that doubt is what sends somebody refreshing all morning.
+    assert cover[nxt] == (12, px.shape[1])
 
 
 def test_a_complete_frame_is_returned_unchanged():
@@ -2167,7 +2172,7 @@ def test_a_complete_frame_is_returned_unchanged():
     from qbs.data import drop_partial_bars
 
     px = _wide()
-    out, dropped = drop_partial_bars(px)
+    out, dropped, cover = drop_partial_bars(px)
     assert dropped == [] and out is px
 
     # A handful of names legitimately absent is not a torn bar -- names get
@@ -2175,7 +2180,7 @@ def test_a_complete_frame_is_returned_unchanged():
     # sessions.
     gappy = px.copy()
     gappy.iloc[-1, :5] = np.nan
-    out, dropped = drop_partial_bars(gappy)
+    out, dropped, cover = drop_partial_bars(gappy)
     assert dropped == [], "95% coverage is a session, not a tear"
 
 
@@ -2190,7 +2195,7 @@ def test_consecutive_torn_bars_all_go():
         torn.loc[day] = np.nan
         torn.loc[day, list(px.columns[:k])] = 100.0
 
-    out, dropped = drop_partial_bars(torn)
+    out, dropped, cover = drop_partial_bars(torn)
     assert len(dropped) == 2
     assert out.index[-1] == px.index[-1]
 
@@ -2205,7 +2210,7 @@ def test_early_history_is_not_mistaken_for_a_tear():
     # The first 60 sessions only ever had ten names listed.
     px.iloc[:60, 10:] = np.nan
 
-    out, dropped = drop_partial_bars(px)
+    out, dropped, cover = drop_partial_bars(px)
     assert dropped == [], "thin history is history, not a torn bar"
     assert len(out) == len(px)
 
@@ -2242,7 +2247,7 @@ def test_breadth_over_a_torn_bar_reports_zero_movers():
     assert bad["up4"] == 0 and bad["dn4"] == 0, "the symptom, reproduced"
 
     # With the row dropped first, the table simply ends at the last real one.
-    clean, _ = drop_partial_bars(torn)
+    clean, _, _ = drop_partial_bars(torn)
     good = daily_breadth(clean, qqq=qqq2).table
     assert good.index[-1] == px.index[-1]
     assert (good["n_stocks"] == 100).all()
@@ -2847,7 +2852,9 @@ def test_a_torn_cached_bar_does_not_pass_as_a_fresh_cache(tmp_path):
     assert c.index.max() == pd.Timestamp("2026-09-18"), "the torn bar is gone"
     assert v.index.max() == pd.Timestamp("2026-09-18"), "volumes follow it"
     assert err and "2026-09-21" in err, "and it is named, not dropped in silence"
-    assert "handful" in err
+    # With the numbers: "a handful" cannot be told apart from a guard that is
+    # simply too strict, so it gets read as a bug and refreshed at all morning.
+    assert "12 of ~200 names" in err
 
     # The cache file itself is untouched: those twelve names are the head of a
     # real bar, and the next fetch fills the rest in rather than starting over.
@@ -3722,3 +3729,89 @@ def test_every_universe_provider_normalises_the_same_way():
         src = Path(mod).read_text(encoding="utf-8")
         assert 'str.replace(".", "-"' not in src, f"{mod} still rolls its own"
         assert "normalise_symbols" in src, f"{mod} does not normalise at all"
+
+
+# --------------------------------------------------------------------------
+# Quarantine for symbols the provider will not serve
+# --------------------------------------------------------------------------
+
+def test_a_failing_ticker_is_quarantined_then_retried(tmp_path):
+    """Yahoo answers an unknown symbol with "possibly delisted; no timezone
+    found" — once per ticker, per batch, per run. Thirty of those bury every
+    real message in the log and spend a slice of every download rediscovering
+    the same answer.
+
+    It EXPIRES on purpose. A permanent blacklist would shrink the universe by
+    one name every time the provider had a bad minute, silently and for ever,
+    with nothing to put a name back.
+    """
+    from qbs.data import QUARANTINE_DAYS, load_quarantine, record_failures
+
+    d = str(tmp_path)
+    now = pd.Timestamp("2026-09-23 12:00")
+    assert load_quarantine(d, now=now) == {}, "nothing banned to begin with"
+
+    record_failures(d, ["HYAC-U", "ORCL-PD"], now=now)
+    banned = load_quarantine(d, now=now)
+    assert set(banned) == {"HYAC-U", "ORCL-PD"}
+    assert banned["HYAC-U"]["fails"] == 1
+
+    # Failing again counts, rather than resetting.
+    record_failures(d, ["HYAC-U"], now=now + pd.Timedelta(days=1))
+    assert load_quarantine(d, now=now + pd.Timedelta(days=1))["HYAC-U"]["fails"] == 2
+
+    # And it lapses, so a symbol that starts working is tried again without
+    # anybody editing a file.
+    later = now + pd.Timedelta(days=QUARANTINE_DAYS + 2)
+    assert load_quarantine(d, now=later) == {}
+
+
+def test_the_quarantine_survives_a_corrupt_or_missing_file(tmp_path):
+    """It sits on a download's start-up path. A bad file has to cost a noisy
+    log, never a download that will not start."""
+    from qbs.data import _quarantine_path, clear_quarantine, load_quarantine, \
+        record_failures
+
+    d = str(tmp_path)
+    assert load_quarantine(d) == {}, "missing file is not an error"
+
+    Path(_quarantine_path(d)).write_text("this is not a csv at all\x00")
+    assert load_quarantine(d) == {}, "unreadable file is not an error"
+
+    Path(_quarantine_path(d)).write_text("wrong,columns\n1,2\n")
+    assert load_quarantine(d) == {}, "wrong schema is not an error"
+
+    record_failures(d, ["AAA"], now=pd.Timestamp("2026-09-23"))
+    assert "AAA" in load_quarantine(d, now=pd.Timestamp("2026-09-23"))
+    clear_quarantine(d)
+    assert load_quarantine(d, now=pd.Timestamp("2026-09-23")) == {}
+    clear_quarantine(d)        # removing a file that is gone is not an error
+
+
+def test_quarantined_tickers_are_not_requested_again(tmp_path, monkeypatch):
+    """The point of the list: the second run does not spend a request finding
+    out what the first run already learned."""
+    import qbs.finviz as fz
+    from qbs.data import record_failures
+
+    d = str(tmp_path)
+    record_failures(d, ["DEAD-A", "DEAD-B"], now=pd.Timestamp.now("UTC").tz_localize(None))
+
+    asked = []
+
+    class FakeYF:
+        @staticmethod
+        def download(batch, **kw):
+            asked.extend(batch)
+            idx = pd.bdate_range("2026-06-01", periods=80)
+            cols = pd.MultiIndex.from_product([["Close", "Volume"], batch])
+            vals = np.column_stack([np.full((len(idx), len(batch)), 10.0),
+                                    np.full((len(idx), len(batch)), 1e6)])
+            return pd.DataFrame(vals, index=idx, columns=cols)
+
+    monkeypatch.setitem(sys.modules, "yfinance", FakeYF)
+    c, v, err = fz.load_universe_bars(["GOOD", "DEAD-A", "DEAD-B"],
+                                      cache_dir=d, verbose=False)
+    assert asked == ["GOOD"], f"the dead ones were asked anyway: {asked}"
+    assert c is not None and list(c.columns) == ["GOOD"]
+    assert err and "2 ticker(s) skipped" in err, "and it says so, not silently"

@@ -154,8 +154,11 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
 
     # BEFORE the reindex-and-ffill, which would paper a torn bar over with
     # yesterday's prices and make every name look unchanged on the day.
-    uni, torn = drop_partial_bars(uni)
-    status["partial"] = [f"{d:%Y-%m-%d}" for d in torn]
+    uni, torn, cover = drop_partial_bars(uni)
+    status["partial"] = [
+        f"{d:%Y-%m-%d}" + (f" ({cover[d][0]} of ~{cover[d][1]} names)"
+                           if d in cover else "")
+        for d in torn]
     if torn:
         px = px.loc[:uni.index.max()]
 
@@ -544,10 +547,11 @@ def freshness_banner():
         days = ", ".join(data_status["partial"])
         st.warning(md(
             f"**{days} dropped — the provider had not finished publishing "
-            "it.** Only a handful of names carried that bar, and a session "
-            "counted over a handful is not a session: every 4%-mover count "
-            "and every rank would have been computed from it. Press "
-            "**Refresh now** once the data has settled."), icon="🧩")
+            "it.** A session counted over a fraction of the universe is not a "
+            "session: every 4%-mover count and every rank would have come "
+            "from those few names. Press **Refresh now** once the data has "
+            "settled — the count in brackets is how many carried that bar "
+            "against how many a normal one has."), icon="🧩")
     if FRESH_LEVEL == "warn":
         # The remedy depends on why it is stale. Do not tell someone to go
         # online when they already are and the download is what broke.

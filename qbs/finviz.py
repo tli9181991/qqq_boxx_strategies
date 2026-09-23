@@ -53,8 +53,9 @@ import numpy as np
 import pandas as pd
 
 from .config import DOWNLOAD_START
-from .data import (MARKET_CLOSE, MARKET_TZ, drop_partial_bars,
-                   normalise_symbols,
+from .data import (MARKET_CLOSE, MARKET_TZ, QUARANTINE_DAYS,
+                   drop_partial_bars, load_quarantine,
+                   normalise_symbols, record_failures,
                    last_market_close, next_market_close,
                    sessions_behind)
 
@@ -438,7 +439,8 @@ def next_fetch_slot(now: Optional[pd.Timestamp] = None,
     return last_fetch_slot(now, environ) + pd.Timedelta(days=1)
 
 
-def _torn_note(torn: List[pd.Timestamp]) -> Optional[str]:
+def _torn_note(torn: List[pd.Timestamp],
+               coverage: Optional[Dict] = None) -> Optional[str]:
     """What to say about a bar the provider had not finished publishing.
 
     Named rather than dropped in silence: a session that vanishes with no
@@ -447,12 +449,16 @@ def _torn_note(torn: List[pd.Timestamp]) -> Optional[str]:
     """
     if not torn:
         return None
-    days = ", ".join(f"{d:%Y-%m-%d}" for d in sorted(set(torn)))
-    return (f"dropped {days} — the download landed before the provider had "
-            f"published most of the universe, so that bar held only a handful "
-            f"of names. It is not counted as a session and does not count as "
-            f"a fresh cache; the next fetch will pick it up, or press "
-            f"**Refresh now**.")
+    cov = coverage or {}
+    bits = []
+    for d in sorted(set(torn)):
+        got, usual = cov.get(d, (None, None))
+        bits.append(f"{d:%Y-%m-%d}"
+                    + (f" ({got} of ~{usual} names)" if got is not None else ""))
+    return ("dropped " + ", ".join(bits) + " — the download landed before the "
+            "provider had published most of the universe. Not counted as a "
+            "session and not counted as a fresh cache; the next fetch picks "
+            "it up, or press **Refresh now**.")
 
 
 def load_universe_bars(
@@ -490,6 +496,7 @@ def load_universe_bars(
     c_path = os.path.join(cache_dir, f"{prefix}_closes.csv")
     v_path = os.path.join(cache_dir, f"{prefix}_volumes.csv")
     torn: List[pd.Timestamp] = []
+    coverage: Dict[pd.Timestamp, Tuple[int, int]] = {}
 
     def _whole(c, v):
         """Trailing rows the provider had not finished publishing, removed.
@@ -503,9 +510,10 @@ def load_universe_bars(
         """
         if c is None or c.empty:
             return c, v
-        c, dropped = drop_partial_bars(c)
+        c, dropped, cover = drop_partial_bars(c)
         if dropped:
             torn.extend(dropped)
+            coverage.update(cover)
             if v is not None and not v.empty:
                 v = v.loc[:c.index.max()]
         return c, v
@@ -527,7 +535,7 @@ def load_universe_bars(
             err = None if c is not None else (
                 "offline and no cached price frames on disk — run once with "
                 "Source set to Online to build them")
-            return c, v, err or _torn_note(torn)
+            return c, v, err or _torn_note(torn, coverage)
         c, v = _whole(c, v)
         if c is not None and not c.empty:
             # A cache HIT that never asks how old it is pins the app to
@@ -536,15 +544,27 @@ def load_universe_bars(
             # keeps the old behaviour for callers that manage freshness
             # themselves.
             if stale_after is None:
-                return c, v, _torn_note(torn)
+                return c, v, _torn_note(torn, coverage)
             behind = sessions_behind(c.index.max())
             if behind < stale_after:
-                return c, v, _torn_note(torn)
+                return c, v, _torn_note(torn, coverage)
             if verbose:
                 print(f"[finviz] price cache is {behind} session(s) behind "
                       f"(limit {stale_after}) — re-downloading")
 
     tickers = sorted({t for t in tickers if t})
+    # Symbols the provider refused recently are not asked again until the
+    # quarantine expires. Thirty of them in a 2,600-name universe is thirty
+    # "possibly delisted" lines burying every real message in the log, plus a
+    # slice of every download spent rediscovering the same answer.
+    banned = load_quarantine(cache_dir)
+    skipped = [t for t in tickers if t in banned]
+    if skipped:
+        tickers = [t for t in tickers if t not in banned]
+        if verbose:
+            print(f"[finviz] skipping {len(skipped)} quarantined ticker(s): "
+                  f"{', '.join(skipped[:10])}"
+                  + (" ..." if len(skipped) > 10 else ""))
     closes, volumes, failed = [], [], []
     last_error = "unknown"
     try:
@@ -613,9 +633,16 @@ def load_universe_bars(
     if verbose:
         print(f"[finviz] {cdf.shape[1]} tickers, {len(cdf)} rows"
               + (f" · no data for {len(set(failed))}" if failed else ""))
+    if failed:
+        record_failures(cache_dir, failed)
     warn = (f"{len(set(failed))} of {len(tickers)} tickers returned no data"
             if failed else None)
-    return cdf, vdf, "; ".join(x for x in (warn, _torn_note(torn)) if x) or None
+    if skipped:
+        warn = "; ".join(x for x in (warn, (
+            f"{len(skipped)} ticker(s) skipped — the provider has refused them "
+            f"recently and they are quarantined for "
+            f"{QUARANTINE_DAYS} days")) if x)
+    return cdf, vdf, "; ".join(x for x in (warn, _torn_note(torn, coverage)) if x) or None
 
 
 # --------------------------------------------------------------------------

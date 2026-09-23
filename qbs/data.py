@@ -177,11 +177,95 @@ def normalise_symbols(symbols) -> "pd.Series":
             .str.replace("/", "-", regex=False))
 
 
+QUARANTINE_DAYS = 14
+
+
+def _quarantine_path(cache_dir: str) -> str:
+    return os.path.join(cache_dir, "bad_tickers.csv")
+
+
+def load_quarantine(cache_dir: str, days: int = QUARANTINE_DAYS,
+                    now: Optional[pd.Timestamp] = None) -> Dict[str, dict]:
+    """Symbols the provider has refused recently, and how often.
+
+    Yahoo answers a symbol it does not know with "possibly delisted; no
+    timezone found" -- once per ticker, per batch, per run. A universe with
+    thirty of them buries every real message in the log and spends a slice of
+    every download finding out the same thing again.
+
+    Quarantine EXPIRES, deliberately. A permanent blacklist would shrink the
+    universe by one name every time the provider had a bad minute, silently
+    and for ever, and nothing would ever put a name back. A fortnight is long
+    enough to stop the noise and short enough that a symbol which starts
+    working is retried without anybody editing a file.
+    """
+    path = _quarantine_path(cache_dir)
+    if not os.path.exists(path):
+        return {}
+    now = now or pd.Timestamp.now("UTC").tz_localize(None)
+    try:
+        df = pd.read_csv(path)
+    except Exception:  # noqa: BLE001
+        return {}
+    if "ticker" not in df.columns or "last_failed" not in df.columns:
+        return {}
+    out: Dict[str, dict] = {}
+    for row in df.itertuples():
+        try:
+            last = pd.Timestamp(row.last_failed)
+        except Exception:  # noqa: BLE001
+            continue
+        if (now - last).days < days:
+            out[str(row.ticker)] = {
+                "last_failed": last,
+                "fails": int(getattr(row, "fails", 1) or 1),
+            }
+    return out
+
+
+def record_failures(cache_dir: str, failed: Iterable[str],
+                    now: Optional[pd.Timestamp] = None) -> None:
+    """Add or refresh quarantine entries. Never raises.
+
+    An unwritable cache costs a noisy log tomorrow, which is a great deal
+    better than a download that will not start.
+    """
+    failed = sorted({str(t).strip().upper() for t in failed if str(t).strip()})
+    if not failed:
+        return
+    now = now or pd.Timestamp.now("UTC").tz_localize(None)
+    path = _quarantine_path(cache_dir)
+    existing = load_quarantine(cache_dir, days=10 ** 6, now=now)
+    for t in failed:
+        prior = existing.get(t, {})
+        existing[t] = {"last_failed": now,
+                       "fails": int(prior.get("fails", 0)) + 1}
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        pd.DataFrame([{"ticker": t, "last_failed": v["last_failed"].isoformat(
+            timespec="seconds"), "fails": v["fails"]}
+            for t, v in sorted(existing.items())]).to_csv(path, index=False)
+    except (OSError, ValueError):
+        pass
+
+
+def clear_quarantine(cache_dir: str) -> None:
+    """Forget every quarantined symbol, so the next run retries them all."""
+    try:
+        os.remove(_quarantine_path(cache_dir))
+    except OSError:
+        pass
+
+
 def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
                       lookback: int = 20) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """Remove trailing rows the provider had not finished publishing.
 
-    Returns `(frame, dropped_dates)`.
+    Returns `(frame, dropped_dates, coverage)`, where `coverage` maps each
+    dropped date to `(names_that_carried_it, names_a_normal_bar_has)`. The
+    caller needs those two numbers: "a handful" cannot be told apart from a
+    guard that is simply too strict, and that doubt is what sends somebody
+    refreshing all morning.
 
     A wide download is a union of per-ticker series, so one ticker carrying
     today's bar puts today's DATE in the index for all of them -- everyone
@@ -206,21 +290,28 @@ def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
     borderline call, and a tight threshold would start eating half-holidays.
     """
     dropped: List[pd.Timestamp] = []
+    coverage: Dict[pd.Timestamp, Tuple[int, int]] = {}
     if frame is None or frame.empty or len(frame) < 2:
-        return frame, dropped
+        return frame, dropped, coverage
+    # Filled in below so a caller can say 12-of-2610 rather than "a handful".
+    # "A handful" is not a number anybody can act on: it cannot be told from
+    # a guard that is too strict, which is exactly the doubt it creates.
 
     covered = frame.notna().sum(axis=1)
     end = len(frame)
     while end > 1:
         ref = covered.iloc[max(0, end - 1 - lookback):end - 1].median()
         if ref and covered.iloc[end - 1] < min_coverage * ref:
-            dropped.append(frame.index[end - 1])
+            day = frame.index[end - 1]
+            dropped.append(day)
+            coverage[day] = (int(covered.iloc[end - 1]), int(ref))
             end -= 1
         else:
             break
     if not dropped:
-        return frame, dropped
-    return frame.iloc[:end], list(reversed(dropped))
+        return frame, dropped, coverage
+    out = list(reversed(dropped))
+    return frame.iloc[:end], out, {d: coverage[d] for d in out}
 
 
 def last_market_close(now: Optional[pd.Timestamp] = None,
