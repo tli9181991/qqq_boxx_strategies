@@ -478,7 +478,7 @@ Six files, so the run log can be read with `cat` and no tooling:
 what the strategy saw on a past date cannot be recovered from today's prices
 once the ranking has moved on. It is keyed on the date, so the twice-daily
 preflight and any re-run after a failure cannot duplicate a day. `QBS_RANKING_TOP`
-sets the depth (default 25 — the book holds 6 and exits past 10, so 25 shows
+sets the depth (default 25 — the book holds 6 and exits past 8, so 25 shows
 the names queued behind them and a rotation becomes visible before it happens).
 
 `shadow_log.csv` accumulates for the same reason, and exists because six years
