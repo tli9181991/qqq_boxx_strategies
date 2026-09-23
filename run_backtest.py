@@ -75,17 +75,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="skip the Finviz screen strategy")
     p.add_argument("--sweep-target-vol", action="store_true",
                    help="also print the book vol-target sensitivity table")
-    p.add_argument("--ts-exit", type=float, default=None,
-                   help="VIX/VIX3M above this (curve inverted) switches the book "
-                        "to cash (default 1.0)")
-    p.add_argument("--ts-entry", type=float, default=None,
-                   help="VIX/VIX3M below this resumes the base strategy "
-                        "(default 0.95)")
-    p.add_argument("--no-vix-ts", dest="vix_ts", action="store_false", default=True,
-                   help="skip the VIX term-structure breaker")
-    p.add_argument("--sweep-term-structure", action="store_true",
-                   help="also print the inversion-trigger sensitivity table "
-                        "(read 'Time invested' first)")
     p.add_argument("--beta-window", type=int, default=None,
                    help="residual momentum: trailing days behind the market-model "
                         "beta (default 252; the plateau runs 126-504)")
@@ -144,10 +133,6 @@ def main(argv=None) -> int:
         cfg.momentum.rebalance = args.rebalance
     if args.max_corr is not None:
         cfg.momentum.max_corr = args.max_corr
-    if args.ts_exit is not None:
-        cfg.vix_ts.exit_ratio = args.ts_exit
-    if args.ts_entry is not None:
-        cfg.vix_ts.entry_ratio = args.ts_entry
     if args.beta_window is not None:
         cfg.resmom.beta_window = args.beta_window
     cfg.resmom.standardise = args.standardise_resid
@@ -174,10 +159,6 @@ def main(argv=None) -> int:
         cfg.finviz.rebalance = args.finviz_rebalance
     if cfg.finviz.exit_rank and cfg.finviz.exit_rank < cfg.finviz.n_hold:
         print("finviz-exit-rank must be 0 (no band) or >= the number of names held",
-              file=sys.stderr)
-        return 2
-    if cfg.vix_ts.entry_ratio > cfg.vix_ts.exit_ratio:
-        print("--ts-entry must be <= --ts-exit (the band cannot be inverted)",
               file=sys.stderr)
         return 2
     if cfg.resmom.beta_window < 20:
@@ -207,7 +188,6 @@ def main(argv=None) -> int:
                   use_synthetic=args.synthetic, with_momentum=args.momentum,
                   with_vix=args.vix, with_book_vt=args.book_vt,
                   with_finviz=args.finviz, with_resmom=args.resmom,
-                  with_vix_ts=args.vix_ts,
                   fetch_universe=args.fetch_universe, pit_membership=pit)
     except ImportError:
         print("yfinance is not installed. Either `pip install yfinance` or run "
@@ -294,14 +274,6 @@ def main(argv=None) -> int:
             with pd.option_context("display.width", 200):
                 print(sv.round(4).to_string(index=False))
             print("  min_ratio 0.0 is the unfiltered book; compare the rest to it.")
-
-    if args.sweep_term_structure and "momentum_ts" in lab.signals:
-        from qbs.pipeline import sweep_term_structure as _sweep_ts
-        sts = _sweep_ts(lab)
-        print("\nVIX term-structure trigger sensitivity (read 'Time invested' "
-              "first -- inversion should be RARE):")
-        with pd.option_context("display.width", 200):
-            print(sts.round(4).to_string(index=False))
 
     if args.sweep_corr_cap and "momentum" in lab.signals:
         from qbs.pipeline import sweep_corr_cap as _sweep_cc
