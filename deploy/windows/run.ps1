@@ -40,7 +40,12 @@ if (-not (Test-Path $Python)) {
 # there is nothing to corrupt -- while pasting one with the spaces Google
 # displays it with, or in quotes, produces AUTHENTICATIONFAILED and no clue
 # why. `runner config` reports the shape of what was read.
+# Say which file was read, every time. There is a patreon.env in deploy\windows
+# AND one in deploy\patreon (the systemd copy), and editing the wrong one
+# produces a login failure that blames the credential rather than the path.
+# One dim line here answers "which file am I editing?" at a glance.
 if (Test-Path $EnvFile) {
+    Write-Host "env: $EnvFile" -ForegroundColor DarkGray
     foreach ($line in Get-Content -LiteralPath $EnvFile) {
         $trimmed = $line.Trim()
         if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
@@ -56,7 +61,15 @@ if (Test-Path $EnvFile) {
         Set-Item -Path "env:$key" -Value $val
     }
 } else {
-    Write-Warning "No $EnvFile -- running on defaults and whatever is already in the environment."
+    Write-Warning @"
+No $EnvFile -- running on defaults and whatever is already in the environment.
+
+  This is the file run.ps1 reads. Note there is also a patreon.env under
+  deploy\patreon, which is the systemd copy and is NOT read on Windows.
+  Create this one from its example:
+
+      Copy-Item .\patreon.env.example .\patreon.env
+"@
 }
 
 # Push/Pop rather than Set-Location. PowerShell's current directory belongs to
