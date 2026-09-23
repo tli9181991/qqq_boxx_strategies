@@ -32,23 +32,61 @@ if (-not (Test-Path $Python)) {
 }
 
 # KEY=VALUE, one per line. '#' starts a comment; blank lines are skipped.
-# Values are taken literally -- no quote stripping, no expansion -- because a
-# Gmail app password can contain almost anything and guessing at quoting is how
-# a credential silently becomes the wrong string.
+#
+# Values are trimmed, and one matching pair of surrounding quotes is removed.
+# An earlier version took them literally, on the theory that guessing at
+# quoting could corrupt a credential. That was backwards: a Gmail app password
+# is sixteen lowercase letters and can contain neither a quote nor a space, so
+# there is nothing to corrupt -- while pasting one with the spaces Google
+# displays it with, or in quotes, produces AUTHENTICATIONFAILED and no clue
+# why. `runner config` reports the shape of what was read.
+# Say which file was read, every time. There is a patreon.env in deploy\windows
+# AND one in deploy\patreon (the systemd copy), and editing the wrong one
+# produces a login failure that blames the credential rather than the path.
+# One dim line here answers "which file am I editing?" at a glance.
 if (Test-Path $EnvFile) {
+    Write-Host "env: $EnvFile" -ForegroundColor DarkGray
     foreach ($line in Get-Content -LiteralPath $EnvFile) {
         $trimmed = $line.Trim()
         if ($trimmed -eq '' -or $trimmed.StartsWith('#')) { continue }
         $idx = $trimmed.IndexOf('=')
         if ($idx -lt 1) { continue }
         $key = $trimmed.Substring(0, $idx).Trim()
-        $val = $trimmed.Substring($idx + 1)
+        $val = $trimmed.Substring($idx + 1).Trim()
+        if ($val.Length -ge 2 -and
+            (($val.StartsWith('"') -and $val.EndsWith('"')) -or
+             ($val.StartsWith("'") -and $val.EndsWith("'")))) {
+            $val = $val.Substring(1, $val.Length - 2)
+        }
         Set-Item -Path "env:$key" -Value $val
     }
 } else {
-    Write-Warning "No $EnvFile -- running on defaults and whatever is already in the environment."
+    Write-Warning @"
+No $EnvFile -- running on defaults and whatever is already in the environment.
+
+  This is the file run.ps1 reads. Note there is also a patreon.env under
+  deploy\patreon, which is the systemd copy and is NOT read on Windows.
+  Create this one from its example:
+
+      Copy-Item .\patreon.env.example .\patreon.env
+"@
 }
 
-Set-Location $RepoRoot
-& $Python -m patreon_pipeline.runner @Arguments
-exit $LASTEXITCODE
+# Push/Pop rather than Set-Location. PowerShell's current directory belongs to
+# the session, not to the script, so a bare Set-Location here leaves the
+# caller's prompt somewhere it never asked to be -- you run `.\run.ps1 status`
+# from deploy\windows and land in the repo root. The finally restores it
+# however this exits: clean run, failure, thrown error or Ctrl-C.
+#
+# The directory has to change at all because patreon_pipeline is imported from
+# the working tree rather than installed, so `python -m` needs the repo root
+# as the working directory.
+$exitCode = 1
+Push-Location -LiteralPath $RepoRoot
+try {
+    & $Python -m patreon_pipeline.runner @Arguments
+    $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+} finally {
+    Pop-Location
+}
+exit $exitCode

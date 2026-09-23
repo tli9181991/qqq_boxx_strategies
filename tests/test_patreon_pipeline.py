@@ -37,6 +37,29 @@ def test_canonical_post_url_collapses_slug_variants():
         assert mail.canonical_post_url(url) == want, url
 
 
+def test_creator_prefixed_post_urls_canonicalise():
+    """A campaign listing returns /CreatorName/posts/slug-id, not /posts/... .
+    Rejecting that shape made the sweep skip every post it found."""
+    want = "https://www.patreon.com/posts/170231621"
+    for url in (
+        "https://www.patreon.com/KelileoCUP/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/KelileoCUP/posts/shi-chang-guan-170231621?utm_source=x",
+        "https://www.patreon.com/c/KelileoCUP/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/posts/170231621",
+    ):
+        assert mail.canonical_post_url(url) == want, url
+
+
+def test_a_campaign_page_is_not_a_post():
+    """The shape the sweep must keep rejecting -- it is the listing's own
+    address, and queueing it would download the whole campaign as one job."""
+    for url in ("https://www.patreon.com/cw/KelileoCUP",
+                "https://www.patreon.com/c/KelileoCUP",
+                "https://www.patreon.com/KelileoCUP"):
+        assert mail.canonical_post_url(url) is None, url
+
+
 def test_canonical_post_url_rejects_non_posts():
     for url in (
         "https://www.patreon.com/c/somecreator",
@@ -196,6 +219,16 @@ def test_flags_set_and_clear():
 # yt-dlp wrapper
 # ----------------------------------------------------------------------
 
+def test_a_post_with_nothing_downloadable_is_skipped_not_retried():
+    """yt-dlp's Patreon extractor raises this verbatim for a text-or-images
+    post. Classified as a generic failure it burns four attempts and an hour
+    of backoff on something that will never succeed -- and on a creator who
+    mostly posts text, that is most of the queue."""
+    assert download.classify_error(
+        "ERROR: [patreon] 170224421: No supported media found in this post"
+    ) is download.NoMediaError
+
+
 def test_auth_failures_are_classified_apart_from_real_failures():
     """This split is what stops an expired login marching the whole queue
     into `failed`."""
@@ -302,6 +335,44 @@ def test_default_vocabulary_is_populated():
 # Uploads
 # ----------------------------------------------------------------------
 
+def test_campaign_listing_prints_the_entry_url_not_the_playlist_url():
+    """With --flat-playlist, yt-dlp copies the PLAYLIST's webpage_url onto
+    every entry. Printing that field returns the campaign URL once per post --
+    a listing that looks plausible, canonicalises to nothing, and reports
+    "0 new jobs" with no error. `url` holds the entry's own target."""
+    import inspect
+    src = inspect.getsource(download.list_campaign_posts)
+    printed = [l for l in src.splitlines() if "--print" in l]
+    assert printed, "the listing should use --print"
+    field = [l for l in src.splitlines() if "%(" in l and "s\"" in l]
+    assert any("%(url," in l for l in field), \
+        f"expected the url field first, got: {field}"
+    assert not any('"%(webpage_url)s"' in l for l in src.splitlines()), \
+        "webpage_url alone returns the campaign URL for every entry"
+
+
+def test_folders_command_is_reachable_and_needs_mail_credentials():
+    """A Gmail label is an IMAP folder, but not always under the name shown in
+    the web UI -- nested labels arrive as "Parent/Child". `folders` prints the
+    real list so the name never has to be guessed."""
+    from patreon_pipeline import runner
+    args = runner.build_parser().parse_args(["folders"])
+    assert args.command == "folders"
+    # It talks to Gmail, so it must be held to the same credential check as
+    # `watch` rather than failing later with a socket error.
+    assert PipelineConfig().validate(need_mail=True), \
+        "a config with no IMAP credentials should report problems"
+
+
+def test_sweep_without_campaigns_is_an_error_not_a_quiet_success():
+    """A sweep that swept nothing did not do its job. Returning success for it
+    hides the usual cause -- a config file that is not being read at all."""
+    from patreon_pipeline import worker
+    cfg = PipelineConfig(campaign_urls=[])
+    cfg.state_dir = tempfile.mkdtemp()
+    assert worker.sweep(cfg) == worker.EXIT_CONFIG
+
+
 def test_rclone_is_the_default_backend():
     """Chosen because it needs no Cloud project, no consent screen and has no
     seven-day token expiry."""
@@ -390,6 +461,49 @@ def test_a_misspelled_setting_is_still_rejected():
         assert "campaign_url" in str(exc)
     else:
         raise AssertionError("a misspelled key should not be accepted")
+
+
+def test_unedited_placeholders_are_caught_as_config_errors():
+    """Gmail rejects you@gmail.com with the same AUTHENTICATIONFAILED it gives
+    a wrong password, so an unedited example value reads as a credential
+    problem and sends you hunting in the wrong place."""
+    cfg = PipelineConfig()
+    cfg.imap_user = "you@gmail.com"
+    cfg.imap_password = "abcdefghijklmnop"
+    assert any("example value" in p for p in cfg.validate(need_mail=True))
+
+    cfg.imap_user = "tli9181991"
+    assert any("not an email address" in p for p in cfg.validate(need_mail=True))
+
+    cfg.imap_user = "real@gmail.com"
+    assert cfg.validate(need_mail=True) == []
+
+
+def test_the_example_campaign_url_is_rejected():
+    cfg = PipelineConfig(campaign_urls=["https://www.patreon.com/c/somecreator"])
+    assert any("example URL" in p for p in cfg.validate())
+
+
+def test_password_shape_names_the_usual_mistakes_without_revealing_it():
+    """Gmail answers every bad credential with the same opaque
+    AUTHENTICATIONFAILED, so the diagnosis has to come from this side."""
+    def shape(pw):
+        cfg = PipelineConfig()
+        cfg.imap_password = pw
+        return cfg.password_shape()
+
+    assert shape("abcdefghijklmnop") == "<16 chars>"
+    assert "SPACES" in shape("abcd efgh ijkl mnop")
+    assert "QUOTED" in shape('"abcdefghijklmnop"')
+    assert "WHITESPACE" in shape(" abcdefghijklmnop")
+    assert "OAuth client secret" in shape("GOCSPX-laVe0Q32m")
+    assert shape("") == "(unset)"
+
+
+def test_the_password_itself_never_appears_in_describe():
+    cfg = PipelineConfig()
+    cfg.imap_password = "hunter2hunter2xx"
+    assert "hunter2" not in cfg.describe()
 
 
 def test_secrets_are_not_read_from_the_config_file():

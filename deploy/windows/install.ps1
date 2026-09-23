@@ -6,21 +6,28 @@
     The Windows counterpart to the systemd units in deploy\systemd. Four tasks,
     mapping one-to-one onto the four Linux units:
 
-      PatreonPipeline-Watch   at logon, restarts on failure  (patreon-watch.service)
-      PatreonPipeline-Work    at logon, restarts on failure  (patreon-work.service)
+      PatreonPipeline-Watch   at logon, retried every 5 min  (patreon-watch.service)
+      PatreonPipeline-Work    at logon, retried every 5 min  (patreon-work.service)
       PatreonPipeline-Sweep   every 6 hours                  (patreon-sweep.timer)
       PatreonPipeline-Probe   daily at 09:00                 (patreon-probe.timer)
 
-    Task Scheduler's restart-on-failure is the stand-in for systemd's
-    Restart=always. The intervals match: one minute for the watcher, five for
-    the worker, because the worker's exit code 3 means "the Patreon session
-    expired" and retrying that every minute just fills the log.
+    The stand-in for systemd's Restart=always is a repetition on the trigger,
+    not Task Scheduler's restart-on-failure: a repetition fires whatever
+    stopped the task, where restart-on-failure only fires on what Task
+    Scheduler classes as a failure. MultipleInstances=IgnoreNew makes a tick
+    that lands while the task is still running a no-op, so the five-minute
+    repetition reads as "start it if it is not running".
 
 .PARAMETER LogonType
     Interactive (default) runs the tasks only while you are logged in, and
     needs no stored password. That suits a home mini-PC with automatic logon.
     S4U runs them whether or not you are logged on, without storing a password
     either, but a task running that way has no access to network locations.
+
+.NOTES
+    Run this from an ELEVATED PowerShell: registering a Scheduled Task in the
+    Task Scheduler root requires administrator rights. -SkipTasks does
+    everything else and needs no elevation.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -44,6 +51,39 @@ $RunPs1   = Join-Path $PSScriptRoot 'run.ps1'
 
 Write-Host "Repo:  $RepoRoot"
 Write-Host "State: $StateDir"
+
+# ---------------------------------------------------------------------------
+# Elevation
+# ---------------------------------------------------------------------------
+# Checked first, before anything slow happens. Registering a task in the Task
+# Scheduler root needs an elevated token, and without this check the failure
+# lands at the very end -- after a ~2 GB dependency install and every file has
+# been written -- which reads like the whole install failed when in fact only
+# the last step did.
+#
+# Elevation does not change WHICH user you are, only the token you hold, so the
+# tasks still register against this account and still read this account's
+# Firefox profile. Running the installer elevated does not make the pipeline
+# run elevated.
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin -and -not $SkipTasks) {
+    Write-Host ""
+    throw @"
+This needs an elevated PowerShell to register the Scheduled Tasks.
+
+  Right-click PowerShell -> Run as administrator, then:
+
+      cd "$PSScriptRoot"
+      powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  Or do everything except the tasks, and register them later:
+
+      powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipTasks
+"@
+}
 
 # ---------------------------------------------------------------------------
 # Prerequisites
@@ -114,7 +154,7 @@ function New-PipelineTask {
         [string]$Description,
         [string]$CommandArgs,
         [object[]]$Triggers,
-        [int]$RestartMinutes = 0,
+        [int]$RepeatMinutes = 0,
         [switch]$Unlimited
     )
 
@@ -135,10 +175,25 @@ function New-PipelineTask {
         $settingsArgs['ExecutionTimeLimit'] = (New-TimeSpan -Seconds 0)
     }
     $settings = New-ScheduledTaskSettingsSet @settingsArgs
-    if ($RestartMinutes -gt 0) {
-        # The stand-in for systemd Restart=always.
-        $settings.RestartInterval = (New-TimeSpan -Minutes $RestartMinutes)
-        $settings.RestartCount = 999
+
+    # Keeping a long-running task alive: a repetition on its trigger, rather
+    # than Task Scheduler's restart-on-failure.
+    #
+    # Two reasons. RestartInterval can only be assigned onto the settings
+    # object after it is built, and that path serialises the TimeSpan into a
+    # form the task XML schema rejects outright -- "The task XML contains a
+    # value which is incorrectly formatted or out of range". And
+    # restart-on-failure only fires on what Task Scheduler classes as a
+    # failure, which misses a process that simply went away.
+    #
+    # A repetition re-runs the task on a fixed tick regardless of why it
+    # stopped. Paired with MultipleInstances = IgnoreNew, a tick that lands
+    # while the task is still running is discarded -- so the net behaviour is
+    # "start it if it is not already running", checked every few minutes.
+    if ($RepeatMinutes -gt 0) {
+        $repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Minutes $RepeatMinutes)).Repetition
+        foreach ($trigger in $Triggers) { $trigger.Repetition = $repetition }
     }
 
     $principal = if ($LogonType -eq 'S4U') {
@@ -162,13 +217,13 @@ New-PipelineTask -Name 'PatreonPipeline-Watch' `
     -Description 'Patreon pipeline: Gmail IDLE watcher' `
     -CommandArgs "--logfile `"$StateDir\logs\watch.log`" watch" `
     -Triggers @((New-ScheduledTaskTrigger -AtLogOn)) `
-    -RestartMinutes 1 -Unlimited
+    -RepeatMinutes 5 -Unlimited
 
 New-PipelineTask -Name 'PatreonPipeline-Work' `
     -Description 'Patreon pipeline: download, transcribe and upload queue worker' `
     -CommandArgs "--logfile `"$StateDir\logs\work.log`" work" `
     -Triggers @((New-ScheduledTaskTrigger -AtLogOn)) `
-    -RestartMinutes 5 -Unlimited
+    -RepeatMinutes 5 -Unlimited
 
 New-PipelineTask -Name 'PatreonPipeline-Sweep' `
     -Description 'Patreon pipeline: campaign sweep (backstop for missed emails)' `

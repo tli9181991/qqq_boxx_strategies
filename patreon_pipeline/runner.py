@@ -4,6 +4,7 @@
     python -m patreon_pipeline.runner watch         # long-running: Gmail IDLE
     python -m patreon_pipeline.runner work          # long-running: the queue
     python -m patreon_pipeline.runner sweep         # from a timer: backstop
+    python -m patreon_pipeline.runner folders       # which Gmail labels exist
     python -m patreon_pipeline.runner status        # what is in the queue
     python -m patreon_pipeline.runner add URL ...   # queue a post by hand
     python -m patreon_pipeline.runner probe URL     # is the session still good?
@@ -126,6 +127,52 @@ def download_probe(cfg: PipelineConfig, url: str):
     return probe_session(cfg, url)
 
 
+def cmd_folders(cfg: PipelineConfig, args) -> int:
+    """List the IMAP folders the account exposes, and say whether ours is one.
+
+    Gmail labels are IMAP folders, but not always under the name you see in the
+    web UI: a nested label arrives as "Parent/Child", and the name is
+    case-sensitive. Guessing at that produces a select-folder error that says
+    nothing useful, so this prints the real list instead.
+    """
+    try:
+        from imapclient import IMAPClient
+    except ImportError:
+        log.error("imapclient is not installed: pip install -r "
+                  "requirements-patreon.txt")
+        return EXIT_CONFIG
+
+    with IMAPClient(cfg.imap_host, port=cfg.imap_port, ssl=True,
+                    timeout=60) as client:
+        try:
+            client.login(cfg.imap_user, cfg.imap_password)
+        except Exception as exc:
+            if (type(exc).__name__ == "LoginError"
+                    or "AUTHENTICATIONFAILED" in str(exc)):
+                log.error("%s", mail.login_help(cfg, exc))
+                return EXIT_CONFIG
+            raise
+        rows = client.list_folders()
+
+    names = []
+    for _flags, _delimiter, name in rows:
+        names.append(name if isinstance(name, str) else name.decode("utf-8"))
+
+    print(f"folders visible to {cfg.imap_user}:\n")
+    for name in sorted(names):
+        marker = "   <-- PATREON_IMAP_FOLDER" if name == cfg.imap_folder else ""
+        print(f"  {name}{marker}")
+
+    if cfg.imap_folder not in names:
+        print(f"\n!! {cfg.imap_folder!r} is not in that list, so the watcher "
+              f"cannot select it.\n"
+              f"   Set PATREON_IMAP_FOLDER to one of the names above, exactly "
+              f"as printed.")
+        return EXIT_CONFIG
+    print(f"\n{cfg.imap_folder!r} exists -- the watcher can select it.")
+    return EXIT_OK
+
+
 def cmd_transcribe(cfg: PipelineConfig, args) -> int:
     """Transcribe a local file without touching the queue or Drive.
 
@@ -171,6 +218,9 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("auth", help="one-time Google Drive authorisation")
     a.add_argument("--console", action="store_true",
                    help="print the URL instead of opening a browser (for SSH)")
+
+    sub.add_parser("folders",
+                   help="list the IMAP folders (Gmail labels) this account has")
 
     w = sub.add_parser("watch", help="hold a Gmail IDLE connection open")
     w.add_argument("--once", action="store_true",
@@ -228,7 +278,7 @@ def main(argv=None) -> int:
             print(f"\nuploader: {cfg.uploader} -- NOT READY: {exc}")
         return EXIT_OK
 
-    problems = cfg.validate(need_mail=args.command == "watch")
+    problems = cfg.validate(need_mail=args.command in ("watch", "folders"))
     if problems:
         for pb in problems:
             log.error("config: %s", pb)
@@ -263,6 +313,8 @@ def main(argv=None) -> int:
             path = drive.authorize(cfg, console=args.console)
             print(f"authorised; token saved to {path}")
             return EXIT_OK
+        if args.command == "folders":
+            return cmd_folders(cfg, args)
         if args.command == "watch":
             return mail.watch(cfg, once=args.once)
         if args.command == "work":

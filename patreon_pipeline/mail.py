@@ -53,9 +53,14 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) patreon-pipeline/1.0"
 _URL_RE = re.compile(r"""https?://[^\s"'<>)\]]+""", re.IGNORECASE)
 
 # The post id is the final run of digits in the path. Patreon serves the same
-# post as /posts/12345678 and /posts/friday-recap-12345678, and both must
-# collapse to the same key or the dedupe does nothing.
-_POST_PATH_RE = re.compile(r"^/posts/(?:.*?-)?(\d+)/?$")
+# post under several shapes -- /posts/12345678, /posts/friday-recap-12345678,
+# and /CreatorName/posts/friday-recap-12345678 (which is what a campaign
+# listing returns) -- and all of them must collapse to the same key or the
+# dedupe does nothing and the sweep re-downloads the archive every run.
+#
+# The leading segments are optional and bounded rather than open-ended: real
+# URLs carry at most a vanity name, or a /c/ or /cw/ prefix plus the vanity.
+_POST_PATH_RE = re.compile(r"^(?:/[\w-]+){0,2}/posts/(?:.*?-)?(\d+)/?$")
 
 _HOST_RE = re.compile(r"^https?://([^/:?#]+)", re.IGNORECASE)
 
@@ -302,6 +307,32 @@ def check_now(client, conn, cfg: PipelineConfig) -> int:
     return created
 
 
+def login_help(cfg: PipelineConfig, exc: Exception) -> str:
+    """What to tell someone whose Gmail login was refused.
+
+    Gmail answers every bad credential with the same opaque
+    AUTHENTICATIONFAILED, so the useful information is what we can see on this
+    side: the shape of the string we read, and the short list of things that
+    actually cause it.
+    """
+    return (
+        f"Gmail rejected the login for {cfg.imap_user or '(no user set)'}.\n"
+        f"  password read as: {cfg.password_shape()}\n"
+        f"  server said: {exc}\n"
+        f"\n"
+        f"  A Gmail app password is 16 lowercase letters. Check, in order:\n"
+        f"    - It is an APP password, not your Google account password.\n"
+        f"    - It is not the OAuth client secret (those start GOCSPX-).\n"
+        f"    - The 4x4 grouping Google displays is not part of it; enter the\n"
+        f"      16 characters with no spaces.\n"
+        f"    - 2-Step Verification is on, or app passwords cannot exist.\n"
+        f"    - PATREON_IMAP_USER is the full address, including @gmail.com.\n"
+        f"\n"
+        f"  Create one at https://myaccount.google.com/apppasswords\n"
+        f"  `runner config` prints the shape of what was read."
+    )
+
+
 def watch(cfg: PipelineConfig, *, once: bool = False) -> int:
     """Hold an IDLE connection open and enqueue posts as notifications land.
 
@@ -344,6 +375,12 @@ def watch(cfg: PipelineConfig, *, once: bool = False) -> int:
             log.info("watcher stopped")
             return 0
         except Exception as exc:
+            # A refused credential is a config error, not a blip. Reconnecting
+            # every few minutes forever would hammer Gmail with a password it
+            # has already rejected, and bury the one message worth reading.
+            if type(exc).__name__ == "LoginError" or "AUTHENTICATIONFAILED" in str(exc):
+                log.error("%s", login_help(cfg, exc))
+                return 2
             log.error("imap error (%s: %s); reconnecting in %.0fs",
                       type(exc).__name__, exc, backoff)
             if once:
