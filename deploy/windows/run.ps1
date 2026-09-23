@@ -49,6 +49,21 @@ if (Test-Path $EnvFile) {
     Write-Warning "No $EnvFile -- running on defaults and whatever is already in the environment."
 }
 
-Set-Location $RepoRoot
-& $Python -m patreon_pipeline.runner @Arguments
-exit $LASTEXITCODE
+# Push/Pop rather than Set-Location. PowerShell's current directory belongs to
+# the session, not to the script, so a bare Set-Location here leaves the
+# caller's prompt somewhere it never asked to be -- you run `.\run.ps1 status`
+# from deploy\windows and land in the repo root. The finally restores it
+# however this exits: clean run, failure, thrown error or Ctrl-C.
+#
+# The directory has to change at all because patreon_pipeline is imported from
+# the working tree rather than installed, so `python -m` needs the repo root
+# as the working directory.
+$exitCode = 1
+Push-Location -LiteralPath $RepoRoot
+try {
+    & $Python -m patreon_pipeline.runner @Arguments
+    $exitCode = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+} finally {
+    Pop-Location
+}
+exit $exitCode
