@@ -70,6 +70,18 @@ DEFAULT_STATE_DIR = os.environ.get("PATREON_STATE_DIR", _default_state_dir())
 DEFAULT_TITLE_BYTES = 100 if IS_WINDOWS else 180
 
 
+# Values the shipped example files carry. Left in place they produce failures
+# that look like credential problems -- Gmail rejects you@gmail.com with the
+# same AUTHENTICATIONFAILED it gives a wrong password -- so they are caught as
+# config errors instead.
+PLACEHOLDERS = {
+    "you@gmail.com", "your@gmail.com", "user@gmail.com", "youremail@gmail.com",
+    "xxxxxxxxxxxxxxxx",
+    "https://www.patreon.com/posts/12345678",
+    "https://www.patreon.com/c/somecreator",
+}
+
+
 def _env_str(key: str, default: str) -> str:
     v = os.environ.get(key)
     return v if v not in (None, "") else default
@@ -336,6 +348,20 @@ class PipelineConfig:
         if need_mail:
             if not self.imap_user:
                 problems.append("imap_user is unset (PATREON_IMAP_USER)")
+            elif self.imap_user.strip().lower() in PLACEHOLDERS:
+                problems.append(
+                    f"imap_user is still the example value "
+                    f"{self.imap_user!r} -- set PATREON_IMAP_USER to your own "
+                    f"address. Gmail rejects it exactly like a wrong password.")
+            elif "@" not in self.imap_user:
+                problems.append(
+                    f"imap_user {self.imap_user!r} is not an email address; "
+                    f"Gmail needs the full address including the domain")
+            if self.imap_password.strip().lower() in PLACEHOLDERS:
+                problems.append(
+                    "imap_password is still the example value -- paste the "
+                    "16-character app password from "
+                    "https://myaccount.google.com/apppasswords")
             if not self.imap_password:
                 problems.append(
                     "imap_password is unset (PATREON_IMAP_PASSWORD); use a "
@@ -355,6 +381,11 @@ class PipelineConfig:
             problems.append(
                 "upload_media is off but transcribe is off too: nothing would "
                 "be produced")
+        if self.campaign_urls and any(
+                u.strip().lower() in PLACEHOLDERS for u in self.campaign_urls):
+            problems.append(
+                "campaign_urls still contains the example URL -- replace it "
+                "with the creator you actually follow")
         if self.uploader not in ("rclone", "drive"):
             problems.append(
                 f"uploader must be 'rclone' or 'drive', not {self.uploader!r}")

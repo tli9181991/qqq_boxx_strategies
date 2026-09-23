@@ -463,6 +463,27 @@ def test_a_misspelled_setting_is_still_rejected():
         raise AssertionError("a misspelled key should not be accepted")
 
 
+def test_unedited_placeholders_are_caught_as_config_errors():
+    """Gmail rejects you@gmail.com with the same AUTHENTICATIONFAILED it gives
+    a wrong password, so an unedited example value reads as a credential
+    problem and sends you hunting in the wrong place."""
+    cfg = PipelineConfig()
+    cfg.imap_user = "you@gmail.com"
+    cfg.imap_password = "abcdefghijklmnop"
+    assert any("example value" in p for p in cfg.validate(need_mail=True))
+
+    cfg.imap_user = "tli9181991"
+    assert any("not an email address" in p for p in cfg.validate(need_mail=True))
+
+    cfg.imap_user = "real@gmail.com"
+    assert cfg.validate(need_mail=True) == []
+
+
+def test_the_example_campaign_url_is_rejected():
+    cfg = PipelineConfig(campaign_urls=["https://www.patreon.com/c/somecreator"])
+    assert any("example URL" in p for p in cfg.validate())
+
+
 def test_password_shape_names_the_usual_mistakes_without_revealing_it():
     """Gmail answers every bad credential with the same opaque
     AUTHENTICATIONFAILED, so the diagnosis has to come from this side."""
