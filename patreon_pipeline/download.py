@@ -73,12 +73,18 @@ _AUTH_PATTERNS = (
     r"could not (?:copy|find).*cookie",
 )
 
+# Matched against yt-dlp's stderr. The first entry is the one that matters:
+# the Patreon extractor raises it verbatim for a post with nothing
+# downloadable in it, which on a text-and-images creator is most posts. The
+# optional "supported" is load-bearing -- the message is "No supported media
+# found in this post", and a pattern of "no media found" does not match it.
 _NO_MEDIA_PATTERNS = (
+    r"no (?:supported )?media found",
     r"no video formats found",
     r"there's no video",
     r"unsupported url",
-    r"no media found",
     r"does not have a video",
+    r"requested format is not available",
 )
 
 

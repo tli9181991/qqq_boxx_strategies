@@ -219,6 +219,16 @@ def test_flags_set_and_clear():
 # yt-dlp wrapper
 # ----------------------------------------------------------------------
 
+def test_a_post_with_nothing_downloadable_is_skipped_not_retried():
+    """yt-dlp's Patreon extractor raises this verbatim for a text-or-images
+    post. Classified as a generic failure it burns four attempts and an hour
+    of backoff on something that will never succeed -- and on a creator who
+    mostly posts text, that is most of the queue."""
+    assert download.classify_error(
+        "ERROR: [patreon] 170224421: No supported media found in this post"
+    ) is download.NoMediaError
+
+
 def test_auth_failures_are_classified_apart_from_real_failures():
     """This split is what stops an expired login marching the whole queue
     into `failed`."""
