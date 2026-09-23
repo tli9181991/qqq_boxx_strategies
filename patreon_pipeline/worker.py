@@ -253,14 +253,28 @@ def sweep(cfg: PipelineConfig, *, limit: int = 20) -> int:
             except download.DownloadError as exc:
                 log.error("sweep of %s failed: %s", campaign, exc)
                 continue
+            skipped = []
             for url in urls:
                 canon = mail.canonical_post_url(url)
                 if not canon:
+                    # Never silent. A listing whose entries do not look like
+                    # posts means the wrong field was printed, and that failure
+                    # is otherwise indistinguishable from "nothing new".
+                    skipped.append(url)
                     continue
                 _, is_new = store.enqueue(conn, canon, source="sweep",
                                           post_id=mail.post_id_of(canon))
                 if is_new:
                     created += 1
                     log.info("sweep queued %s", canon)
+            if skipped:
+                log.warning(
+                    "%d/%d listed url(s) were not Patreon posts and were "
+                    "skipped, e.g. %s", len(skipped), len(urls), skipped[0])
+            if urls and not any(mail.canonical_post_url(u) for u in urls):
+                log.error(
+                    "the campaign listing returned no post URLs at all. Every "
+                    "entry looked like %s -- that is the campaign page, not a "
+                    "post, so yt-dlp printed the wrong field.", urls[0])
     log.info("sweep finished: %d new job(s)", created)
     return EXIT_OK

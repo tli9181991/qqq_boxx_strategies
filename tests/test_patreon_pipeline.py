@@ -302,6 +302,22 @@ def test_default_vocabulary_is_populated():
 # Uploads
 # ----------------------------------------------------------------------
 
+def test_campaign_listing_prints_the_entry_url_not_the_playlist_url():
+    """With --flat-playlist, yt-dlp copies the PLAYLIST's webpage_url onto
+    every entry. Printing that field returns the campaign URL once per post --
+    a listing that looks plausible, canonicalises to nothing, and reports
+    "0 new jobs" with no error. `url` holds the entry's own target."""
+    import inspect
+    src = inspect.getsource(download.list_campaign_posts)
+    printed = [l for l in src.splitlines() if "--print" in l]
+    assert printed, "the listing should use --print"
+    field = [l for l in src.splitlines() if "%(" in l and "s\"" in l]
+    assert any("%(url," in l for l in field), \
+        f"expected the url field first, got: {field}"
+    assert not any('"%(webpage_url)s"' in l for l in src.splitlines()), \
+        "webpage_url alone returns the campaign URL for every entry"
+
+
 def test_sweep_without_campaigns_is_an_error_not_a_quiet_success():
     """A sweep that swept nothing did not do its job. Returning success for it
     hides the usual cause -- a config file that is not being read at all."""

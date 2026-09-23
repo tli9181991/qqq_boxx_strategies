@@ -265,7 +265,13 @@ def list_campaign_posts(cfg: PipelineConfig, campaign_url: str,
     """
     cmd = [cfg.ytdlp_binary] + _cookie_args(cfg) + [
         "--flat-playlist", "--no-warnings", "--ignore-errors",
-        "--print", "%(webpage_url)s",
+        # `url`, not `webpage_url`. With --flat-playlist, yt-dlp copies the
+        # *playlist's* webpage_url onto every entry, so asking for that field
+        # returns the campaign URL once per post rather than the post URLs --
+        # a listing that looks plausible and canonicalises to nothing. `url`
+        # holds the entry's own target; the comma is yt-dlp's alternation
+        # syntax, falling back if a future version stops setting it.
+        "--print", "%(url,webpage_url)s",
     ]
     if limit > 0:
         cmd += ["--playlist-items", f"1-{int(limit)}"]
@@ -282,6 +288,7 @@ def list_campaign_posts(cfg: PipelineConfig, campaign_url: str,
     # entry is unavailable. Trust whatever came out of stdout, and only raise
     # when nothing did.
     urls = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+    log.info("campaign listing returned %d url(s)", len(urls))
     if not urls and proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         tail = "\n".join(stderr.splitlines()[-6:])
