@@ -226,8 +226,19 @@ def run(cfg: PipelineConfig, *, once: bool = False,
 def sweep(cfg: PipelineConfig, *, limit: int = 20) -> int:
     """Enqueue anything on the configured campaigns that is not already known."""
     if not cfg.campaign_urls:
-        log.warning("no campaign_urls configured; nothing to sweep")
-        return EXIT_OK
+        # A hard error, not a warning. A sweep that swept nothing did not do
+        # what it was asked, and reporting success for it hides the real
+        # problem -- which is almost always that the config file is not being
+        # read at all, so every other setting is silently a default too.
+        source = os.environ.get("PATREON_CONFIG") or "(no PATREON_CONFIG set)"
+        log.error(
+            "no campaign_urls configured -- nothing to sweep.\n"
+            "  config file read: %s\n"
+            "  Set campaign_urls there, or PATREON_CAMPAIGN_URLS in the "
+            "environment (which overrides the file).\n"
+            "  `runner config` prints what actually got loaded.",
+            source)
+        return EXIT_CONFIG
     from . import mail
 
     created = 0

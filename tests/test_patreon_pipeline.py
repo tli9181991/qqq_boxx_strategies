@@ -302,6 +302,15 @@ def test_default_vocabulary_is_populated():
 # Uploads
 # ----------------------------------------------------------------------
 
+def test_sweep_without_campaigns_is_an_error_not_a_quiet_success():
+    """A sweep that swept nothing did not do its job. Returning success for it
+    hides the usual cause -- a config file that is not being read at all."""
+    from patreon_pipeline import worker
+    cfg = PipelineConfig(campaign_urls=[])
+    cfg.state_dir = tempfile.mkdtemp()
+    assert worker.sweep(cfg) == worker.EXIT_CONFIG
+
+
 def test_rclone_is_the_default_backend():
     """Chosen because it needs no Cloud project, no consent screen and has no
     seven-day token expiry."""
