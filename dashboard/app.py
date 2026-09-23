@@ -306,11 +306,11 @@ def load_us_market(download_start: str, online: bool, force: bool,
     that looks entirely plausible. `fetched` says whether this call went to the
     network, so the UI can tell "fresh" from "cached" rather than implying one.
 
-    Automatic refresh is gated to once a calendar day by `due_for_fetch`, and
-    the gate counts ATTEMPTS. Streamlit re-runs this script on every widget
-    interaction, and before the close the last bar is always yesterday's -- so
-    a data-based test would start a 2,400-name download on every rerun and
-    never stop. **Refresh now** ignores the gate.
+    Automatic refresh is gated by `due_for_fetch` to one attempt a day, at the
+    wall-clock slot `QBS_FETCH_AT` names, and the gate counts ATTEMPTS.
+    Streamlit re-runs this script on every widget interaction, so a data-based
+    test would start a 2,400-name download on every rerun and never stop.
+    **Refresh now** ignores the gate.
     """
     filters = UniverseFilters()
     if not online:

@@ -2624,102 +2624,150 @@ def test_no_strftime_directive_is_glibc_only():
         "instead, e.g. f\"{ts:%b} {ts.day}\":\n  " + "\n  ".join(offenders))
 
 
+def _hk(stamp):
+    """A moment in the reader's zone, which is the clock the gate uses."""
+    return pd.Timestamp(stamp, tz="Asia/Hong_Kong")
+
+
 def test_the_fetch_gate_allows_the_first_run(tmp_path):
     from qbs.finviz import due_for_fetch
 
-    due, why = due_for_fetch(str(tmp_path / "stamp.txt"))
+    due, why = due_for_fetch(str(tmp_path / "stamp.txt"),
+                             now=_hk("2026-09-22 15:00"))
     assert due and "no automatic fetch" in why
 
 
-def test_the_fetch_gate_closes_until_the_next_close(tmp_path):
-    """The gate counts ATTEMPTS, not data age. Streamlit re-runs the script on
-    every widget interaction, and before the close the last bar is always
-    yesterday's -- so a data-based test would start a 2,400-name download on
-    every rerun and never stop."""
-    from qbs.finviz import due_for_fetch, record_fetch_attempt
+def test_the_gate_opens_only_at_the_scheduled_slot(tmp_path):
+    """The rule: once a day at the configured hour, manual at every other.
 
-    stamp = str(tmp_path / "stamp.txt")
-    now = _et("2026-09-21 17:30")
-    record_fetch_attempt(stamp, now=now)
-
-    due, why = due_for_fetch(stamp, now=now + pd.Timedelta(minutes=5))
-    assert not due
-    assert "already fetched since" in why and "Refresh now" in why
-    assert "Sep 22" in why, "it has to say when it will try again"
-
-    # And it stays shut through the next morning, because nothing new has
-    # been published yet.
-    assert not due_for_fetch(stamp, now=_et("2026-09-22 09:30"))[0]
-    assert not due_for_fetch(stamp, now=_et("2026-09-22 16:30"))[0], \
-        "not the instant the bell rings -- the tape is still settling"
-    assert due_for_fetch(stamp, now=_et("2026-09-22 17:00"))[0]
-
-
-def test_a_pre_close_fetch_does_not_consume_the_days_attempt(tmp_path):
-    """The regression, and the whole reason this gate is not a calendar day.
-
-    Open the dashboard at 09:00 in UTC+8 -- 01:00 UTC -- and a per-UTC-day
-    gate spends the day's only automatic attempt hours before the close it
-    was meant to collect. The bar appears at 20:00 UTC and the gate refuses
-    until the UTC date rolls over, so the app sits a session behind all
-    evening with no way forward but the button.
+    The gate counts ATTEMPTS, not data age. Streamlit re-runs the script on
+    every widget interaction, so a data-based test would start a 2,600-name
+    download on every rerun and never stop.
     """
     from qbs.finviz import due_for_fetch, record_fetch_attempt
 
     stamp = str(tmp_path / "stamp.txt")
-    morning = pd.Timestamp("2026-09-21 01:00")        # naive UTC, as stamped
-    assert due_for_fetch(stamp, now=morning)[0]
-    record_fetch_attempt(stamp, now=morning)
 
-    # Mid-session: nothing new, so no second download.
-    assert not due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 13:30"))[0]
+    # Before the slot, nothing -- and the message points at the manual route.
+    for t in ("2026-09-22 00:01", "2026-09-22 09:00", "2026-09-22 14:59"):
+        due, why = due_for_fetch(stamp, now=_hk(t))
+        assert not due, t
+        assert "before today's 15:00" in why and "Refresh now" in why
 
-    # Still inside the settling window: asking here is how the torn bar got
-    # in, so the gate holds.
-    assert not due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 20:30"))[0]
+    # On the dot, and once.
+    due, _ = due_for_fetch(stamp, now=_hk("2026-09-22 15:00"))
+    assert due
+    record_fetch_attempt(stamp, now=_hk("2026-09-22 15:00"))
 
-    # Once it has settled, 9/21's bar MUST be collectable -- on 9/21, not
-    # after the UTC date has rolled over.
-    due, why = due_for_fetch(stamp, now=pd.Timestamp("2026-09-21 21:30"))
-    assert due, "the post-close attempt is the one that gets the new bar"
-    assert "before the 2026-09-21 close" in why
-    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 21:30"))
-
-    # Having collected it, it does not go round again.
-    for t in ("2026-09-21 23:59", "2026-09-22 01:00", "2026-09-22 13:30"):
-        assert not due_for_fetch(stamp, now=pd.Timestamp(t))[0], t
+    for t in ("2026-09-22 15:01", "2026-09-22 18:00", "2026-09-22 23:59"):
+        due, why = due_for_fetch(stamp, now=_hk(t))
+        assert not due, t
+        assert "already fetched today" in why
+        assert "Wed 15:00" in why, "it has to say when it will try again"
 
 
-def test_the_fetch_gate_compares_the_stamp_in_the_right_zone(tmp_path):
-    """The stamp is written in naive UTC and the boundary is in exchange
-    time. Comparing them without converting is the same bug one layer
-    down."""
+def test_a_missed_slot_is_not_collected_late(tmp_path):
+    """"At 15:00, manual otherwise" means the morning after a slot nobody was
+    there for starts no download either. It costs only freshness: the
+    download is the full history each time, so the next slot picks up both
+    days."""
     from qbs.finviz import due_for_fetch, record_fetch_attempt
 
     stamp = str(tmp_path / "stamp.txt")
-    # 20:30 UTC on 9/21 == 16:30 ET, i.e. AFTER that day's close.
-    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 20:30"))
-    assert not due_for_fetch(stamp, now=_et("2026-09-21 17:00"))[0]
-    # 19:30 UTC == 15:30 ET, BEFORE it.
-    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 19:30"))
-    assert due_for_fetch(stamp, now=_et("2026-09-21 17:00"))[0]
+    record_fetch_attempt(stamp, now=_hk("2026-09-22 15:00"))
+
+    # Wednesday's slot passes unattended...
+    assert not due_for_fetch(stamp, now=_hk("2026-09-24 09:00"))[0], \
+        "Thursday morning must not collect Wednesday's missed slot"
+    assert "before today's" in due_for_fetch(stamp,
+                                             now=_hk("2026-09-24 09:00"))[1]
+    # ...and Thursday's own slot runs normally.
+    assert due_for_fetch(stamp, now=_hk("2026-09-24 15:00"))[0]
 
 
-def test_the_epoch_key_changes_only_on_a_close():
-    """What the dashboard's caches are keyed on. `st.cache_data` memoises on
-    arguments alone, so without this a process left running across a close
-    serves the numbers it read on start-up for ever -- and the gate above is
-    never consulted, because the function holding it does not run."""
+def test_the_slot_does_not_spend_a_download_on_a_dead_weekend(tmp_path):
+    """At 15:00 UTC+8 on a Sunday the newest bar is still Friday's, which
+    Saturday's slot already collected."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+
+    # Saturday's slot is the first one after Friday's close, so it runs.
+    assert due_for_fetch(stamp, now=_hk("2026-09-26 15:00"))[0]
+    record_fetch_attempt(stamp, now=_hk("2026-09-26 15:00"))
+
+    due, why = due_for_fetch(stamp, now=_hk("2026-09-27 15:00"))
+    assert not due, "Sunday has nothing new to fetch"
+    assert "nothing new since" in why
+
+
+def test_the_gate_compares_the_stamp_in_the_right_zone(tmp_path):
+    """The stamp is written in naive UTC and the slot is in the reader's
+    zone. Comparing them without converting is a whole class of bug this
+    file has had before, one layer down."""
+    from qbs.finviz import due_for_fetch, record_fetch_attempt
+
+    stamp = str(tmp_path / "stamp.txt")
+    at = _hk("2026-09-22 18:00")           # after the slot, so it can fire
+
+    # 07:00 UTC on 9/22 IS 15:00 in UTC+8 -- the slot itself, so this counts
+    # as today's fetch. Read as naive UTC against a UTC+8 slot it would look
+    # like 07:00 local, hours early, and the gate would fire a second time.
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-22 07:00"))
+    due, why = due_for_fetch(stamp, now=at)
+    assert not due and "already fetched today" in why
+
+    # 19:00 UTC on 9/21 is 03:00 UTC+8 on the 22nd: before the slot, and also
+    # before the Sep 21 close landed in this zone at 04:00. Both conditions
+    # therefore pass, which is what isolates the comparison being tested --
+    # a stamp at 14:00 local would be before the slot but AFTER the close,
+    # and would be held by the other condition for an unrelated reason.
+    record_fetch_attempt(stamp, now=pd.Timestamp("2026-09-21 19:00"))
+    assert due_for_fetch(stamp, now=at)[0]
+
+
+def test_the_schedule_is_configurable_and_survives_a_typo():
+    """Read on a dashboard's start-up path, so a bad value costs a line on
+    screen rather than a page that will not load -- and a SILENT fallback
+    would have someone waiting all afternoon for a fetch scheduled at an hour
+    they think they changed."""
+    from qbs.finviz import DEFAULT_FETCH_AT, DEFAULT_FETCH_TZ, fetch_schedule
+
+    hh, mm, tz, note = fetch_schedule({})
+    assert (hh, mm) == tuple(int(x) for x in DEFAULT_FETCH_AT.split(":"))
+    assert tz == DEFAULT_FETCH_TZ and note is None
+
+    hh, mm, tz, note = fetch_schedule({"QBS_FETCH_AT": "06:30",
+                                       "QBS_FETCH_TZ": "Europe/London"})
+    assert (hh, mm, tz) == (6, 30, "Europe/London") and note is None
+
+    hh, mm, tz, note = fetch_schedule({"QBS_FETCH_AT": "25:99",
+                                       "QBS_FETCH_TZ": "Mars/Olympus"})
+    assert (hh, mm, tz) == (15, 0, DEFAULT_FETCH_TZ), "falls back"
+    assert note and "25:99" in note and "Mars/Olympus" in note
+
+
+def test_the_epoch_key_flips_at_the_slot_not_the_close():
+    """What the dashboard's caches are keyed on, and it has to answer to the
+    same clock as the gate.
+
+    Key it on the close and an app opened at 10:00 memoises "not due yet"
+    under a key that will not change again until the next close -- which is
+    AFTER the 15:00 slot -- so the scheduled fetch is memoised away and never
+    happens at all.
+    """
     from qbs.finviz import fetch_epoch
 
-    pre = fetch_epoch(_et("2026-09-21 09:30"))
-    assert pre == fetch_epoch(_et("2026-09-21 15:59")), "steady all session"
-    assert pre == fetch_epoch(_et("2026-09-21 16:30")), "and while it settles"
-    post = fetch_epoch(_et("2026-09-21 17:00"))
-    assert post != pre, "a settled bar is the only thing that moves it"
-    assert post == fetch_epoch(_et("2026-09-21 23:59"))
-    assert post == fetch_epoch(_et("2026-09-22 09:30")), "and overnight"
-    assert fetch_epoch(_et("2026-09-22 17:00")) != post
+    pre = fetch_epoch(_hk("2026-09-22 09:00"))
+    assert pre == fetch_epoch(_hk("2026-09-22 14:59")), "steady all morning"
+    # The US close lands at 04:00 UTC+8; the key must NOT move for it.
+    assert pre == fetch_epoch(_hk("2026-09-22 05:00"))
+
+    post = fetch_epoch(_hk("2026-09-22 15:00"))
+    assert post != pre, "the slot is the only thing that moves it"
+    assert post == fetch_epoch(_hk("2026-09-22 23:59"))
+    assert post == fetch_epoch(_hk("2026-09-23 09:00")), "and overnight"
+    assert fetch_epoch(_hk("2026-09-23 15:00")) != post
 
 
 def test_an_unwritable_stamp_does_not_break_the_fetch(tmp_path):
@@ -2737,7 +2785,10 @@ def test_a_corrupt_stamp_reads_as_never_fetched(tmp_path):
 
     stamp = tmp_path / "stamp.txt"
     stamp.write_text("not a timestamp")
-    assert due_for_fetch(str(stamp))[0], "unreadable means unknown means try"
+    # Pinned past the slot: this is about the unreadable STAMP, and left on
+    # the wall clock it would pass in the afternoon and fail in the morning.
+    assert due_for_fetch(str(stamp), now=_hk("2026-09-22 15:00"))[0], \
+        "unreadable means unknown means try"
 
 
 def test_a_stale_bars_cache_stops_counting_as_a_hit(tmp_path):

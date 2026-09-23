@@ -117,14 +117,20 @@ def fetch_epoch(now: Optional[pd.Timestamp] = None) -> str:
     """A key that changes exactly when a new bar becomes collectable.
 
     For a caller that memoises a load -- the dashboard's `st.cache_data`
-    wrappers -- passing this in makes the memo expire on the close instead of
-    living for the life of the process. A cache keyed only on its arguments
-    pins a long-running app to whatever it read on start-up, and then the gate
-    below is never even consulted, because the function holding it does not
-    run. A time-based TTL would work too, but it re-reads on a schedule that
-    has nothing to do with when the data changes.
+    wrappers -- passing this in makes the memo expire on the schedule instead
+    of living for the life of the process. A cache keyed only on its
+    arguments pins a long-running app to whatever it read on start-up, and
+    then the gate below is never even consulted, because the function holding
+    it does not run.
+
+    Keyed on the SLOT, not on the close, and the two are not
+    interchangeable. Key it on the close and an app opened at 10:00 memoises
+    "not due yet" under a key that will not change again until the next
+    close -- which is AFTER the 15:00 slot -- so the scheduled fetch is
+    memoised away and never happens. The gate and the key have to answer to
+    the same clock.
     """
-    return last_market_close(now).isoformat(timespec="minutes")
+    return last_fetch_slot(now).isoformat(timespec="minutes")
 
 
 def last_fetch_attempt(stamp_path: str = FETCH_STAMP) -> Optional[pd.Timestamp]:
@@ -157,42 +163,61 @@ def due_for_fetch(stamp_path: str = FETCH_STAMP,
                   now: Optional[pd.Timestamp] = None) -> Tuple[bool, str]:
     """`(due, why)` -- is an automatic refresh allowed right now?
 
-    Due when the last attempt predates the most recently published bar. See
-    the note above this section for why that, and not a calendar day: a
-    calendar day spends its one attempt at whatever hour the app happens to
-    be opened, which for anybody east of UTC is hours before the close it was
-    supposed to collect.
+    Two conditions, both required:
 
-    `why` is written to be rendered next to a stale date, so it says what the
-    app is waiting for rather than only that it is waiting.
+    1. the day's scheduled slot has passed since the last attempt, and
+    2. a US session has closed since the last attempt.
+
+    (1) is the rule: once a day, at the configured hour, and never at any
+    other -- see the schedule section for why a gate and not a scheduler.
+    (2) stops the slot spending a 2,600-name download on a day with nothing
+    new in it: at 15:00 UTC+8 on a Sunday the newest bar is still Friday's,
+    which Saturday's slot already collected.
+
+    `why` is written to be rendered next to a stale date, so it says which of
+    the two is holding and when the app will try again. A "nothing to do"
+    that does not say until when is the one that gets read as a fault.
     """
-    now = (pd.Timestamp.now(MARKET_TZ) if now is None else pd.Timestamp(now))
-    now = (now.tz_localize("UTC") if now.tzinfo is None
-           else now).tz_convert(MARKET_TZ)
+    hh, mm, tz, cfg_note = fetch_schedule()
+    now = pd.Timestamp.now(tz) if now is None else pd.Timestamp(now)
+    now = (now.tz_localize("UTC") if now.tzinfo is None else now).tz_convert(tz)
+
+    slot = last_fetch_slot(now)
     close = last_market_close(now)
+    suffix = f" ({cfg_note})" if cfg_note else ""
+
+    # Today's slot, or nothing. A missed slot is NOT collected late: opening
+    # the app at 09:00 must not start a download, because "at 15:00, and
+    # manually otherwise" is the whole rule. Skipping one costs only
+    # freshness -- the download is the full history every time, not an
+    # increment, so the next slot picks up both days.
+    if slot.normalize() != now.normalize():
+        return False, (f"before today's {hh:02d}:{mm:02d} {tz} — automatic "
+                       f"fetches run then and at no other time; use Refresh "
+                       f"now for one immediately" + suffix)
 
     last = last_fetch_attempt(stamp_path)
     if last is None:
-        return True, "no automatic fetch has run yet"
-    # The stamp is written in naive UTC; the boundary is in exchange time.
-    # Comparing them without converting is the bug this whole section is
-    # about, one layer down.
-    last_et = (last.tz_localize("UTC") if last.tzinfo is None
-               else last).tz_convert(MARKET_TZ)
-    if last_et < close:
-        return True, (f"last automatic fetch was "
-                      f"{last_et:%Y-%m-%d %H:%M} ET, before the "
-                      f"{close:%Y-%m-%d} close")
-    nxt = next_market_close(now)
-    # `{close.day}` rather than a `%-d` in the format spec: the no-padding
-    # modifier is a glibc extension. Windows' C runtime rejects it outright
-    # with "Invalid format string", so a date in a status line took the whole
-    # dashboard down on the platform it was not developed on.
-    return False, (f"already fetched since the {close:%b} {close.day} close "
-                   f"(at {last_et:%H:%M} ET) — next automatic attempt after "
-                   f"the {nxt:%b} {nxt.day} close, or use Refresh now")
+        return True, "no automatic fetch has run yet" + suffix
 
+    # The stamp is written in naive UTC and the slot is in the reader's zone.
+    # Comparing them without converting is a whole class of bug this file has
+    # had before, one layer down.
+    last_tz = (last.tz_localize("UTC") if last.tzinfo is None
+               else last).tz_convert(tz)
+    nxt = next_fetch_slot(now)
 
+    if last_tz >= slot:
+        return False, (f"already fetched today at {last_tz:%H:%M} — next "
+                       f"automatic attempt {nxt:%a} {nxt:%H:%M} {tz}, or use "
+                       f"Refresh now" + suffix)
+    if last_tz >= close.tz_convert(tz):
+        return False, (f"nothing new since the {close:%b} {close.day} close, "
+                       f"already fetched at {last_tz:%H:%M} — next automatic "
+                       f"attempt {nxt:%a} {nxt:%H:%M} {tz}, or use Refresh now"
+                       + suffix)
+    return True, (f"scheduled fetch for {slot:%a} {slot:%H:%M} {tz}; last "
+                  f"attempt {last_tz:%Y-%m-%d %H:%M}" + suffix)
 
 
 @dataclass
@@ -327,6 +352,90 @@ def sector_map(universe: Optional[pd.DataFrame]) -> Dict[str, str]:
         return {}
     pairs = universe.dropna(subset=["Sector"])
     return dict(zip(pairs["Ticker"], pairs["Sector"]))
+
+
+# --------------------------------------------------------------------------
+# When the automatic fetch is allowed to run
+# --------------------------------------------------------------------------
+# A wall-clock slot in the reader's own timezone, once a day, and nothing at
+# any other hour. The default is 15:00 in UTC+8: eleven hours after the
+# previous US close, so the tape has long settled, and the middle of the
+# afternoon for somebody in Asia rather than the middle of their night.
+#
+# This is a GATE, not a scheduler. Streamlit runs code when something
+# interacts with it and at no other time, so "fetch at 15:00" means "the
+# first run at or after 15:00 fetches, and the rest of the day does not". Open
+# the app at 18:00 and it fetches then; open it at 10:00 and it will not. For
+# a download that happens whether or not anyone is looking, point cron or
+# Task Scheduler at the app's own fetch -- a dashboard cannot do it, because
+# a dashboard nobody has open is not running.
+#
+# Both conditions have to hold, and the second is why Sunday does not spend a
+# download: the slot has to have passed since the last attempt, AND a US
+# session has to have closed since the last attempt. At 15:00 UTC+8 on a
+# Sunday the newest bar is still Friday's, which Saturday's slot already
+# collected.
+
+FETCH_AT_VAR = "QBS_FETCH_AT"
+FETCH_TZ_VAR = "QBS_FETCH_TZ"
+DEFAULT_FETCH_AT = "15:00"
+DEFAULT_FETCH_TZ = "Asia/Hong_Kong"   # UTC+8; Singapore/Taipei/Shanghai are identical
+
+
+def fetch_schedule(environ: Optional[Dict[str, str]] = None
+                   ) -> Tuple[int, int, str, Optional[str]]:
+    """`(hour, minute, tz, complaint)` for the daily automatic fetch.
+
+    A bad value falls back to the default and is REPORTED rather than raised.
+    This is read on a dashboard's start-up path, so a typo in a `.env` should
+    cost a line on screen, not a page that will not load -- and a silent
+    fallback would have someone waiting all afternoon for a fetch scheduled
+    at an hour they think they changed.
+    """
+    env = os.environ if environ is None else environ
+    bad: List[str] = []
+
+    raw = (env.get(FETCH_AT_VAR) or DEFAULT_FETCH_AT).strip()
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError(raw)
+    except (ValueError, TypeError):
+        bad.append(f"{FETCH_AT_VAR}={raw!r} is not HH:MM")
+        hh, mm = (int(x) for x in DEFAULT_FETCH_AT.split(":"))
+
+    tz = (env.get(FETCH_TZ_VAR) or DEFAULT_FETCH_TZ).strip()
+    try:
+        pd.Timestamp("2026-01-01", tz=tz)
+    except Exception:  # noqa: BLE001
+        bad.append(f"{FETCH_TZ_VAR}={tz!r} is not a timezone pandas knows")
+        tz = DEFAULT_FETCH_TZ
+
+    note = ("; ".join(bad) + f" — using {hh:02d}:{mm:02d} {tz}") if bad else None
+    return hh, mm, tz, note
+
+
+def last_fetch_slot(now: Optional[pd.Timestamp] = None,
+                    environ: Optional[Dict[str, str]] = None) -> pd.Timestamp:
+    """The most recent scheduled fetch moment at or before `now`, tz-aware."""
+    hh, mm, tz, _ = fetch_schedule(environ)
+    now = pd.Timestamp.now(tz) if now is None else pd.Timestamp(now)
+    now = (now.tz_localize("UTC") if now.tzinfo is None else now).tz_convert(tz)
+
+    slot = now.normalize() + pd.Timedelta(hours=hh, minutes=mm)
+    if slot > now:
+        slot -= pd.Timedelta(days=1)
+    return slot
+
+
+def next_fetch_slot(now: Optional[pd.Timestamp] = None,
+                    environ: Optional[Dict[str, str]] = None) -> pd.Timestamp:
+    """The next scheduled fetch moment strictly after `now`, tz-aware.
+
+    Only used to tell someone when the app will try again. A "nothing to do"
+    message that does not say until when is the one that gets read as a fault.
+    """
+    return last_fetch_slot(now, environ) + pd.Timedelta(days=1)
 
 
 def _torn_note(torn: List[pd.Timestamp]) -> Optional[str]:
