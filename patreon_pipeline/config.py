@@ -368,8 +368,34 @@ class PipelineConfig:
                 "whisper_compute_type float16 is not supported on CPU; use int8")
         return problems
 
+    def password_shape(self) -> str:
+        """Describe the app password without revealing it.
+
+        "***" tells you nothing when Gmail says AUTHENTICATIONFAILED. Almost
+        every cause of that is visible in the *shape* of the string -- pasted
+        with the spaces Google displays it with, wrapped in quotes, or the
+        OAuth client secret pasted by mistake -- so report those and keep the
+        value itself out of the output.
+        """
+        pw = self.imap_password
+        if not pw:
+            return "(unset)"
+        notes = [f"{len(pw)} chars"]
+        if pw != pw.strip():
+            notes.append("SURROUNDING WHITESPACE -- trim it")
+        core = pw.strip()
+        if core[:1] in ("\"", "'") or core[-1:] in ("\"", "'"):
+            notes.append("QUOTED -- remove the quotes")
+        if any(c.isspace() for c in core):
+            notes.append("CONTAINS SPACES -- enter the 16 characters unspaced")
+        if core.startswith("GOCSPX-"):
+            notes.append("this is an OAuth client secret, NOT an app password")
+        elif len(core) != 16:
+            notes.append("expected 16 characters for a Gmail app password")
+        return "<" + "; ".join(notes) + ">"
+
     def describe(self) -> str:
-        """Human-readable dump with the secret redacted."""
+        """Human-readable dump. The password is described, never printed."""
         d = asdict(self)
-        d["imap_password"] = "***" if self.imap_password else ""
+        d["imap_password"] = self.password_shape()
         return json.dumps(d, indent=2, sort_keys=True)

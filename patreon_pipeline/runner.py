@@ -144,7 +144,14 @@ def cmd_folders(cfg: PipelineConfig, args) -> int:
 
     with IMAPClient(cfg.imap_host, port=cfg.imap_port, ssl=True,
                     timeout=60) as client:
-        client.login(cfg.imap_user, cfg.imap_password)
+        try:
+            client.login(cfg.imap_user, cfg.imap_password)
+        except Exception as exc:
+            if (type(exc).__name__ == "LoginError"
+                    or "AUTHENTICATIONFAILED" in str(exc)):
+                log.error("%s", mail.login_help(cfg, exc))
+                return EXIT_CONFIG
+            raise
         rows = client.list_folders()
 
     names = []

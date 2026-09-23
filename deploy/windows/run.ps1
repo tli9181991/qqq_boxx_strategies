@@ -32,9 +32,14 @@ if (-not (Test-Path $Python)) {
 }
 
 # KEY=VALUE, one per line. '#' starts a comment; blank lines are skipped.
-# Values are taken literally -- no quote stripping, no expansion -- because a
-# Gmail app password can contain almost anything and guessing at quoting is how
-# a credential silently becomes the wrong string.
+#
+# Values are trimmed, and one matching pair of surrounding quotes is removed.
+# An earlier version took them literally, on the theory that guessing at
+# quoting could corrupt a credential. That was backwards: a Gmail app password
+# is sixteen lowercase letters and can contain neither a quote nor a space, so
+# there is nothing to corrupt -- while pasting one with the spaces Google
+# displays it with, or in quotes, produces AUTHENTICATIONFAILED and no clue
+# why. `runner config` reports the shape of what was read.
 if (Test-Path $EnvFile) {
     foreach ($line in Get-Content -LiteralPath $EnvFile) {
         $trimmed = $line.Trim()
@@ -42,7 +47,12 @@ if (Test-Path $EnvFile) {
         $idx = $trimmed.IndexOf('=')
         if ($idx -lt 1) { continue }
         $key = $trimmed.Substring(0, $idx).Trim()
-        $val = $trimmed.Substring($idx + 1)
+        $val = $trimmed.Substring($idx + 1).Trim()
+        if ($val.Length -ge 2 -and
+            (($val.StartsWith('"') -and $val.EndsWith('"')) -or
+             ($val.StartsWith("'") -and $val.EndsWith("'")))) {
+            $val = $val.Substring(1, $val.Length - 2)
+        }
         Set-Item -Path "env:$key" -Value $val
     }
 } else {

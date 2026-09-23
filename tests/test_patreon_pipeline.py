@@ -463,6 +463,28 @@ def test_a_misspelled_setting_is_still_rejected():
         raise AssertionError("a misspelled key should not be accepted")
 
 
+def test_password_shape_names_the_usual_mistakes_without_revealing_it():
+    """Gmail answers every bad credential with the same opaque
+    AUTHENTICATIONFAILED, so the diagnosis has to come from this side."""
+    def shape(pw):
+        cfg = PipelineConfig()
+        cfg.imap_password = pw
+        return cfg.password_shape()
+
+    assert shape("abcdefghijklmnop") == "<16 chars>"
+    assert "SPACES" in shape("abcd efgh ijkl mnop")
+    assert "QUOTED" in shape('"abcdefghijklmnop"')
+    assert "WHITESPACE" in shape(" abcdefghijklmnop")
+    assert "OAuth client secret" in shape("GOCSPX-laVe0Q32m")
+    assert shape("") == "(unset)"
+
+
+def test_the_password_itself_never_appears_in_describe():
+    cfg = PipelineConfig()
+    cfg.imap_password = "hunter2hunter2xx"
+    assert "hunter2" not in cfg.describe()
+
+
 def test_secrets_are_not_read_from_the_config_file():
     """A Gmail app password in a tracked JSON file is how it ends up in a
     commit. It must come from the environment or not at all."""
