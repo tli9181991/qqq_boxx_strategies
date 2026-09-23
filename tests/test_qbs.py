@@ -22,7 +22,7 @@ from dataclasses import replace
 from qbs.config import (
     SAFE_ASSET, BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams,
     GEMParams, MomentumParams, RSI2Params, ResidualMomentumParams,
-    VixBreakerParams, VolTargetParams,
+    VixBreakerParams, VixTermStructureParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -32,7 +32,8 @@ from qbs.pipeline import build_signals, run, sweep_band, sweep_target_vol, sweep
 from qbs.strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
     cross_sectional_momentum, drawdown_stop, gem, residual_momentum,
-    residual_momentum_score, vix_circuit_breaker, vol_target_overlay,
+    residual_momentum_score, vix_circuit_breaker, vix_term_structure_breaker,
+    vol_target_overlay,
 )
 from qbs.universe import membership_mask, synthetic_universe
 
@@ -535,6 +536,104 @@ def _vix_fixture(levels):
     base = buy_and_hold(px, "QQQ")
     vix = pd.Series(levels, index=idx, dtype=float)
     return px, base, vix
+
+
+def _ts_fixture(vix_levels, vix3m_levels):
+    """A fully-invested base plus hand-written VIX and VIX3M paths."""
+    px = synthetic_prices()
+    idx = px.index[:len(vix_levels)]
+    px = px.loc[idx]
+    base = buy_and_hold(px, "QQQ")
+    vix = pd.Series(vix_levels, index=idx, dtype=float)
+    vix3m = pd.Series(vix3m_levels, index=idx, dtype=float)
+    return px, base, vix, vix3m
+
+
+def test_term_structure_trips_on_inversion_not_on_level():
+    """The whole point: a HIGH but upward-sloping curve must not trip it.
+
+    VIX at 30 with VIX3M at 34 is an expensive but calm market -- the level
+    breaker would be in cash, this must stay invested. The same VIX at 30
+    against VIX3M at 26 is inverted and must trip.
+    """
+    # high level, still contango -> stay in
+    _, base, v, v3 = _ts_fixture([30, 30, 30, 30], [34, 34, 34, 34])
+    calm = vix_term_structure_breaker(base, v, v3, VixTermStructureParams())
+    assert list(calm.diagnostics["regime"]) == ["INVESTED"] * 4, (
+        "a high but upward-sloping curve is not stress")
+
+    # same level, inverted -> go to cash
+    _, base, v, v3 = _ts_fixture([30, 30, 30, 30], [34, 26, 26, 26])
+    stressed = vix_term_structure_breaker(base, v, v3, VixTermStructureParams())
+    assert stressed.diagnostics["regime"].iloc[1] == "CASH"
+    assert stressed.weights.iloc[1].sum() == 0.0, "CASH must hold nothing"
+
+
+def test_term_structure_and_level_breaker_share_one_state_machine():
+    """Same signal path, same thresholds -> byte-identical regimes.
+
+    The two breakers differ only in what they read. Feeding the ratio version
+    a VIX3M of exactly 1.0 turns its ratio into the raw VIX, so with matching
+    thresholds it must reproduce the level breaker exactly. If this ever
+    fails, the shared machine has grown a branch that only one of them takes.
+    """
+    levels = [12, 12, 25, 25, 25, 14, 14, 14, 14, 14]
+    px, base, vix = _vix_fixture(levels)
+    ones = pd.Series(1.0, index=vix.index)
+
+    lvl = vix_circuit_breaker(
+        base, vix, VixBreakerParams(exit_level=17, entry_level=16,
+                                    park_after_days=3, min_cash_days=2))
+    ts = vix_term_structure_breaker(
+        base, vix, ones, VixTermStructureParams(exit_ratio=17, entry_ratio=16,
+                                                park_after_days=3, min_cash_days=2))
+    assert list(lvl.diagnostics["regime"]) == list(ts.diagnostics["regime"])
+    pd.testing.assert_frame_equal(lvl.weights, ts.weights)
+
+
+def test_term_structure_ignores_an_unusable_long_leg():
+    """A zero or missing VIX3M is no reading, and must not fake a contango."""
+    _, base, v, v3 = _ts_fixture([30, 30, 30, 30], [26, 0.0, np.nan, 26])
+    sig = vix_term_structure_breaker(base, v, v3, VixTermStructureParams())
+    ratio = sig.diagnostics["ratio"]
+    assert np.isnan(ratio.iloc[1]), "a zero long leg is not a valid ratio"
+    assert np.isnan(ratio.iloc[2]), "a missing long leg is not a valid ratio"
+    # It tripped on bar 0 and the unreadable bars must not re-admit it.
+    assert sig.diagnostics["regime"].iloc[2] != "INVESTED"
+
+
+def test_term_structure_rejects_an_inverted_band():
+    try:
+        VixTermStructureParams(exit_ratio=0.95, entry_ratio=1.05)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("entry_ratio above exit_ratio should be rejected")
+
+
+def test_term_structure_never_exceeds_the_base_exposure():
+    _, base, v, v3 = _ts_fixture([20] * 8, [18, 18, 25, 25, 25, 25, 25, 25])
+    sig = vix_term_structure_breaker(base, v, v3, VixTermStructureParams())
+    risk = sig.weights.drop(columns=["BOXX"], errors="ignore").sum(axis=1)
+    base_risk = base.weights.drop(columns=["BOXX"], errors="ignore").sum(axis=1)
+    assert (risk <= base_risk + 1e-12).all(), "the breaker may only ever de-risk"
+
+
+def test_synthetic_vix3m_calibrates_to_the_series_it_is_given():
+    """The fixture must hit its inversion target on ANY vix it is handed.
+
+    This is the bug the calibration exists to prevent: a premium tuned on one
+    VIX series produced 24% inverted days on another, which made the strategy
+    look three times more trigger-happy than its rules are.
+    """
+    from qbs.data import synthetic_vix3m, synthetic_vix
+
+    calm = synthetic_vix(synthetic_prices())
+    hot = calm * 2.5 + 5.0        # a completely different level and scale
+    for name, v in (("calm", calm), ("hot", hot)):
+        v3 = synthetic_vix3m(v, target_backwardation=0.08)
+        frac = float(((v / v3) > 1.0).mean())
+        assert 0.04 <= frac <= 0.13, f"{name}: {frac:.1%} inverted, target was 8%"
 
 
 def test_vix_breaker_trips_above_exit_level():

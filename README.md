@@ -13,6 +13,9 @@ that shows you where every signal fired.
   up more than 28% on the quarter), then ranked by relative strength
 - **Top-6 residual momentum** — the same six slots ranked on what the market *cannot*
   explain, which is the one change in this lab that survived a paired robustness test
+- **Top-6 + VIX term structure** — the same risk switch driven by the *slope* of the
+  VIX curve rather than its level ⚠️ *implemented and tested, but not measured: ^VIX3M
+  is not bundled, so it currently runs on a synthetic long leg*
 
 Plus one strategy that does not fit the daily model and runs on its own:
 
@@ -336,6 +339,67 @@ volatility — the same device as the momentum rank band, for the same reason.
 **This is not volatility targeting.** Vol targeting scales exposure continuously with
 forecast risk; this is on/off. They compose — run `vol_target_overlay` on the result
 if you want both.
+
+### 5b. VIX term structure — the slope, not the level
+
+The same three-state switch, reading `VIX / VIX3M` instead of `VIX`. Above 1.0
+the curve is inverted. Full write-up:
+**[`docs/VIX_TERM_STRUCTURE.md`](docs/VIX_TERM_STRUCTURE.md)**.
+
+> ⚠️ **Implemented and tested, but not measured.** `^VIX3M` is not in the
+> bundled cache, so unless you supply it this runs on `synthetic_vix3m` — a
+> fixture. The rules are real; the edge is unknown. Same standing as the
+> weekly breakout book's synthetic hourly bars.
+
+**Why the slope.** Section 5 already admits the level breaker's trigger sits
+near VIX's median, which is why it is invested only 35% of the window and
+takes 29 trips to cash — a mostly-out-of-market strategy, not a filter. Worse,
+a high VIX historically precedes *high* returns; that is the volatility risk
+premium, and selling into it is selling the premium. Inversion is rarer (~8%
+of days since 2010) and says something the level does not: the curve has
+stopped pricing the stress as transitory.
+
+| | Time invested | Trips to cash |
+|---|---|---|
+| VIX level breaker (17/16) | 35% | 29 |
+| **VIX term structure (1.00/0.95)** | **90%** | **9** |
+
+That much is structural and holds regardless of the fixture: it behaves like a
+filter rather than a replacement.
+
+**And on this book it still does not help** — which is the useful part:
+
+| | CAGR | Vol | Sharpe | Max DD |
+|---|---|---|---|---|
+| Top-6 NDX momentum | 48.1% | 49.2% | 0.96 | −40.4% |
+| Top-6 + VIX level breaker | 3.8% | 24.7% | 0.11 | −26.5% |
+| Top-6 + VIX term structure | 39.4% | 43.8% | 0.88 | **−40.4%** |
+
+The drawdown is *identical to the unprotected book*, at every trigger in the
+sweep, because the book's worst episode was never a market event:
+
+```
+worst drawdown -40.4%:  2026-06-22 -> 2026-07-29
+  days inverted:  0 of 27   (ratio never above 0.86)
+  VIX:            15.0-20.7 (at or below its median)
+  QQQ:            -10.3%    (the book fell four times as far)
+```
+
+Six correlated semiconductors fell together while the index barely moved. This
+is a third independent confirmation of section 6's argument: a curve signal is
+a *market* signal, and this book's risk is not primarily market risk. Measure
+the thing you actually hold.
+
+Both breakers now call one shared state machine, so the only thing that
+differs between them is the number they read — a test pins that by feeding the
+ratio version a long leg of 1.0 and requiring it to reproduce the level
+version exactly.
+
+`sweep_term_structure()` reports **Days inverted** beside **Time invested**: if
+the first is far above ~8%, the trigger has been set inside the ordinary
+distribution and has become the thing it was meant to fix.
+
+---
 
 ### 6. Book vol targeting
 
@@ -817,7 +881,7 @@ qbs/
   plotting.py     the chart system
   pipeline.py     load -> signals -> backtest in one call; sweep_band(),
                   sweep_vix(), sweep_target_vol(), sweep_corr_cap(),
-                  book_correlation()
+                  sweep_term_structure(), book_correlation()
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
   agent/          an LLM analyst that READS the results above
@@ -886,6 +950,7 @@ python run_backtest.py --start 2024-09-01 --n-hold 8 --exit-rank 20 --sweep-band
 python run_backtest.py --slippage-bps 20            # does it survive worse fills?
 python run_backtest.py --sweep-corr-cap             # six slots, or six bets?
 python run_backtest.py --beta-window 126            # residual momentum's other end
+python run_backtest.py --sweep-term-structure       # where should inversion trigger?
 python run_backtest.py --sweep-vix --vix-exit 25    # where should the VIX trigger sit?
 python tests/test_qbs.py
 ```

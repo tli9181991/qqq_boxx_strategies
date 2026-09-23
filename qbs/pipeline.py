@@ -10,16 +10,17 @@ import pandas as pd
 
 from .config import (
     BACKTEST_END, BACKTEST_START, Config, INTL_ASSET, RISK_ASSET,
-    SAFE_ASSET, STRATEGY_LABELS, VOL_INDEX,
+    SAFE_ASSET, STRATEGY_LABELS, VOL_INDEX, VOL_INDEX_3M,
 )
-from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
+from .data import (load_prices, load_vix, load_vix3m, synthetic_prices,
+                   synthetic_vix, synthetic_vix3m)
 from .engine import BacktestResult, run_backtest
 from .metrics import format_summary, summarise, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2, drawdown_stop,
     cross_sectional_momentum, gem, residual_momentum, vix_circuit_breaker,
-    vol_target_overlay,
+    vix_term_structure_breaker, vol_target_overlay,
 )
 from .universe import (
     load_universe, load_universe_prices, membership_mask, pit_tickers,
@@ -37,6 +38,7 @@ class Lab:
     universe: Optional[pd.DataFrame] = None    # NDX constituent closes
     combined: Optional[pd.DataFrame] = None    # universe + safe asset, for the engine
     vix: Optional[pd.Series] = None            # VIX closes driving the circuit breaker
+    vix3m: Optional[pd.Series] = None          # 3-month VIX -- the term structure's long leg
 
     @property
     def summary(self) -> pd.DataFrame:
@@ -71,7 +73,9 @@ def run(
     with_book_vt: bool = True,
     with_finviz: bool = True,
     with_resmom: bool = True,
+    with_vix_ts: bool = True,
     vix: Optional[pd.Series] = None,
+    vix3m: Optional[pd.Series] = None,
     fetch_universe: bool = True,
     pit_membership: Optional[pd.DataFrame] = None,
 ) -> Lab:
@@ -83,6 +87,9 @@ def run(
     `with_finviz=False` drops the Finviz screen, which shares the same universe
     download and so is free once the momentum book has been built.
     `with_resmom=False` drops the residual-momentum book, likewise free.
+    `with_vix_ts=False` drops the VIX term-structure breaker. That one needs a
+    second index (^VIX3M) which the repo does not bundle; without it the line
+    is computed on a synthetic long leg and says nothing about markets.
     `pit_membership` takes a point-in-time membership frame (see
     `universe.load_pit_universe`) to remove survivorship bias from the ranking.
     """
@@ -191,6 +198,30 @@ def run(
                 vt_sig, combined, cfg.dd_stop, lag=cfg.execution_lag,
                 benchmark=bench, name="momentum_vt")
 
+        # ---- the same switch, driven by the SLOPE of the VIX curve -------
+        # The level breaker fires on ordinary conditions because VIX's median
+        # sits at 17-18. Inversion is rare and less ambiguous, which is the
+        # whole argument for preferring it. NOTE the data caveat: ^VIX3M is
+        # not in the bundled cache, so offline this runs on a synthetic
+        # companion series and the result is a fixture, not a measurement.
+        if with_vix_ts and vix is not None:
+            if vix3m is None:
+                if use_synthetic:
+                    vix3m = synthetic_vix3m(vix)
+                else:
+                    try:
+                        vix3m = load_vix3m(start=cfg.download_start,
+                                           end=cfg.backtest_end,
+                                           offline=offline, refresh=refresh)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[vix3m] could not load {VOL_INDEX_3M} ({exc}); "
+                              "falling back to a SYNTHETIC long leg -- the term "
+                              "structure line is a fixture, not a measurement.")
+                        vix3m = synthetic_vix3m(vix)
+            if vix3m is not None:
+                signals["momentum_ts"] = vix_term_structure_breaker(
+                    mom_sig, vix, vix3m, cfg.vix_ts, name="momentum_ts")
+
         # ---- the same slots, ranked on residual instead of total momentum -
         # Total-return momentum ranks a name partly for its beta in a rising
         # market, which is why the six slots keep collapsing into one sector
@@ -235,7 +266,7 @@ def run(
     for key, sig in signals.items():
         book = (combined
                 if key in ("momentum", "momentum_vix", "momentum_vt", "finviz",
-                           "resmom")
+                           "resmom", "momentum_ts")
                 else prices)
         results[key] = run_backtest(
             book, sig, start=cfg.backtest_start, end=cfg.backtest_end,
@@ -247,7 +278,7 @@ def run(
           .reindex(results["bh_qqq"].returns.index).fillna(0.0))
 
     return Lab(prices=prices, signals=signals, results=results, rf=rf, config=cfg,
-               universe=universe_prices, combined=combined, vix=vix)
+               universe=universe_prices, combined=combined, vix=vix, vix3m=vix3m)
 
 
 def sweep_volume(
@@ -504,5 +535,54 @@ def sweep_corr_cap(
             "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
             "Calmar": s["Calmar"], "Ann. turnover": s["Ann. turnover"],
             "Book corr": rho, "Eff. bets": n / (1.0 + (n - 1) * rho),
+        })
+    return pd.DataFrame(rows)
+
+
+def sweep_term_structure(
+    lab: Lab,
+    exit_ratios: List[float] = (0.95, 1.00, 1.05, 1.10),
+    band: float = 0.05,
+) -> pd.DataFrame:
+    """Re-run the term-structure breaker across inversion triggers.
+
+    Read **Time invested** first, exactly as with `sweep_vix`: a trigger that
+    sits in cash most of the sample is not protecting a book, it is replacing
+    one. The point of preferring the curve's slope to its level is that
+    inversion is *rare*, so a healthy row here should show a high time
+    invested and few trips -- if it does not, the trigger has been set inside
+    the ordinary distribution and has become the thing it was meant to fix.
+
+    ⚠️ Unless you supplied a real ^VIX3M, the long leg is `synthetic_vix3m`
+    and every column below is a property of that fixture. See
+    docs/VIX_TERM_STRUCTURE.md.
+    """
+    from .metrics import summarise
+    from .config import VixTermStructureParams
+
+    if lab.vix is None or lab.vix3m is None or "momentum" not in lab.signals:
+        raise ValueError("run(with_momentum=True, with_vix_ts=True) first")
+
+    cfg = lab.config
+    rows = []
+    for lvl in exit_ratios:
+        p = VixTermStructureParams(**{**cfg.vix_ts.__dict__,
+                                      "exit_ratio": float(lvl),
+                                      "entry_ratio": float(lvl) - band})
+        sig = vix_term_structure_breaker(lab.signals["momentum"], lab.vix,
+                                         lab.vix3m, p)
+        res = run_backtest(lab.combined, sig, start=cfg.backtest_start,
+                           end=cfg.backtest_end, lag=cfg.execution_lag,
+                           cost_bps=cfg.cost_bps, slippage_bps=cfg.slippage_bps)
+        s = summarise(res, rf=lab.rf)
+        d = sig.diagnostics.loc[res.start:res.end]
+        rows.append({
+            "Exit ratio": lvl, "Entry ratio": round(lvl - band, 4),
+            "Days inverted": float((d["ratio"] > lvl).mean()),
+            "Time invested": float((d["regime"] == "INVESTED").mean()),
+            "Trips": int((sig.events["action"] == "sell").sum()) if not sig.events.empty else 0,
+            "CAGR": s["CAGR"], "Ann. vol": s["Ann. vol"],
+            "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
+            "Ann. turnover": s["Ann. turnover"],
         })
     return pd.DataFrame(rows)

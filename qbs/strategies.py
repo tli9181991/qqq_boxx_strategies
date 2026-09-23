@@ -23,7 +23,7 @@ import pandas as pd
 from .config import (
     BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams,
     MomentumParams, RSI2Params, ResidualMomentumParams, SAFE_ASSET,
-    TRADING_DAYS, VixBreakerParams, VolTargetParams,
+    TRADING_DAYS, VixBreakerParams, VixTermStructureParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
 
@@ -746,16 +746,111 @@ def vix_circuit_breaker(
     if p.entry_level > p.exit_level:
         raise ValueError("entry_level must be <= exit_level (the band cannot be inverted)")
 
+    return _stress_breaker(
+        base, vix.reindex(base.weights.index).ffill(),
+        exit_level=p.exit_level, entry_level=p.entry_level,
+        park_after_days=p.park_after_days, min_cash_days=p.min_cash_days,
+        safe_asset=p.safe_asset, sell_safe_too=p.sell_safe_too,
+        name=name or f"{base.name}_vix",
+        signal_col="vix", label="VIX", fmt=".1f",
+        params=p.__dict__.copy(),
+    )
+
+
+# ==========================================================================
+# 5b. The same switch, driven by the SLOPE of the VIX curve
+# ==========================================================================
+
+def vix_term_structure_breaker(
+    base: StrategySignals,
+    vix: pd.Series,
+    vix3m: pd.Series,
+    params: Optional[VixTermStructureParams] = None,
+    name: Optional[str] = None,
+) -> StrategySignals:
+    """Risk off while the VIX curve is inverted, on while it is in contango.
+
+    The signal is the ratio `VIX / VIX3M`. Above 1.0 the near contract is
+    priced above the three-month one -- backwardation, the market paying up
+    for immediate protection. Below 1.0 is the ordinary state.
+
+    Why the slope rather than the level. The level version in this package
+    fires on ordinary conditions, because VIX's median sits at 17-18 and a
+    trigger at 17 is a coin flip dressed as a crash filter -- and worse, a
+    high VIX is historically followed by *high* returns, since that is the
+    volatility risk premium being paid to whoever holds through it. Inversion
+    is both rarer (about 8% of days since 2010) and less ambiguous: it says
+    the curve itself has stopped believing the stress is transitory.
+
+    Everything else is deliberately the level breaker's machine -- cash before
+    the safe asset, a minimum dwell, a hysteresis band -- so that a comparison
+    between the two is a comparison of *signals* and nothing else.
+
+    ⚠️ The lab cannot currently price this. ^VIX3M is not in the bundled cache,
+    so unless you pass a real series this runs on `synthetic_vix3m`, which is
+    a fixture. See `VixTermStructureParams` and docs/VIX_TERM_STRUCTURE.md.
+    """
+    p = params or VixTermStructureParams()
+    if p.entry_ratio > p.exit_ratio:
+        raise ValueError("entry_ratio must be <= exit_ratio (the band cannot be inverted)")
+
+    idx = base.weights.index
+    v = vix.reindex(idx).ffill()
+    v3 = vix3m.reindex(idx).ffill()
+    # A zero or missing long leg is an unusable reading, not a calm one: it
+    # must leave the machine where it is rather than fake a contango.
+    ratio = v / v3.where(v3 > 0)
+
+    return _stress_breaker(
+        base, ratio,
+        exit_level=p.exit_ratio, entry_level=p.entry_ratio,
+        park_after_days=p.park_after_days, min_cash_days=p.min_cash_days,
+        safe_asset=p.safe_asset, sell_safe_too=p.sell_safe_too,
+        name=name or f"{base.name}_ts",
+        signal_col="ratio", label="VIX/VIX3M", fmt=".3f",
+        params=p.__dict__.copy(),
+        extra_diagnostics={"vix": v, "vix3m": v3},
+    )
+
+
+def _stress_breaker(
+    base: StrategySignals,
+    signal: pd.Series,
+    exit_level: float,
+    entry_level: float,
+    park_after_days: int,
+    min_cash_days: int,
+    safe_asset: str,
+    sell_safe_too: bool,
+    name: str,
+    signal_col: str,
+    label: str,
+    fmt: str,
+    params: Dict,
+    extra_diagnostics: Optional[Dict[str, pd.Series]] = None,
+) -> StrategySignals:
+    """The three-state risk switch, shared by both breakers.
+
+    Factored out because the level breaker and the term-structure breaker are
+    the same machine reading different numbers. Keeping one copy means a fix
+    to the dwell logic or the cash-before-safe-asset rule cannot land in one
+    and be forgotten in the other -- and it means the comparison between them
+    is a comparison of signals, which is the only thing it should be.
+
+    `signal` is a stress reading where HIGHER is worse; the caller supplies
+    the two thresholds in the signal's own units. A NaN reading leaves the
+    state untouched, which is what "the data did not print today" should do.
+    """
     w_base = base.weights
     idx = w_base.index
-    v = vix.reindex(idx).ffill()
+    v = signal.reindex(idx)
 
     assets = list(w_base.columns)
-    if p.safe_asset not in assets:
-        assets = assets + [p.safe_asset]
+    if safe_asset not in assets:
+        assets = assets + [safe_asset]
     weights = pd.DataFrame(0.0, index=idx, columns=assets)
 
-    risk_cols = [c for c in w_base.columns if c != p.safe_asset]
+    risk_cols = [c for c in w_base.columns if c != safe_asset]
 
     state = "INVESTED"
     days_in_cash = 0
@@ -767,57 +862,59 @@ def vix_circuit_breaker(
         known = not np.isnan(vx)
 
         if state == "INVESTED":
-            if known and vx > p.exit_level:
+            if known and vx > exit_level:
                 state, days_in_cash = "CASH", 0
                 events.append(dict(date=dt, action="sell", asset="BOOK",
                                    price=float(vx),
-                                   reason=f"VIX {vx:.1f} > {p.exit_level:g} -- to cash"))
+                                   reason=f"{label} {vx:{fmt}} > {exit_level:g} -- to cash"))
         elif state == "CASH":
             days_in_cash += 1
-            recovered = known and vx < p.entry_level
-            if recovered and days_in_cash >= p.min_cash_days:
+            recovered = known and vx < entry_level
+            if recovered and days_in_cash >= min_cash_days:
                 state = "INVESTED"
                 events.append(dict(date=dt, action="buy", asset="BOOK", price=float(vx),
-                                   reason=f"VIX {vx:.1f} < {p.entry_level:g} after "
+                                   reason=f"{label} {vx:{fmt}} < {entry_level:g} after "
                                           f"{days_in_cash}d -- back in"))
-            elif days_in_cash >= p.park_after_days:
+            elif days_in_cash >= park_after_days:
                 state = "PARKED"
-                events.append(dict(date=dt, action="park", asset=p.safe_asset,
-                                   price=float(vx),
+                events.append(dict(date=dt, action="park", asset=safe_asset,
+                                   price=float(vx) if known else np.nan,
                                    reason=f"still elevated after {days_in_cash}d -- "
-                                          f"cash into {p.safe_asset}"))
+                                          f"cash into {safe_asset}"))
         elif state == "PARKED":
             days_in_cash += 1
-            if known and vx < p.entry_level:
+            if known and vx < entry_level:
                 state = "INVESTED"
                 events.append(dict(date=dt, action="buy", asset="BOOK", price=float(vx),
-                                   reason=f"VIX {vx:.1f} < {p.entry_level:g} -- back in"))
+                                   reason=f"{label} {vx:{fmt}} < {entry_level:g} -- back in"))
 
         if state == "INVESTED":
             days_in_cash = 0
             weights.loc[dt, w_base.columns] = w_base.loc[dt].to_numpy()
         elif state == "PARKED":
-            weights.at[dt, p.safe_asset] = 1.0
+            weights.at[dt, safe_asset] = 1.0
         else:
             # CASH: hold nothing. Unallocated weight earns exactly 0% in the
             # engine, which is what physical cash does.
-            if not p.sell_safe_too and p.safe_asset in w_base.columns:
-                weights.at[dt, p.safe_asset] = float(w_base.at[dt, p.safe_asset])
+            if not sell_safe_too and safe_asset in w_base.columns:
+                weights.at[dt, safe_asset] = float(w_base.at[dt, safe_asset])
 
         states.append(state)
 
     regime = pd.Series(states, index=idx, name="regime")
-    diagnostics = pd.DataFrame({
-        "vix": v,
+    cols = {signal_col: v}
+    if extra_diagnostics:
+        cols.update(extra_diagnostics)
+    cols.update({
         "regime": regime,
         "invested": (regime == "INVESTED").astype(float),
         "base_risk_weight": w_base[risk_cols].sum(axis=1) if risk_cols else 0.0,
-        "risk_weight": weights[[c for c in weights.columns if c != p.safe_asset]].sum(axis=1),
+        "risk_weight": weights[[c for c in weights.columns if c != safe_asset]].sum(axis=1),
     })
+    diagnostics = pd.DataFrame(cols)
 
     ev = pd.DataFrame(events) if events else _empty_events()
-    sig = StrategySignals(name or f"{base.name}_vix", weights, diagnostics, ev,
-                          params=p.__dict__.copy())
+    sig = StrategySignals(name, weights, diagnostics, ev, params=params)
     sig.holding = regime
     sig.holdings_log = base.holdings_log
     sig.held_ranks = base.held_ranks

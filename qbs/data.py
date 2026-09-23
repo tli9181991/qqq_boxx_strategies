@@ -19,7 +19,7 @@ from typing import Iterable, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .config import DOWNLOAD_START, TICKERS
+from .config import DOWNLOAD_START, TICKERS, VOL_INDEX_3M
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
@@ -558,6 +558,87 @@ def synthetic_vix(
     noise = rng.normal(0, 0.45, len(s))
     return pd.Series(np.clip(s.to_numpy() + noise, 9.0, 90.0),
                      index=prices.index, name="^VIX")
+
+
+def load_vix3m(
+    start: str = DOWNLOAD_START,
+    end: Optional[str] = None,
+    use_cache: bool = True,
+    refresh: bool = False,
+    offline: bool = False,
+) -> pd.Series:
+    """Daily close of the 3-month VIX -- the long leg of the term structure.
+
+    Thin wrapper over `load_vix`, which already takes a symbol; it exists so
+    callers do not have to remember the ticker and so the cache key is written
+    the same way every time (`data/_VIX3M.csv`).
+    """
+    return load_vix(start=start, end=end, symbol=VOL_INDEX_3M,
+                    use_cache=use_cache, refresh=refresh, offline=offline)
+
+
+def synthetic_vix3m(
+    vix: pd.Series,
+    long_run: Optional[float] = None,
+    damp: float = 0.55,
+    halflife: int = 20,
+    target_backwardation: float = 0.08,
+    seed: int = 22,
+) -> pd.Series:
+    """A VIX3M-shaped companion to whatever VIX you hand it.
+
+    Three-month implied vol is not a smoothed VIX, but for exercising a term
+    structure signal the property that matters is the one that makes the curve
+    informative: **the long leg barely moves when the short leg spikes**. So
+    this damps VIX's deviation from its own long-run level and lags it, which
+    puts the ratio above 1.0 in a spike and below it the rest of the time.
+
+    Calibration, and why it is not optional
+    ---------------------------------------
+    The level is then scaled so the curve is inverted on about
+    `target_backwardation` of days -- 8%, which is roughly what ^VIX/^VIX3M
+    has done since 2010. This is the same device as `synthetic_vix`'s
+    `target_median`, for the same reason: a term-structure trigger's entire
+    behaviour is decided by where it sits in the signal's distribution, so an
+    uncalibrated fixture does not exercise the strategy, it replaces it.
+
+    It matters more here than it looks. Fed the REAL cached VIX with a premium
+    tuned on the SYNTHETIC one, this produced inversion on 24% of days instead
+    of 8% -- tripping three times too often and making the strategy look far
+    worse than its rules are. Calibrating against the series actually supplied
+    removes that particular way of being wrong.
+
+    `long_run` defaults to the given series' own median, so the fixture does
+    not assume its input is calibrated to anything in particular.
+
+    ⚠️ It is still a fixture, not a forecast, and it does not reproduce the
+    DEPTH of a real inversion: the ratio here tops out well short of the
+    1.3-1.4 a real crisis reaches. Numbers computed on it say what the code
+    does, never what the market does.
+    """
+    rng = np.random.default_rng(seed)
+    v = vix.astype(float)
+    base = float(v.median()) if long_run is None else float(long_run)
+
+    smooth = v.ewm(halflife=halflife, min_periods=1).mean()
+    # Pull the smoothed level back toward the long-run mean: a 3-month
+    # contract prices a spike as mostly transitory.
+    level = base + (smooth - base) * damp
+
+    # Solve for the multiplicative premium that lands the inversion frequency
+    # on target. ratio = v / (level * k) > 1  <=>  k < v / level, so the
+    # required k is a quantile of that ratio -- one line, no search.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw = (v / level.where(level > 0)).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(raw) and 0.0 < target_backwardation < 1.0:
+        k = float(raw.quantile(1.0 - target_backwardation))
+    else:
+        k = 1.0
+    level = level * max(k, 1e-6)
+
+    noise = rng.normal(0.0, 0.25, len(level))
+    out = np.clip(level.to_numpy() + noise, 9.0, 90.0)
+    return pd.Series(out, index=vix.index, name=VOL_INDEX_3M)
 
 
 def synthetic_prices(

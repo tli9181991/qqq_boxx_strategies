@@ -394,6 +394,57 @@ class DrawdownStopParams:
 
 
 @dataclass
+class VixTermStructureParams:
+    """A risk switch driven by the SLOPE of the VIX curve, not its level.
+
+    `VixBreakerParams` asks "is implied volatility high?". This asks "is the
+    near-term contract priced above the three-month one?" -- i.e. is the curve
+    inverted. They are different questions and the second is the one the
+    literature prefers, for a reason the README already concedes about the
+    level version: a high VIX tends to precede *high* future returns, because
+    you are being paid the volatility risk premium to hold through it. Level
+    is a poor timing signal almost by construction.
+
+    Backwardation is rarer and less ambiguous. VIX has closed above VIX3M on
+    roughly 8% of trading days since 2010, and those episodes cluster in
+    genuine stress rather than in ordinary chop. That rarity is the point: the
+    default `exit_ratio` of 1.0 sits at about the 92nd percentile of the
+    signal, where `VixBreakerParams(exit_level=17)` sits near the MEDIAN of
+    its own and is consequently engaged half the time.
+
+    The state machine is identical to the level breaker's, because the useful
+    parts of it -- cash before the safe asset, a minimum dwell, a hysteresis
+    band -- are properties of the switch, not of the signal:
+
+        INVESTED  ratio > exit_ratio            -> CASH
+        CASH      park_after_days elapsed       -> PARKED (buy the safe asset)
+                  ratio < entry_ratio AND
+                    min_cash_days met           -> INVESTED
+        PARKED    ratio < entry_ratio           -> INVESTED
+
+    ⚠️ NOT VALIDATED ON REAL DATA IN THIS REPO. ^VIX3M is not in the bundled
+    cache and could not be downloaded in the environment this was written in,
+    so every number the lab reports for this strategy comes from
+    `synthetic_vix3m` -- a fixture built to exercise the code, whose inversions
+    are shallower than real ones. The rules are implemented and tested; the
+    edge is unmeasured. Fetch ^VIX3M and re-run before believing anything.
+    """
+    exit_ratio: float = 1.00      # VIX/VIX3M above this (inverted) -> risk off
+    entry_ratio: float = 0.95     # back below this (contango) -> risk on
+    park_after_days: int = 3      # trading days in cash before buying the safe asset
+    min_cash_days: int = 2        # minimum dwell, even if the curve snaps back
+    safe_asset: str = SAFE_ASSET
+    sell_safe_too: bool = True    # True: the trigger sells the safe sleeve as well
+
+    def __post_init__(self):
+        if self.entry_ratio > self.exit_ratio:
+            raise ValueError(
+                "entry_ratio must be <= exit_ratio (the band cannot be inverted)")
+        if self.exit_ratio <= 0 or self.entry_ratio <= 0:
+            raise ValueError("ratios are VIX/VIX3M and must be positive")
+
+
+@dataclass
 class BookVolTargetParams:
     """Volatility targeting applied to a WHOLE book, on its own realised vol.
 
@@ -539,6 +590,7 @@ class Config:
     breakout: BreakoutParams = field(default_factory=BreakoutParams)
     weekly_book: WeeklyBookParams = field(default_factory=WeeklyBookParams)
     vix: VixBreakerParams = field(default_factory=VixBreakerParams)
+    vix_ts: VixTermStructureParams = field(default_factory=VixTermStructureParams)
     book_vol: BookVolTargetParams = field(default_factory=BookVolTargetParams)
     dd_stop: DrawdownStopParams = field(default_factory=DrawdownStopParams)
     dd_stop_benchmark: str = RISK_ASSET   # the series dd_stop.qqq_drawdown reads
@@ -581,6 +633,9 @@ PALETTE = {
     # momentum yellow by lightness, which is what the eye uses when the
     # categorical hues are spent.
     "resmom":    "#00696e",   # slot 9 -- deep teal
+    # Slot 10 sits next to the level breaker's magenta on purpose: the two are
+    # the same switch on different signals, and the chart should say so.
+    "momentum_ts": "#9c3d6b",  # slot 10 -- deep magenta
     "bh_qqq":    "#898781",   # benchmark -- muted
     "bh_boxx":   "#c3c2b7",   # benchmark -- fainter still
     "buy":       "#0ca30c",   # status: good
@@ -629,6 +684,7 @@ STRATEGY_LABELS = {
     "finviz": "Top-20 high momentum screen",
     "breakout": "Weekly breakout, 6 slots",
     "resmom": "Top-6 residual momentum",
+    "momentum_ts": "Top-6 + VIX term structure",
     "bh_qqq": "Buy & hold QQQ",
     "bh_boxx": "Buy & hold BOXX",
 }
