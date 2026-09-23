@@ -94,7 +94,8 @@ RETIRED_VARS = {
 KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
               "QBS_GEMINI_MODEL", "QBS_SUMMARY_MODEL", "QBS_THINKING_BUDGET",
               "QBS_DASH_WATCHLIST", "QBS_UNIVERSE_SOURCE",
-              "QBS_FETCH_AT", "QBS_FETCH_TZ", DISABLE_CHAT_VAR,
+              "QBS_FETCH_AT", "QBS_FETCH_TZ", "QBS_FILL_LAST_BAR",
+              DISABLE_CHAT_VAR,
               DISABLE_NEWS_ANALYSIS_VAR, DISABLE_NEWS_READ_VAR)
 
 # Values that mean "switch is off, carry on". Everything else non-empty

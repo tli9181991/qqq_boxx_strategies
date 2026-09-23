@@ -51,6 +51,8 @@ from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
                       load_prices, sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
                         load_universe_bars, record_fetch_attempt, sector_map)
+from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
+                        latest_quotes, needs_fill)
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
@@ -91,6 +93,26 @@ PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
 # Data
 # --------------------------------------------------------------------------
 
+def _top_up_front_bar(closes, volumes, online: bool):
+    """The newest close from the screener, when yfinance has not published it.
+
+    Returns `(closes, volumes, note)`. yfinance stays the authority for every
+    settled bar; this only reaches names whose newest one is missing, and only
+    once the session has closed -- see `qbs.quotes` for why an open session is
+    refused rather than filled.
+
+    Asked only when a bar is actually short, so a normal day costs no screener
+    request at all.
+    """
+    if not online or fill_disabled() or not needs_fill(closes):
+        return closes, volumes, None
+    quotes, err = latest_quotes()
+    if quotes is None:
+        return closes, volumes, f"could not top up the newest bar — {err}"
+    closes, volumes, report = fill_last_bar(closes, volumes, quotes)
+    return closes, volumes, fill_note(report)
+
+
 def _read_cache(download_start: str, fetch_members: bool = False):
     """Whatever is on disk, without touching the network.
 
@@ -127,7 +149,7 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
     numbers is fine; showing them while claiming to be live is not.
     """
     status = {"mode": "online" if online else "offline", "downloaded": False,
-              "error": None, "partial": []}
+              "error": None, "partial": [], "filled": None, "carried": None}
 
     uni, px = None, None
     try:
@@ -159,8 +181,22 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
         f"{d:%Y-%m-%d}" + (f" ({cover[d][0]} of ~{cover[d][1]} names)"
                            if d in cover else "")
         for d in torn]
-    if torn:
+    # The bar yfinance dropped is the one the screener already has. Done
+    # after the torn one is gone, so the fill lands on a clean frame rather
+    # than beside a dozen stragglers.
+    uni, _, status["filled"] = _top_up_front_bar(uni, None, online)
+    if uni.index.max() < px.index.max():
         px = px.loc[:uni.index.max()]
+    elif uni.index.max() > px.index.max():
+        # The screener filled a session the ETFs do not have. Reindexing onto
+        # `px.index` here would throw that bar straight back out -- the fill
+        # would appear to work, say so on screen, and change nothing. The
+        # ETFs are carried forward instead, and it is reported: BOXX is a
+        # T-bill proxy so one stale session moves the absolute filter by
+        # basis points, but QQQ carried forward reads as an unchanged day
+        # rather than an unknown one, and that is worth saying out loud.
+        status["carried"] = f"{uni.index.max():%Y-%m-%d}"
+        px = px.reindex(px.index.union(uni.index)).ffill()
 
     uni = uni.reindex(px.index).ffill()
     uni = uni.loc[:, uni.notna().sum() >= 260]
@@ -347,7 +383,8 @@ def load_us_market(download_start: str, online: bool, force: bool,
     # function's own staleness check, or a torn bar makes the cache look
     # current and the download that would replace it never runs. Its reason
     # arrives in `bars_err`.
-    warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
+    closes, volumes, fill = _top_up_front_bar(closes, volumes, online)
+    warn = "; ".join(x for x in (uni_err, bars_err, fill) if x) or None
     # The source is named in the note because two providers apply the same
     # rules to different listings databases and will not agree on the last
     # hundred names. A breadth count that steps when the source changed, on a
@@ -540,6 +577,16 @@ def freshness_banner():
     if failed:
         st.error(f"**Download failed — showing the cached data instead.** "
                  f"{data_status['error']}", icon="🚫")
+    if data_status.get("filled"):
+        # Two providers in one series must never be invisible: a reader
+        # comparing today's numbers with last week's needs to know the newest
+        # bar did not come from the same place as the rest.
+        st.info(md("🔗 " + data_status["filled"]
+                   + (f". QQQ, VEU and BOXX have no bar for "
+                      f"{data_status['carried']} either and are **carried "
+                      "forward** — the index ATR reads as an unchanged day "
+                      "on it." if data_status.get("carried") else "")),
+                icon="🧩")
     if data_status.get("partial"):
         # Said out loud rather than quietly dropped. Someone looking for
         # yesterday's session needs to know it was there and was thrown

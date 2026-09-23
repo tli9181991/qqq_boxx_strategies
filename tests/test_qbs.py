@@ -3815,3 +3815,113 @@ def test_quarantined_tickers_are_not_requested_again(tmp_path, monkeypatch):
     assert asked == ["GOOD"], f"the dead ones were asked anyway: {asked}"
     assert c is not None and list(c.columns) == ["GOOD"]
     assert err and "2 ticker(s) skipped" in err, "and it says so, not silently"
+
+
+# --------------------------------------------------------------------------
+# Topping up the newest bar from the screener (qbs/quotes.py)
+# --------------------------------------------------------------------------
+
+def _bars(end="2026-09-21", names=10):
+    idx = pd.bdate_range("2026-09-01", end)
+    cols = [f"T{i}" for i in range(names)]
+    return (pd.DataFrame(100.0, index=idx, columns=cols),
+            pd.DataFrame(1e6, index=idx, columns=cols))
+
+
+def _quotes(names=8, close=101.0):
+    return pd.DataFrame({"close": [close] * names, "volume": [2e6] * names},
+                        index=[f"T{i}" for i in range(names)])
+
+
+def test_the_front_bar_is_filled_once_the_session_has_closed():
+    """The bar yfinance has not published is the one the screener already
+    returned, in a request the app was making anyway."""
+    from qbs.quotes import fill_last_bar, fill_note
+
+    c, v = _bars()
+    out, vol, rep = fill_last_bar(c, v, _quotes(), now=_et("2026-09-22 18:00"))
+
+    day = pd.Timestamp("2026-09-22")
+    assert out.index.max() == day, "the missing session is now there"
+    assert rep["filled"] == 8 and rep["absent"] == 2
+    assert float(out.at[day, "T0"]) == 101.0
+    assert float(vol.at[day, "T0"]) == 2e6
+    assert pd.isna(out.at[day, "T9"]), "a name the screener lacks stays empty"
+    note = fill_note(rep, "finviz")
+    assert note and "8 of 10" in note and "finviz" in note
+
+
+def test_an_open_session_is_refused_not_filled():
+    """A screener queried while the market is open returns an INTRADAY print.
+    Dropping one into a series of closes makes every return computed across
+    it wrong, and nothing downstream can tell."""
+    from qbs.quotes import fill_last_bar
+
+    c, v = _bars()
+    out, _, rep = fill_last_bar(c, v, _quotes(), now=_et("2026-09-22 11:00"),
+                                session=pd.Timestamp("2026-09-22"))
+    assert rep["filled"] == 0
+    assert "has not closed" in rep["skipped"] and "intraday" in rep["skipped"]
+    assert out.index.max() == pd.Timestamp("2026-09-21"), "frame untouched"
+
+
+def test_the_fill_never_overwrites_a_real_bar():
+    """yfinance is the authority for anything it actually published; the
+    screener only reaches the gaps."""
+    from qbs.quotes import fill_last_bar
+
+    c, v = _bars()
+    day = pd.Timestamp("2026-09-22")
+    c.loc[day] = np.nan
+    c.loc[day, ["T0", "T1", "T2"]] = 99.0          # yfinance got three
+
+    out, _, rep = fill_last_bar(c, v, _quotes(), now=_et("2026-09-22 18:00"))
+    assert rep["already"] == 3 and rep["filled"] == 5 and rep["absent"] == 2
+    assert list(out.loc[day, ["T0", "T1", "T2"]]) == [99.0, 99.0, 99.0]
+
+
+def test_a_complete_session_is_left_alone():
+    from qbs.quotes import fill_last_bar
+
+    c, v = _bars(end="2026-09-22")
+    out, _, rep = fill_last_bar(c, v, _quotes(), now=_et("2026-09-22 18:00"))
+    assert rep["filled"] == 0 and "already complete" in rep["skipped"]
+    assert out.equals(c)
+
+
+def test_the_screener_is_not_asked_on_a_normal_day():
+    """The top-up is for the hours yfinance is behind, not a second provider
+    on every page load."""
+    from qbs.quotes import needs_fill
+
+    c, _ = _bars(end="2026-09-22")
+    assert not needs_fill(c, _et("2026-09-22 18:00")), "complete: no request"
+    assert not needs_fill(c, _et("2026-09-22 11:00")), "mid-session: no request"
+    assert needs_fill(c.iloc[:-1], _et("2026-09-22 18:00")), "missing: ask"
+    torn = c.copy()
+    torn.loc[c.index[-1], "T9"] = np.nan
+    assert needs_fill(torn, _et("2026-09-22 18:00")), "torn: ask"
+
+
+def test_the_top_up_can_be_switched_off():
+    """It ships on, because the front edge being unreliable is why it exists
+    and a remedy that ships off is one nobody gets. But a series that must be
+    purely yfinance has to be reachable."""
+    from qbs.quotes import FILL_VAR, fill_disabled
+
+    assert not fill_disabled({}), "on by default"
+    for off in ("0", "false", "no", "off", "none", "disabled"):
+        assert fill_disabled({FILL_VAR: off}), off
+    assert not fill_disabled({FILL_VAR: "1"})
+
+
+def test_screener_quotes_are_shaped_and_normalised():
+    """Same ticker spelling as the price frames, or the fill lands on nothing."""
+    from qbs.quotes import _shape_quotes
+
+    out = _shape_quotes(pd.Series(["brk.b", "ORCL/PD", "AAPL", "AAPL", "BAD"]),
+                        pd.Series([1.0, 2.0, 3.0, 3.0, None]),
+                        pd.Series([10, 20, 30, 30, 40]))
+    assert list(out.index) == ["BRK-B", "ORCL-PD", "AAPL"], "normalised, deduped"
+    assert float(out.at["AAPL", "close"]) == 3.0
+    assert "BAD" not in out.index, "a quote with no price is not a quote"
