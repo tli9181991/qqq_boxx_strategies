@@ -24,6 +24,11 @@
     S4U runs them whether or not you are logged on, without storing a password
     either, but a task running that way has no access to network locations.
 
+.NOTES
+    Run this from an ELEVATED PowerShell: registering a Scheduled Task in the
+    Task Scheduler root requires administrator rights. -SkipTasks does
+    everything else and needs no elevation.
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -LogonType S4U
@@ -46,6 +51,39 @@ $RunPs1   = Join-Path $PSScriptRoot 'run.ps1'
 
 Write-Host "Repo:  $RepoRoot"
 Write-Host "State: $StateDir"
+
+# ---------------------------------------------------------------------------
+# Elevation
+# ---------------------------------------------------------------------------
+# Checked first, before anything slow happens. Registering a task in the Task
+# Scheduler root needs an elevated token, and without this check the failure
+# lands at the very end -- after a ~2 GB dependency install and every file has
+# been written -- which reads like the whole install failed when in fact only
+# the last step did.
+#
+# Elevation does not change WHICH user you are, only the token you hold, so the
+# tasks still register against this account and still read this account's
+# Firefox profile. Running the installer elevated does not make the pipeline
+# run elevated.
+$isAdmin = ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin -and -not $SkipTasks) {
+    Write-Host ""
+    throw @"
+This needs an elevated PowerShell to register the Scheduled Tasks.
+
+  Right-click PowerShell -> Run as administrator, then:
+
+      cd "$PSScriptRoot"
+      powershell -ExecutionPolicy Bypass -File .\install.ps1
+
+  Or do everything except the tasks, and register them later:
+
+      powershell -ExecutionPolicy Bypass -File .\install.ps1 -SkipTasks
+"@
+}
 
 # ---------------------------------------------------------------------------
 # Prerequisites

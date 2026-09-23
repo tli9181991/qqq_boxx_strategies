@@ -37,10 +37,21 @@ Open a **new** terminal afterwards so PATH is picked up.
 
 ## Install
 
+Run this from an **elevated** PowerShell — registering a Scheduled Task in the
+Task Scheduler root requires administrator rights. Right-click PowerShell →
+*Run as administrator*, then:
+
 ```powershell
 cd <repo>\deploy\windows
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
+
+Elevation changes the token you hold, not which user you are, so the tasks
+still register against your account and still read your Firefox profile. The
+pipeline itself does not run elevated.
+
+`-SkipTasks` does everything except registering the tasks and needs no
+elevation.
 
 That creates the virtualenv, installs dependencies, makes
 `C:\ProgramData\PatreonPipeline\`, copies starter config, and registers four
