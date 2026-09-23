@@ -456,6 +456,66 @@ def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
     return price, ema_long, lvl, last, n_in_view, has_overhead
 
 
+def session_axis(*frames, date_col: str = "date", n_ticks: int = 6):
+    """Put charts on a SESSION index instead of a calendar one.
+
+    Returns `(frames, axis)` with an `n` column added to each frame and an
+    Altair axis that still prints dates, at a handful of ticks.
+
+    A temporal axis draws real time, which means it draws the weekend: every
+    Saturday and Sunday is a gap the market did not trade through, and on a
+    twelve-month chart roughly two days in seven of the width carry no data.
+    Holidays add more. Candles end up separated by whitespace that looks like
+    a pause in trading and is not one, and a 20-session pulse chart wears four
+    gaps that mean nothing.
+
+    Numbering the sessions removes all of it: bar `n` sits next to bar `n+1`
+    whatever the calendar did in between. The cost is that the axis no longer
+    reads as a ruler of time, which is why the tick LABELS are still dates --
+    the spacing is sessions, the labels say when.
+
+    All frames share one index, built from the union of their dates, because
+    the price panel layers candles, EMAs and levels on one chart and a layer
+    numbered on its own dates would sit a bar or two off the others.
+    """
+    dates = pd.DatetimeIndex(sorted(set().union(
+        *[pd.DatetimeIndex(f[date_col]) for f in frames if f is not None
+          and not f.empty])))
+    if len(dates) == 0:
+        return frames, alt.Axis(title=None)
+
+    index = {d: i for i, d in enumerate(dates)}
+    out = []
+    for f in frames:
+        if f is None or f.empty:
+            out.append(f)
+            continue
+        f = f.copy()
+        f["n"] = pd.DatetimeIndex(f[date_col]).map(index)
+        out.append(f)
+
+    # A handful of ticks, always including the last session -- the right-hand
+    # edge is the one anybody actually looks for.
+    step = max(1, (len(dates) - 1) // max(1, n_ticks - 1))
+    picks = list(range(0, len(dates), step))
+    last = len(dates) - 1
+    if picks[-1] != last:
+        # Replace rather than append when the final tick would land on top of
+        # the previous one: two labels a couple of sessions apart overlap and
+        # read as a mistake.
+        if last - picks[-1] < step / 2:
+            picks[-1] = last
+        else:
+            picks.append(last)
+    spans_years = dates[-1].year != dates[0].year
+    fmt_ = "%b %d %y" if spans_years else "%b %d"
+    expr = " : ".join(f"datum.value === {i} ? '{dates[i].strftime(fmt_)}'"
+                      for i in picks) + " : ''"
+    axis = alt.Axis(values=picks, labelExpr=expr, title=None, labelAngle=0,
+                    grid=False)
+    return out, axis
+
+
 def fmt(v, spec="{:.1f}", dash="—"):
     return dash if v is None or (isinstance(v, float) and pd.isna(v)) else spec.format(v)
 
@@ -799,13 +859,20 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 bars = win.reset_index()
                 bars.columns = [str(c).lower() for c in bars.columns]
 
+        # One index across every layer here. Numbered per layer, a candle at
+        # session 40 and an EMA point at session 40 would be different days
+        # whenever the two frames start on different dates.
+        (price, ema_long, bars), xaxis = session_axis(price, ema_long, bars)
+        xenc = alt.X("n:Q", axis=xaxis, title=None,
+                     scale=alt.Scale(nice=False, zero=False))
+
         yscale = alt.Scale(zero=False, nice=True)
         if bars is not None:
             body_colour = alt.condition(
                 "datum.open <= datum.close",
                 alt.value(CANDLE_UP), alt.value(CANDLE_DN))
             cbase = alt.Chart(bars).encode(
-                x=alt.X("date:T", title=None), color=body_colour,
+                x=xenc, color=body_colour,
                 tooltip=[alt.Tooltip("date:T", title="Date"),
                          alt.Tooltip("open:Q", format=".2f"),
                          alt.Tooltip("high:Q", format=".2f"),
@@ -820,17 +887,18 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
         else:
             line = alt.Chart(price).mark_line(
                 color="#0b0b0b", size=1.7).encode(
-                x=alt.X("date:T", title=None),
+                x=xenc,
                 y=alt.Y("close:Q", title=None, scale=yscale),
                 tooltip=[alt.Tooltip("date:T", title="Date"),
                          alt.Tooltip("close:Q", title="Close", format=".2f")])
         emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
-            x="date:T",
+            x=xenc,
             y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
             color=alt.Color("ema:N", title=None, scale=alt.Scale(
                 domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
                 legend=alt.Legend(orient="top", direction="horizontal")),
-            tooltip=[alt.Tooltip("ema:N", title="Line"),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("ema:N", title="Line"),
                      alt.Tooltip("value:Q", title="Value", format=".2f")])
         layers = [line, emas]
         if not lvl.empty:
@@ -1305,8 +1373,11 @@ with tab_market:
         pd.DataFrame({"date": pulse.index, "value": -pulse["dn4"].astype(int),
                       "cls": [PULSE_LABELS[pulse_class(v, "down")] for v in pulse["dn4"]]}),
     ])
-    chart = alt.Chart(bars).mark_bar().encode(
-        x=alt.X("date:T", title=None),
+    (bars,), pulse_axis = session_axis(bars)
+    chart = alt.Chart(bars).mark_bar(
+        size=max(2.0, 620 / max(len(pulse), 1))).encode(
+        x=alt.X("n:Q", axis=pulse_axis, title=None,
+                scale=alt.Scale(nice=False, zero=False)),
         y=alt.Y("value:Q", title="Number of stocks"),
         color=alt.Color("cls:N", scale=alt.Scale(
             domain=[PULSE_LABELS[k_] for k_ in
@@ -1419,9 +1490,11 @@ with tab_market:
 
     trend = (100.0 * tbl["mli_n"] / tbl["n_stocks"]).rename("pct").reset_index()
     trend.columns = ["date", "pct"]
+    (trend_n,), trend_axis = session_axis(trend.tail(250))
     st.altair_chart(
-        alt.Chart(trend.tail(250)).mark_line(color="#2a4b8d").encode(
-            x=alt.X("date:T", title=None),
+        alt.Chart(trend_n).mark_line(color="#2a4b8d").encode(
+            x=alt.X("n:Q", axis=trend_axis, title=None,
+                    scale=alt.Scale(nice=False, zero=False)),
             y=alt.Y("pct:Q", title="Leaders as % of sample"),
             tooltip=[alt.Tooltip("date:T", title="Date"),
                      alt.Tooltip("pct:Q", title="%", format=".1f")],
