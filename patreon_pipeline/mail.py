@@ -53,9 +53,14 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) patreon-pipeline/1.0"
 _URL_RE = re.compile(r"""https?://[^\s"'<>)\]]+""", re.IGNORECASE)
 
 # The post id is the final run of digits in the path. Patreon serves the same
-# post as /posts/12345678 and /posts/friday-recap-12345678, and both must
-# collapse to the same key or the dedupe does nothing.
-_POST_PATH_RE = re.compile(r"^/posts/(?:.*?-)?(\d+)/?$")
+# post under several shapes -- /posts/12345678, /posts/friday-recap-12345678,
+# and /CreatorName/posts/friday-recap-12345678 (which is what a campaign
+# listing returns) -- and all of them must collapse to the same key or the
+# dedupe does nothing and the sweep re-downloads the archive every run.
+#
+# The leading segments are optional and bounded rather than open-ended: real
+# URLs carry at most a vanity name, or a /c/ or /cw/ prefix plus the vanity.
+_POST_PATH_RE = re.compile(r"^(?:/[\w-]+){0,2}/posts/(?:.*?-)?(\d+)/?$")
 
 _HOST_RE = re.compile(r"^https?://([^/:?#]+)", re.IGNORECASE)
 

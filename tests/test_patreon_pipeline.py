@@ -37,6 +37,29 @@ def test_canonical_post_url_collapses_slug_variants():
         assert mail.canonical_post_url(url) == want, url
 
 
+def test_creator_prefixed_post_urls_canonicalise():
+    """A campaign listing returns /CreatorName/posts/slug-id, not /posts/... .
+    Rejecting that shape made the sweep skip every post it found."""
+    want = "https://www.patreon.com/posts/170231621"
+    for url in (
+        "https://www.patreon.com/KelileoCUP/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/KelileoCUP/posts/shi-chang-guan-170231621?utm_source=x",
+        "https://www.patreon.com/c/KelileoCUP/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/posts/shi-chang-guan-170231621",
+        "https://www.patreon.com/posts/170231621",
+    ):
+        assert mail.canonical_post_url(url) == want, url
+
+
+def test_a_campaign_page_is_not_a_post():
+    """The shape the sweep must keep rejecting -- it is the listing's own
+    address, and queueing it would download the whole campaign as one job."""
+    for url in ("https://www.patreon.com/cw/KelileoCUP",
+                "https://www.patreon.com/c/KelileoCUP",
+                "https://www.patreon.com/KelileoCUP"):
+        assert mail.canonical_post_url(url) is None, url
+
+
 def test_canonical_post_url_rejects_non_posts():
     for url in (
         "https://www.patreon.com/c/somecreator",
