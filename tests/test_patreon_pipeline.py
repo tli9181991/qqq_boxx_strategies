@@ -341,6 +341,19 @@ def test_campaign_listing_prints_the_entry_url_not_the_playlist_url():
         "webpage_url alone returns the campaign URL for every entry"
 
 
+def test_folders_command_is_reachable_and_needs_mail_credentials():
+    """A Gmail label is an IMAP folder, but not always under the name shown in
+    the web UI -- nested labels arrive as "Parent/Child". `folders` prints the
+    real list so the name never has to be guessed."""
+    from patreon_pipeline import runner
+    args = runner.build_parser().parse_args(["folders"])
+    assert args.command == "folders"
+    # It talks to Gmail, so it must be held to the same credential check as
+    # `watch` rather than failing later with a socket error.
+    assert PipelineConfig().validate(need_mail=True), \
+        "a config with no IMAP credentials should report problems"
+
+
 def test_sweep_without_campaigns_is_an_error_not_a_quiet_success():
     """A sweep that swept nothing did not do its job. Returning success for it
     hides the usual cause -- a config file that is not being read at all."""
