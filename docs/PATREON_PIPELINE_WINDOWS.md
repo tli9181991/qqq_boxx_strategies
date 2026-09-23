@@ -48,14 +48,23 @@ Scheduled Tasks that mirror the systemd units one-for-one:
 
 | Task | Schedule | Linux equivalent |
 | --- | --- | --- |
-| `PatreonPipeline-Watch` | at logon, restart every 1 min on failure | `patreon-watch.service` |
-| `PatreonPipeline-Work` | at logon, restart every 5 min on failure | `patreon-work.service` |
+| `PatreonPipeline-Watch` | at logon, re-checked every 5 min | `patreon-watch.service` |
+| `PatreonPipeline-Work` | at logon, re-checked every 5 min | `patreon-work.service` |
 | `PatreonPipeline-Sweep` | every 6 hours | `patreon-sweep.timer` |
 | `PatreonPipeline-Probe` | daily at 09:00 | `patreon-probe.timer` |
 
-Task Scheduler's restart-on-failure stands in for `Restart=always`. The
-intervals differ on purpose: the worker exits 3 when the Patreon session has
-expired, and retrying that every minute would just fill the log.
+The stand-in for `Restart=always` is a **repetition on the trigger**, not Task
+Scheduler's restart-on-failure. Restart-on-failure only fires on what Task
+Scheduler classes as a failure, which misses a process that simply went away;
+a repetition fires regardless. `MultipleInstances=IgnoreNew` discards a tick
+that lands while the task is still running, so a five-minute repetition reads
+as "start it if it is not running".
+
+That also sidesteps a real trap: `RestartInterval` can only be assigned onto
+the settings object after it is built, and that path serialises the TimeSpan
+into a form the task XML schema rejects — `Register-ScheduledTask` fails with
+*"The task XML contains a value which is incorrectly formatted or out of
+range"*.
 
 Then the five things the installer cannot do for you:
 
