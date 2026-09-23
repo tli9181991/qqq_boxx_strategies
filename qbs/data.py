@@ -153,6 +153,30 @@ MARKET_CLOSE = (16, 0)            # 16:00 ET, the regular-session close
 BAR_SETTLE = pd.Timedelta(minutes=60)
 
 
+def normalise_symbols(symbols) -> "pd.Series":
+    """Provider spellings turned into the one yfinance wants.
+
+    Two substitutions, both to a dash, and each has cost a download:
+
+    * ``.`` -- a share class. Finviz and Wikipedia write ``BRK.B``; Yahoo
+      wants ``BRK-B``.
+    * ``/`` -- a preferred series. The screener writes ``ORCL/PD``; Yahoo
+      wants ``ORCL-PD``. Left alone it 404s as "possibly delisted; no
+      timezone found", which reads like a dead company rather than a
+      misspelled symbol, and there is one of these per issuer so they arrive
+      in batches.
+
+    One function rather than the same two-line chain in every provider,
+    because a normalisation that only three of four callers apply produces
+    keys that do not match the same price frame -- and the symptom is a name
+    silently missing from a universe, not an error.
+    """
+    return (pd.Series(list(symbols), dtype="object").astype(str).str.strip()
+            .str.upper()
+            .str.replace(".", "-", regex=False)
+            .str.replace("/", "-", regex=False))
+
+
 def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
                       lookback: int = 20) -> Tuple[pd.DataFrame, List[pd.Timestamp]]:
     """Remove trailing rows the provider had not finished publishing.

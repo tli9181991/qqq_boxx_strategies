@@ -3686,3 +3686,39 @@ def test_the_tradingview_provider_does_not_apply_the_momentum_rule():
     assert "col(\"Perf" not in src and "col('Perf" not in src
     # It filters on membership and liquidity only.
     assert "average_volume_90d_calc" in src, "the AVERAGE, as Finviz does"
+
+
+def test_symbol_normalisation_covers_classes_and_preferreds():
+    """Two substitutions, both to a dash, and each has cost a download.
+
+    `.` is a share class (BRK.B). `/` is a preferred series: the screener
+    returns ORCL/PD and Yahoo wants ORCL-PD, and left alone it 404s as
+    "possibly delisted; no timezone found" -- which reads like a dead company
+    rather than a misspelled symbol, so it gets diagnosed as a data problem.
+    """
+    from qbs.data import normalise_symbols
+
+    got = list(normalise_symbols(
+        ["brk.b", "ORCL/PD", "HPE/PC", " aapl ", "BF.B", "MSFT"]))
+    assert got == ["BRK-B", "ORCL-PD", "HPE-PC", "AAPL", "BF-B", "MSFT"]
+    assert list(normalise_symbols([])) == []
+
+
+def test_every_universe_provider_normalises_the_same_way():
+    """A normalisation only some providers apply produces keys that do not
+    match the same price frame, and the symptom is a name silently missing
+    from a universe rather than an error."""
+    from qbs.data import normalise_symbols
+    from qbs.tradingview import _shape
+
+    raw = pd.DataFrame({"name": ["BRK.B", "ORCL/PD", "aapl"],
+                        "sector": ["Finance", "Tech", "Tech"],
+                        "industry": ["x", "y", "z"],
+                        "country": ["US", "US", "US"]})
+    assert list(_shape(raw)["Ticker"]) == ["BRK-B", "ORCL-PD", "AAPL"]
+
+    # And nobody keeps a private copy of the chain any more.
+    for mod in ("qbs/finviz.py", "qbs/tradingview.py", "qbs/universe.py"):
+        src = Path(mod).read_text(encoding="utf-8")
+        assert 'str.replace(".", "-"' not in src, f"{mod} still rolls its own"
+        assert "normalise_symbols" in src, f"{mod} does not normalise at all"

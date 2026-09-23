@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from .data import normalise_symbols
 from .finviz import CACHE_DIR, UniverseFilters
 
 UNIVERSE_CSV = os.path.join(CACHE_DIR, "tradingview_universe.csv")
@@ -161,9 +162,10 @@ def _shape(df: pd.DataFrame) -> pd.DataFrame:
     ("NASDAQ:AAPL"); this takes `name` and falls back to the tail of
     `ticker`, because which of the two a version returns has moved before.
 
-    Dots become dashes (BRK.B -> BRK-B), the same normalisation the Finviz
-    side applies, because that is the spelling yfinance wants and the two
-    universes have to produce keys that match the same price frame.
+    Symbols go through `normalise_symbols`, the same one the Finviz side
+    applies -- dots and slashes both become dashes -- because that is the
+    spelling yfinance wants and the two universes have to produce keys that
+    match the same price frame.
     """
     out = pd.DataFrame()
     if "name" in df.columns:
@@ -173,8 +175,7 @@ def _shape(df: pd.DataFrame) -> pd.DataFrame:
     else:
         raise RuntimeError(f"no symbol column in {list(df.columns)[:8]}")
 
-    out["Ticker"] = (out["Ticker"].str.strip().str.upper()
-                     .str.replace(".", "-", regex=False))
+    out["Ticker"] = normalise_symbols(out["Ticker"]).values
     for src, dst in (("sector", "Sector"), ("industry", "Industry"),
                      ("country", "Country")):
         if src in df.columns:

@@ -74,6 +74,8 @@ def fetch_ndx(timeout: int = 20) -> List[str]:
     """
     import pandas as pd  # noqa: F811
 
+    from .data import normalise_symbols
+
     url = "https://en.wikipedia.org/wiki/Nasdaq-100"
     tables = pd.read_html(url)
     for t in tables:
@@ -81,8 +83,7 @@ def fetch_ndx(timeout: int = 20) -> List[str]:
         for key in ("ticker", "symbol"):
             if key in cols:
                 col = [c for c in t.columns if str(c).strip().lower() == key][0]
-                syms = (t[col].astype(str).str.strip().str.upper()
-                        .str.replace(".", "-", regex=False))
+                syms = normalise_symbols(t[col])
                 syms = [s for s in syms if s.isascii() and 1 <= len(s) <= 6]
                 if len(syms) >= 90:
                     return sorted(set(syms))

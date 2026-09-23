@@ -54,6 +54,7 @@ import pandas as pd
 
 from .config import DOWNLOAD_START
 from .data import (MARKET_CLOSE, MARKET_TZ, drop_partial_bars,
+                   normalise_symbols,
                    last_market_close, next_market_close,
                    sessions_behind)
 
@@ -322,8 +323,7 @@ def fetch_us_universe(
             raise RuntimeError(f"no Ticker column in {list(df.columns)[:8]}")
 
         out = df[keep].copy()
-        out["Ticker"] = (out["Ticker"].astype(str).str.strip().str.upper()
-                         .str.replace(".", "-", regex=False))
+        out["Ticker"] = normalise_symbols(out["Ticker"]).values
         out = out.drop_duplicates(subset="Ticker").reset_index(drop=True)
 
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
