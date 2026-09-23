@@ -4126,3 +4126,113 @@ def test_screener_quotes_are_shaped_and_normalised():
     assert list(out.index) == ["BRK-B", "ORCL-PD", "AAPL"], "normalised, deduped"
     assert float(out.at["AAPL", "close"]) == 3.0
     assert "BAD" not in out.index, "a quote with no price is not a quote"
+
+
+# ==========================================================================
+# The dashboard's third book
+# ==========================================================================
+
+def _dashboard_ast():
+    """`dashboard/app.py` parsed, never imported.
+
+    Importing it would run a Streamlit script top to bottom -- downloads,
+    widgets and all -- so the checks below read the source instead. That is
+    enough for the failures they are about, which are all wiring.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parent.parent
+    return ast.parse((root / "dashboard" / "app.py").read_text(encoding="utf-8"))
+
+
+def _tuple_strings(node):
+    import ast
+
+    return [e.value for e in node.elts
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+
+
+def test_the_residual_band_survives_every_book_size_the_dashboard_offers():
+    """The band is a WIDTH, and carrying it over as a rank would be a crash.
+
+    `ResidualMomentumParams` ships (n_hold=6, exit_rank=10): a band four ranks
+    wide. The dashboard runs the book ten deep, and reusing the number 10
+    there would mean a band of zero -- every name round-tripped the moment it
+    wobbled -- while anything deeper than ten would raise outright, taking the
+    whole page down. So the dashboard adds the width, and this pins that the
+    width works across the entire range its control allows.
+    """
+    p = ResidualMomentumParams()
+    band = p.exit_rank - p.n_hold
+    assert band > 0, "a band of zero is a round-trip machine, not a band"
+
+    for n in range(1, 31):          # the number_input's range
+        q = ResidualMomentumParams(n_hold=n, exit_rank=n + band)
+        assert q.exit_rank - q.n_hold == band, n
+
+    # What carrying the number over instead would do, at the two sizes that
+    # show both halves of it: a silent band of zero at ten slots, and a hard
+    # ValueError at eleven. Neither is a thing to ship, and the second would
+    # take the page down rather than merely trade badly.
+    flat = ResidualMomentumParams(n_hold=p.exit_rank, exit_rank=p.exit_rank)
+    assert flat.exit_rank - flat.n_hold == 0, "the silent half of the bug"
+    try:
+        ResidualMomentumParams(n_hold=p.exit_rank + 1, exit_rank=p.exit_rank)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a negative band should still be rejected")
+
+
+def test_momentum_label_reads_the_residual_params_too():
+    """The two books run different lookbacks, and both headers say which.
+
+    The dashboard names the residual column with `momentum_label` applied to
+    `ResidualMomentumParams`, which works because the helper only ever reads
+    the two lookback fields. If it grew an isinstance check the column would
+    start claiming the total-return book's window, which is the exact kind of
+    quiet mislabelling `momentum_label` exists to prevent.
+    """
+    from qbs.breadth import momentum_label
+
+    resid = momentum_label(ResidualMomentumParams())
+    assert resid == "12-1", resid
+    assert resid != momentum_label(MomentumParams()), (
+        "the two books would be labelled with the same window")
+
+
+def test_the_picks_tab_and_the_selection_builder_agree_on_the_books():
+    """Three lists of strategy keys, one KeyError if they drift.
+
+    `build_selections` writes the frames, `strategy_labels` names them and the
+    picks tab iterates them into columns. A key added to one and not the
+    others is not caught by anything else here — it surfaces as a KeyError on
+    a running dashboard, which is to say on somebody's screen.
+    """
+    import ast
+
+    tree = _dashboard_ast()
+
+    built = labelled = columns = None
+    for node in ast.walk(tree):
+        # `for key, sig in (("momentum", mom), ("resmom", res), ...)`.
+        # Matched on the loop variables too, so an unrelated tuple-of-tuples
+        # loop added later cannot shadow this one and fail the test for a
+        # reason its message would not explain.
+        if (isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
+                and isinstance(node.target, ast.Tuple)
+                and [getattr(t, "id", None) for t in node.target.elts]
+                    == ["key", "sig"]):
+            built = [e.elts[0].value for e in node.iter.elts]
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "strategy_labels"):
+            ret = next(n for n in ast.walk(node) if isinstance(n, ast.Return))
+            labelled = [k.value for k in ret.value.keys]
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Tuple)
+                and any(getattr(t, "id", None) == "books" for t in node.targets)):
+            columns = _tuple_strings(node.value)
+
+    assert built and labelled and columns, (built, labelled, columns)
+    assert set(built) == set(labelled) == set(columns), (
+        f"built {built}, labelled {labelled}, rendered {columns}")
+    assert "resmom" in built, "the residual book is not wired in"

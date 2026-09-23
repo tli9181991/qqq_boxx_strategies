@@ -4,9 +4,10 @@
 
 Four tabs:
 
-* **Daily picks** -- what each of the two selection strategies held on each
+* **Daily picks** -- what each of the three selection strategies held on each
   day, with the entries and exits that changed it. The momentum book ranks the
-  universe and is always invested; the high-momentum screen applies an
+  universe and is always invested; the residual book ranks the same universe
+  on what the market cannot explain; the high-momentum screen applies an
   absolute bar and can hold almost nothing.
 * **Market overview** -- the breadth monitor: 4% movers, percent holding the
   moving averages, index stretch in ATR units, and the momentum-leader group.
@@ -46,7 +47,7 @@ from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
                          sector_leaders)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
-                        MomentumParams)
+                        MomentumParams, ResidualMomentumParams)
 from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
                       load_prices, sessions_behind)
 from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
@@ -57,7 +58,7 @@ from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
 from qbs.shadow import parse_watchlist, watchlist_rows
-from qbs.strategies import cross_sectional_momentum
+from qbs.strategies import cross_sectional_momentum, residual_momentum
 from qbs.universe import load_universe, load_universe_prices
 
 st.set_page_config(page_title="Strategy picks / Market overview", layout="wide",
@@ -76,13 +77,42 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
 PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
               "light_red": DN, "dark_red": DN_STRONG, "none": ""}
 
-# Both counts come from the config rather than the string, for the same reason
-# the lookback does: they have each moved once already, and a header claiming
-# the old value is a quiet lie on every screenshot.
-STRATEGY_LABELS = {
-    "momentum": f"Top-{Config().momentum.n_hold} NDX momentum ({momentum_label()})",
-    "finviz": f"Top-{FinvizScreenParams().n_hold} high momentum screen",
-}
+# How many slots the residual book runs here. The research default is six,
+# the same as its total-return sibling, because the point of that comparison
+# is that ONLY the score differs. This dashboard runs it deeper on purpose:
+# the residual score is a risk-adjusted one and its whole claim is that the
+# names it picks are less alike, so ten slots of it is not ten times the same
+# bet the way ten momentum slots would be. See docs/RESIDUAL_MOMENTUM.md.
+RESID_N_HOLD = 10
+# The band, kept as a WIDTH rather than an absolute rank. `exit_rank` is how
+# far a held name may slip before it is sold, and the sweep that validated it
+# varied the pair together -- carrying the number 10 over to a ten-name book
+# would be a band of zero, i.e. a round-trip every time a name wobbles.
+RESID_BAND = (ResidualMomentumParams().exit_rank
+              - ResidualMomentumParams().n_hold)
+
+
+def strategy_labels(n_mom: int, n_screen: int, n_resid: int) -> Dict[str, str]:
+    """The three book names, counting the slots each one is actually running.
+
+    Every count is derived, never written out, for the same reason the
+    lookback is: each of these has already moved once, and a header claiming
+    the old value is a quiet lie on every screenshot. They read the live
+    sidebar values rather than the config defaults, because the sidebar is
+    what built the book on screen.
+    """
+    return {
+        "momentum": f"Top-{n_mom} NDX momentum ({momentum_label()})",
+        "resmom": (f"Top-{n_resid} residual momentum "
+                   f"({momentum_label(ResidualMomentumParams())})"),
+        "finviz": f"Top-{n_screen} high momentum screen",
+    }
+
+
+# The defaults, so anything importing this module before the sidebar renders
+# still has a name for each book. Rebuilt from the sidebar further down.
+STRATEGY_LABELS = strategy_labels(
+    Config().momentum.n_hold, FinvizScreenParams().n_hold, RESID_N_HOLD)
 PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
                 "up": f"Up 4% < {BreadthParams().pulse_strong}",
                 "down": f"Down 4% < {BreadthParams().pulse_strong}",
@@ -204,8 +234,9 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
 
 
 @st.cache_data(show_spinner="Building selections…")
-def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
-                     exit_rank: int, n_screen: int,
+def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
+                     n_hold: int, exit_rank: int, n_screen: int,
+                     n_resid: int,
                      bar_epoch: str = "") -> Dict[str, pd.DataFrame]:
     """Daily holdings for each strategy, plus whether the volume leg ran.
 
@@ -213,6 +244,11 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
     cannot apply rather than skipping one, so this either supplies volumes or
     opts out explicitly -- and the caller has to be told which, because
     without the leg the screen is more permissive than its own definition.
+
+    `_market` is the factor the residual book regresses against -- QQQ, the
+    same series the breadth monitor uses. It is passed in rather than read
+    here so this function keeps taking every price it needs from its caller,
+    which is what makes the cache key honest.
     """
     from qbs.config import MomentumParams
     from qbs.universe import load_universe_volumes
@@ -221,6 +257,16 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
 
     mom = cross_sectional_momentum(
         _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
+
+    # Same universe, same safe asset, same slot machinery, same absolute
+    # filter against BOXX -- only the score it sorts on differs. That is the
+    # whole point of the strategy, and it is also why the two columns can be
+    # read side by side: anything they disagree about is the market component
+    # of the ranking, and nothing else.
+    res = residual_momentum(
+        _uni, _safe, _market,
+        ResidualMomentumParams(n_hold=n_resid,
+                               exit_rank=n_resid + RESID_BAND))
 
     vols = load_universe_volumes(list(_uni.columns))
     volume_applied = vols is not None and not vols.empty
@@ -231,7 +277,7 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, n_hold: int,
         vols, screen = None, FinvizScreenParams(n_hold=n_screen, min_volume=None)
     fin = finviz_momentum_screen(_uni, _safe, screen, volumes=vols)
 
-    for key, sig in (("momentum", mom), ("finviz", fin)):
+    for key, sig in (("momentum", mom), ("resmom", res), ("finviz", fin)):
         ev = sig.events
         rows = []
         for d, names in sig.holdings_log.items():
@@ -565,6 +611,15 @@ n_screen = st.sidebar.number_input(
     help="How many names the high-momentum screen ranks down to. On the "
          "Nasdaq-100 universe fewer than this usually qualify, so the column "
          "shows everyone who passed.")
+n_resid = st.sidebar.number_input(
+    "Residual book size", 1, 30, RESID_N_HOLD,
+    help="Slots in the residual-momentum book. It gets its own control "
+         "rather than sharing n_hold because it is run deeper here than its "
+         f"total-return sibling: its band follows at +{RESID_BAND}.")
+
+# Now that every slot count is known, name each book after the one it is
+# actually running rather than after the config default.
+STRATEGY_LABELS = strategy_labels(int(n_hold), int(n_screen), int(n_resid))
 
 # Loaded here, not with the Analyst settings further down, because the
 # default below reads the environment and this box is rendered first. The
@@ -695,7 +750,8 @@ st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
                     "warn": f"⚠️ {N_BEHIND} sessions behind"}[FRESH_LEVEL])
 
 selections, SCREEN_VOLUME_APPLIED = build_selections(
-    uni, px["BOXX"], int(n_hold), int(exit_rank), int(n_screen), BAR_EPOCH)
+    uni, px["BOXX"], px["QQQ"], int(n_hold), int(exit_rank), int(n_screen),
+    int(n_resid), BAR_EPOCH)
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH)
 
 def names_on(key: str, when) -> list:
@@ -1127,9 +1183,29 @@ with tab_picks:
     asof = st.select_slider("Date", options=dates, value=dates[-1],
                             format_func=lambda d: f"{d:%Y-%m-%d}")
 
-    cols = st.columns([1, 1, 2.6])
+    # Three books, so the panel is narrower than it was -- but each column
+    # holds one short ticker list, and splitting them across two rows would
+    # put the chart out of eyeshot of the names it is meant to explain.
+    books = ("momentum", "resmom", "finviz")
+    cols = st.columns([1, 1, 1, 3])
+    RP = ResidualMomentumParams()
+    # The long "why" lives in a metric tooltip rather than under the header:
+    # three columns is narrow enough that a paragraph there would push this
+    # book's ticker table a screenful below its neighbours', and the tables
+    # are what the panel is for.
+    BOOK_HELP = {
+        "resmom": (
+            "Same universe, same slot machinery, same hysteresis rule and "
+            f"the same absolute filter against {RP.safe_asset} as the "
+            "momentum book — the only thing that differs is what the "
+            "ranking sorts on. So "
+            "whatever these two columns disagree about is the market "
+            "component of the score, and nothing else. Run deeper than its "
+            "sibling because a residual score is meant to pick names that "
+            "are less alike; see docs/RESIDUAL_MOMENTUM.md."),
+    }
     picks: Dict[str, set] = {}
-    for col, key in zip(cols[:2], ("momentum", "finviz")):
+    for col, key in zip(cols[:3], books):
         frame = selections[key]
         row = frame.loc[asof] if asof in frame.index else None
         raw = row["holdings"] if row is not None and row["holdings"] else ""
@@ -1137,7 +1213,13 @@ with tab_picks:
         picks[key] = set(names)
         with col:
             st.markdown(f"**{STRATEGY_LABELS[key]}**")
-            st.metric("Names held", len(names))
+            st.metric("Names held", len(names), help=BOOK_HELP.get(key))
+            if key == "resmom":
+                st.caption(md(
+                    f"{int(n_resid)} slots, band +{RESID_BAND} · "
+                    f"{momentum_label(RP)} momentum of each return **net of "
+                    f"a {RP.beta_window}-day beta to {RP.market_asset}**, "
+                    "over that residual's own vol."))
             if key == "finviz":
                 # Say it here rather than leaving someone to wonder why a
                 # "top-20" shows 6 names.
@@ -1168,18 +1250,36 @@ with tab_picks:
                 st.caption(f"🔴 Sold: {row['sells']}")
 
     # ---- right-hand panel: price, EMAs and the levels that matter ---------
-    with cols[2]:
+    with cols[3]:
         universe_names = list(uni.columns)
         picked = sorted(set().union(*picks.values()))
         options = picked + [t for t in universe_names if t not in picked]
         price_panel(uni, px, asof, options, int(n_hold), "picks")
 
-    common = picks["momentum"] & picks["finviz"]
-    st.markdown(
-        f"**Held by both books:** "
-        f"{', '.join(sorted(common)) if common else 'no overlap'} "
-        f"({len(common)} of {len(picks['momentum']) or '—'} momentum names)"
-    )
+    # ---- what the books agree on -----------------------------------------
+    # One "held by both" line stopped being answerable at three books: it no
+    # longer says which two. The pairs are listed instead, momentum ∩
+    # residual first, because that pair shares its universe, its slots and
+    # its engine -- what it does NOT share is exactly what removing the
+    # market component from the score changed, and nothing else.
+    SHORT = {"momentum": "momentum", "resmom": "residual", "finviz": "screen"}
+    st.markdown("**Held in common**")
+    ov = st.columns(4)
+    for c, (a, b) in zip(ov, (("momentum", "resmom"), ("momentum", "finviz"),
+                              ("resmom", "finviz"))):
+        both = picks[a] & picks[b]
+        smaller = min(len(picks[a]), len(picks[b]))
+        with c:
+            st.caption(md(
+                f"**{SHORT[a]} ∩ {SHORT[b]}** — "
+                + (", ".join(sorted(both)) if both else "no overlap")
+                + f" ({len(both)} of {smaller or '—'})"))
+    with ov[3]:
+        all3 = picks["momentum"] & picks["resmom"] & picks["finviz"]
+        st.caption(md(
+            "**all three** — "
+            + (", ".join(sorted(all3)) if all3 else "no overlap")
+            + f" ({len(all3)})"))
 
     # ---- watchlist: where a name places, without the book buying it -----
     st.divider()

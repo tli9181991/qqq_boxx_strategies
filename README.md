@@ -958,10 +958,20 @@ streamlit run dashboard/app.py
 
 Two tabs:
 
-- **Daily picks** — what each of the two selection strategies held on any chosen day,
-  the entries and exits that changed it, how many names they hold in common, and a
+- **Daily picks** — what each of the three selection strategies held on any chosen day,
+  the entries and exits that changed it, how many names each pair holds in common, and a
   downloadable history table. A chart panel on the right plots any name with its
   10/20/50/200-day EMAs and the nearest support and resistance levels.
+
+  The middle column is the **residual-momentum book** ([`docs/RESIDUAL_MOMENTUM.md`](docs/RESIDUAL_MOMENTUM.md)),
+  run ten slots deep rather than six. It shares the momentum book's universe, slot
+  machinery, hysteresis rule and absolute filter against BOXX, so the only thing that
+  differs is what the ranking sorts on — which is what makes the two columns readable
+  side by side: whatever they disagree about is the market component of the score and
+  nothing else. It is run deeper because a residual score is meant to pick names that are less
+  alike, so ten of its slots are not ten copies of one bet the way ten momentum slots
+  would be. Its band follows the size (`+4`, the width the research validated) rather
+  than being carried over as an absolute rank.
 
   The levels are re-derived **from history up to the selected date only** — the same
   causal rule `candidate_trades` uses, so the chart never draws a line the strategy
