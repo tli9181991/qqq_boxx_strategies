@@ -21,8 +21,9 @@ import numpy as np
 import pandas as pd
 
 from .config import (
-    BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams, MomentumParams, RSI2Params,
-    SAFE_ASSET, TRADING_DAYS, VixBreakerParams, VolTargetParams,
+    BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams,
+    MomentumParams, RSI2Params, ResidualMomentumParams, SAFE_ASSET,
+    TRADING_DAYS, VixBreakerParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
 
@@ -377,6 +378,25 @@ def cross_sectional_momentum(
     Anything that cannot be filled -- too few eligible names, or (with
     `absolute_filter`) too few names beating the safe asset -- goes to cash in
     the safe asset rather than being force-allocated into a falling stock.
+
+    The correlation cap
+    -------------------
+    With `params.max_corr` set, a candidate is skipped when its trailing
+    correlation with a name already chosen exceeds the cap. The rank decides
+    which names are strong; the cap decides whether the book is holding six
+    bets or one bet six times. Momentum is a trend signal, so the names
+    trending hardest at any moment tend to be one sector -- on the cached
+    window the unconstrained book ran a mean pairwise correlation of 0.43,
+    about 1.9 independent bets across its 6 slots.
+
+    Held names are NOT re-tested against the cap: the band already decides
+    what is held, and re-testing would evict a name for the sin of being
+    correlated with something bought after it. The cap gates entry only.
+
+    The estimate is strictly causal -- the correlation matrix at date `t` is
+    built from returns up to and including `t`, then used to pick weights
+    that the engine lags again before trading.
+
     """
     p = params or MomentumParams()
 
@@ -411,6 +431,10 @@ def cross_sectional_momentum(
     else:
         vol = None
 
+    # Only computed when the cap is on: on a 100-name universe this is the
+    # one part of the loop that is not O(1) per date.
+    corr_rets = px.pct_change() if p.max_corr is not None else None
+
     # Rebalance calendar.
     if p.rebalance == "daily":
         rebal_dates = list(px.index)
@@ -436,6 +460,8 @@ def cross_sectional_momentum(
             cand = row[ok].dropna()
 
             if p.absolute_filter:
+                # Always on 12-1 vs the safe asset, even when ranking on
+                # something else -- see the docstring.
                 hurdle = safe_mom.loc[dt]
                 if not np.isnan(hurdle):
                     # Filter on momentum, order by the score. With the default
@@ -463,22 +489,58 @@ def cross_sectional_momentum(
                         score=float(row.get(t, np.nan)),
                     ))
 
+            # With the cap on, the correlation matrix is computed once per
+            # rebalance over the top `corr_pool` candidates -- not per
+            # candidate, and never over the whole universe.
+            cmat = None
+            if corr_rets is not None and len(keep) < p.n_hold:
+                # The pool is the candidates a slot may reach PLUS whatever is
+                # already held. A name kept by the band can sit below
+                # `corr_pool` in the ranking, and leaving it out would let a
+                # new pick be accepted without ever being tested against it.
+                pool = list(dict.fromkeys(list(order.index[:p.corr_pool]) + keep))
+                pool = [t for t in pool if t in corr_rets.columns]
+                if pool:
+                    win = corr_rets.loc[:dt, pool].tail(p.corr_window)
+                    if len(win) >= max(2, p.corr_window // 2):
+                        cmat = win.corr()
+
             for t in order.index:
                 if len(keep) >= p.n_hold:
                     break
-                if t not in keep:
-                    keep.append(t)
-                    events.append(dict(
-                        date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
-                        # The label names the actual lookback, so changing the
-                        # parameter cannot leave the log claiming 12-1 while
-                        # the ranker scores something else.
-                        reason=(f"rank {rank[t]:.0f}, "
-                                f"{p.lookback_months:g}-{p.skip_months:g} mom "
-                                f"{order[t]:+.1%}"),
-                        rank=float(rank[t]),
-                        score=float(order[t]),
-                    ))
+                if t in keep:
+                    continue
+                if cmat is not None and t in cmat.index:
+                    # Reject a name too close to something already chosen.
+                    # A NaN correlation (a name with too little overlapping
+                    # history) is not evidence of independence, but it is not
+                    # evidence against it either -- it is allowed through, and
+                    # `min_history` is what keeps those rare.
+                    too_close = next(
+                        (u for u in keep
+                         if u in cmat.columns
+                         and not np.isnan(cmat.at[t, u])
+                         and cmat.at[t, u] > p.max_corr),
+                        None,
+                    )
+                    if too_close is not None:
+                        continue
+                keep.append(t)
+                events.append(dict(
+                    date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
+                    # The label names the actual lookback, so changing the
+                    # parameter cannot leave the log claiming 12-1 while
+                    # the ranker scores something else. When a caller supplies
+                    # its own score the number is not a return at all, so it is
+                    # reported as a score rather than mislabelled as momentum.
+                    reason=(f"rank {rank[t]:.0f}, "
+                            f"{p.lookback_months:g}-{p.skip_months:g} mom "
+                            f"{order[t]:+.1%}"
+                            if score is None else
+                            f"rank {rank[t]:.0f}, score {order[t]:+.2f}"),
+                    rank=float(rank[t]),
+                    score=float(order[t]),
+                ))
             held = keep
             # The rank each held name survived at, recorded where it is known
             # exactly. Recomputing this outside the loop would mean redoing the
@@ -529,6 +591,112 @@ def cross_sectional_momentum(
     sig.held_ranks = held_ranks
     sig.rank_log = rank_log or None
     sig.momentum = mom
+    return sig
+
+
+# ==========================================================================
+# 4b. Residual momentum -- rank on what the market cannot explain
+# ==========================================================================
+
+def residual_momentum_score(
+    universe_prices: pd.DataFrame,
+    market: pd.Series,
+    params: Optional[ResidualMomentumParams] = None,
+) -> pd.DataFrame:
+    """The ranking score: 12-1 momentum of market-model residuals.
+
+    For each name, a rolling single-factor regression against `market` gives a
+    beta; the residual stream is the return the market does not explain. The
+    score sums those residuals over the 12-1 formation window and (by default)
+    divides by their own standard deviation, which is the construction in
+    Blitz, Huij & Martens -- a t-statistic on idiosyncratic drift rather than a
+    return.
+
+    Causality
+    ---------
+    Beta at date `t` uses returns up to and including `t`; the formation window
+    is shifted by `skip_months` so it ends a month before `t`. Every input is
+    strictly in the past, and the engine lags the resulting weights again.
+    """
+    p = params or ResidualMomentumParams()
+    look = int(round(p.lookback_months * 21))
+    skip = int(round(p.skip_months * 21))
+    bw, half = p.beta_window, max(2, p.beta_window // 2)
+
+    r = universe_prices.pct_change()
+    rm = market.pct_change().reindex(r.index)
+
+    # Rolling single-factor beta. `.cov(rm)` broadcasts the Series across
+    # columns, so this is one pass rather than one regression per name.
+    var_m = rm.rolling(bw, min_periods=half).var()
+    beta = r.rolling(bw, min_periods=half).cov(rm).div(var_m, axis=0)
+
+    resid = r.sub(beta.mul(rm, axis=0))
+    # Blitz et al. score the residual net of the regression intercept, so the
+    # rolling mean comes out: what is left is drift the market did not cause
+    # and the name's own average did not either.
+    resid = resid.sub(resid.rolling(bw, min_periods=half).mean())
+
+    win = look - skip
+    lagged = resid.shift(skip)
+    score = lagged.rolling(win, min_periods=max(2, win // 2)).sum()
+    if p.standardise:
+        sd = lagged.rolling(win, min_periods=max(2, win // 2)).std()
+        # A name the market explains PERFECTLY has no residual, so this is a
+        # 0/0: the sum and the deviation are both floating-point dust and
+        # their ratio is arbitrarily large with an arbitrary sign. That is not
+        # a strong idiosyncratic signal, it is the absence of one, so such a
+        # name is made unrankable rather than allowed to top the book. Real
+        # equities never get this close to zero; index-tracking duplicates and
+        # synthetic fixtures do.
+        score = score.div(sd.where(sd > p.resid_vol_floor))
+    return score
+
+
+def residual_momentum(
+    universe_prices: pd.DataFrame,
+    safe_prices: pd.Series,
+    market: pd.Series,
+    params: Optional[ResidualMomentumParams] = None,
+    eligible: Optional[pd.DataFrame] = None,
+    name: str = "resmom",
+) -> StrategySignals:
+    """The Top-N book, ranked on residual rather than total momentum.
+
+    Same six slots, same hysteresis band, same absolute filter against BOXX,
+    same cash leg -- the ONLY thing that changes is what the ranking sorts on.
+    That is deliberate: held against `cross_sectional_momentum` on the same
+    universe and the same engine, the difference can only be the score.
+
+    Why bother. Total-return momentum ranks a name highly partly for having a
+    large beta in a rising market, so it selects the crowded trade and the six
+    slots collapse into one bet -- measured at 1.9 effective positions on the
+    cached window. Ranking on residuals raises that to 2.2 without any explicit
+    diversification constraint, because the thing that made the names identical
+    has been removed from the score itself.
+
+    Read `docs/RESIDUAL_MOMENTUM.md` before trusting the numbers: it passes the
+    paired-across-the-surface test that several better-looking candidates
+    failed, but it still inherits the lab's survivorship bias and its sample is
+    still 20 months long.
+    """
+    p = params or ResidualMomentumParams()
+    score = residual_momentum_score(universe_prices, market, p)
+
+    # The slot machinery, the band, the absolute filter and the correlation
+    # cap all live in one place; this only swaps the score it sorts on.
+    mp = MomentumParams(
+        lookback_months=p.lookback_months, skip_months=p.skip_months,
+        n_hold=p.n_hold, exit_rank=p.exit_rank, rebalance=p.rebalance,
+        absolute_filter=p.absolute_filter, safe_asset=p.safe_asset,
+        min_history=p.min_history, max_corr=p.max_corr,
+        corr_window=p.corr_window, corr_pool=p.corr_pool,
+    )
+    sig = cross_sectional_momentum(
+        universe_prices, safe_prices, mp, eligible=eligible, name=name,
+        score=score,
+    )
+    sig.params = p.__dict__.copy()
     return sig
 
 

@@ -75,6 +75,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="skip the Finviz screen strategy")
     p.add_argument("--sweep-target-vol", action="store_true",
                    help="also print the book vol-target sensitivity table")
+    p.add_argument("--beta-window", type=int, default=None,
+                   help="residual momentum: trailing days behind the market-model "
+                        "beta (default 252; the plateau runs 126-504)")
+    p.add_argument("--no-standardise-resid", dest="standardise_resid",
+                   action="store_false", default=True,
+                   help="residual momentum: score the raw cumulative residual "
+                        "instead of dividing by its own vol (NOT the paper's rule)")
+    p.add_argument("--no-resmom", dest="resmom", action="store_false", default=True,
+                   help="skip the residual-momentum book")
+    p.add_argument("--max-corr", type=float, default=None,
+                   help="momentum: refuse a candidate whose trailing correlation "
+                        "with a name already held exceeds this (off by default)")
+    p.add_argument("--sweep-corr-cap", action="store_true",
+                   help="also print the correlation-cap table (read 'Eff. bets' "
+                        "and vol, not CAGR)")
     p.add_argument("--synthetic", action="store_true", help="use generated prices, no network")
     p.add_argument("--offline", action="store_true", help="use only the CSV cache")
     p.add_argument("--refresh", action="store_true", help="re-download, ignoring the cache")
@@ -116,6 +131,16 @@ def main(argv=None) -> int:
         cfg.momentum.exit_rank = args.exit_rank
     if args.rebalance is not None:
         cfg.momentum.rebalance = args.rebalance
+    if args.max_corr is not None:
+        cfg.momentum.max_corr = args.max_corr
+    if args.beta_window is not None:
+        cfg.resmom.beta_window = args.beta_window
+    cfg.resmom.standardise = args.standardise_resid
+    # The residual book mirrors the momentum book's slot geometry, so the
+    # shared CLI flags move both rather than silently desynchronising them.
+    cfg.resmom.n_hold = cfg.momentum.n_hold
+    cfg.resmom.exit_rank = cfg.momentum.exit_rank
+    cfg.resmom.rebalance = cfg.momentum.rebalance
     if args.vix_exit is not None:
         cfg.vix.exit_level = args.vix_exit
     if args.vix_entry is not None:
@@ -136,6 +161,19 @@ def main(argv=None) -> int:
         print("finviz-exit-rank must be 0 (no band) or >= the number of names held",
               file=sys.stderr)
         return 2
+    if cfg.resmom.beta_window < 20:
+        print(f"--beta-window {cfg.resmom.beta_window} is too short to estimate "
+              f"a beta from", file=sys.stderr)
+        return 2
+    if cfg.momentum.max_corr is not None and not -1.0 <= cfg.momentum.max_corr <= 1.0:
+        print(f"--max-corr must be a correlation in [-1, 1] "
+              f"(got {cfg.momentum.max_corr})", file=sys.stderr)
+        return 2
+    if cfg.momentum.corr_pool < cfg.momentum.n_hold:
+        print(f"--n-hold {cfg.momentum.n_hold} exceeds the correlation pool "
+              f"({cfg.momentum.corr_pool}); the book could never fill",
+              file=sys.stderr)
+        return 2
     if cfg.momentum.exit_rank < cfg.momentum.n_hold:
         print("exit-rank must be >= n-hold (the band cannot be negative)", file=sys.stderr)
         return 2
@@ -149,7 +187,7 @@ def main(argv=None) -> int:
         lab = run(cfg, offline=args.offline, refresh=args.refresh,
                   use_synthetic=args.synthetic, with_momentum=args.momentum,
                   with_vix=args.vix, with_book_vt=args.book_vt,
-                  with_finviz=args.finviz,
+                  with_finviz=args.finviz, with_resmom=args.resmom,
                   fetch_universe=args.fetch_universe, pit_membership=pit)
     except ImportError:
         print("yfinance is not installed. Either `pip install yfinance` or run "
@@ -236,6 +274,14 @@ def main(argv=None) -> int:
             with pd.option_context("display.width", 200):
                 print(sv.round(4).to_string(index=False))
             print("  min_ratio 0.0 is the unfiltered book; compare the rest to it.")
+
+    if args.sweep_corr_cap and "momentum" in lab.signals:
+        from qbs.pipeline import sweep_corr_cap as _sweep_cc
+        scc = _sweep_cc(lab)
+        print("\nCorrelation-cap sensitivity (the monotone columns are 'Eff. bets' "
+              "and vol; CAGR is not, which is what noise looks like):")
+        with pd.option_context("display.width", 200):
+            print(scc.round(4).to_string(index=False))
 
     if args.sweep_band and "momentum" in lab.signals:
         sw = sweep_band(lab, n_holds=[cfg.momentum.n_hold],

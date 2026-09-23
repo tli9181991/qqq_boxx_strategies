@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .config import (
@@ -17,7 +18,8 @@ from .metrics import format_summary, summarise, summary_table
 from .screens import finviz_momentum_screen
 from .strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2, drawdown_stop,
-    cross_sectional_momentum, gem, vix_circuit_breaker, vol_target_overlay,
+    cross_sectional_momentum, gem, residual_momentum, vix_circuit_breaker,
+    vol_target_overlay,
 )
 from .universe import (
     load_universe, load_universe_prices, membership_mask, pit_tickers,
@@ -68,6 +70,7 @@ def run(
     with_vix: bool = True,
     with_book_vt: bool = True,
     with_finviz: bool = True,
+    with_resmom: bool = True,
     vix: Optional[pd.Series] = None,
     fetch_universe: bool = True,
     pit_membership: Optional[pd.DataFrame] = None,
@@ -79,6 +82,7 @@ def run(
     `with_book_vt=False` drops the vol-targeted variant of the momentum book.
     `with_finviz=False` drops the Finviz screen, which shares the same universe
     download and so is free once the momentum book has been built.
+    `with_resmom=False` drops the residual-momentum book, likewise free.
     `pit_membership` takes a point-in-time membership frame (see
     `universe.load_pit_universe`) to remove survivorship bias from the ranking.
     """
@@ -187,6 +191,16 @@ def run(
                 vt_sig, combined, cfg.dd_stop, lag=cfg.execution_lag,
                 benchmark=bench, name="momentum_vt")
 
+        # ---- the same slots, ranked on residual instead of total momentum -
+        # Total-return momentum ranks a name partly for its beta in a rising
+        # market, which is why the six slots keep collapsing into one sector
+        # bet. This strips the market component out of the SCORE and changes
+        # nothing else, so the comparison against `momentum` isolates it.
+        if with_resmom:
+            signals["resmom"] = residual_momentum(
+                uni, prices[SAFE_ASSET], prices[RISK_ASSET], cfg.resmom,
+                eligible=eligible, name="resmom")
+
         # ---- the Finviz screen, ranking the SAME universe ----------------
         # Same names, same slots, same engine, same costs, so the only thing
         # the comparison against `momentum` can be measuring is the selection
@@ -220,7 +234,8 @@ def run(
     results: Dict[str, BacktestResult] = {}
     for key, sig in signals.items():
         book = (combined
-                if key in ("momentum", "momentum_vix", "momentum_vt", "finviz")
+                if key in ("momentum", "momentum_vix", "momentum_vt", "finviz",
+                           "resmom")
                 else prices)
         results[key] = run_backtest(
             book, sig, start=cfg.backtest_start, end=cfg.backtest_end,
@@ -413,5 +428,81 @@ def sweep_target_vol(
             "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
             "Calmar": s["Calmar"], "Ann. turnover": s["Ann. turnover"],
             "Avg exposure": s["Avg risk exposure"],
+        })
+    return pd.DataFrame(rows)
+
+
+def book_correlation(result: BacktestResult, universe: pd.DataFrame,
+                     window: int = 60) -> pd.Series:
+    """Mean pairwise correlation of the names the book actually held.
+
+    The number the correlation cap exists to move. Read it as *effective
+    bets*: ``n / (1 + (n - 1) * rho)`` is how many independent positions a
+    book of `n` equally-weighted names at average correlation `rho` is really
+    carrying. A Top-6 book at rho = 0.43 is holding about 1.9 of them, which
+    is the gap between what the slot count promises and what it delivers.
+    """
+    sig = result.signals
+    if sig is None or not sig.holdings_log:
+        raise ValueError("this result carries no holdings log")
+    rets = universe.pct_change()
+    out = {}
+    for dt, names in sig.holdings_log.items():
+        if dt < result.start or dt > result.end or len(names) < 2:
+            continue
+        cols = [t for t in names if t in rets.columns]
+        win = rets.loc[:dt, cols].tail(window)
+        if len(win) < max(2, window // 2):
+            continue
+        c = win.corr().to_numpy()
+        iu = np.triu_indices_from(c, 1)
+        vals = c[iu]
+        if np.isfinite(vals).any():
+            out[dt] = float(np.nanmean(vals))
+    return pd.Series(out, name="book_corr")
+
+
+def sweep_corr_cap(
+    lab: Lab,
+    caps: List[Optional[float]] = (None, 0.95, 0.85, 0.75, 0.65, 0.55),
+) -> pd.DataFrame:
+    """Re-run the momentum book across correlation caps.
+
+    `None` is the cap switched off and reproduces the shipped strategy, so it
+    is the row every other row should be read against.
+
+    **Read `Vol` and `Eff. bets` before `CAGR`.** Lowering the cap reliably
+    raises the number of independent bets and lowers volatility -- that is
+    close to mechanical, and it is what the parameter is *for*. Whether it
+    also raises return is a much weaker claim on a 20-month sample: paired
+    against the plain ranker across a grid of `(n_hold, exit_rank)` cells the
+    return improvement wins roughly half the cells, which is a coin flip. So
+    treat a CAGR gain in this table as the sample's, not the strategy's, and
+    size the position off the volatility column instead.
+    """
+    from .metrics import summarise
+    from .config import MomentumParams
+
+    if lab.combined is None or "momentum" not in lab.signals:
+        raise ValueError("run(with_momentum=True) first")
+
+    cfg = lab.config
+    uni = lab.combined.drop(columns=[SAFE_ASSET])
+    rows = []
+    for cap in caps:
+        p = MomentumParams(**{**cfg.momentum.__dict__, "max_corr": cap})
+        sig = cross_sectional_momentum(uni, lab.prices[SAFE_ASSET], p)
+        res = run_backtest(lab.combined, sig, start=cfg.backtest_start,
+                           end=cfg.backtest_end, lag=cfg.execution_lag,
+                           cost_bps=cfg.cost_bps, slippage_bps=cfg.slippage_bps)
+        s = summarise(res, rf=lab.rf)
+        rho = float(book_correlation(res, uni, p.corr_window).mean())
+        n = p.n_hold
+        rows.append({
+            "Max corr": "off" if cap is None else cap,
+            "CAGR": s["CAGR"], "Ann. vol": s["Ann. vol"],
+            "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
+            "Calmar": s["Calmar"], "Ann. turnover": s["Ann. turnover"],
+            "Book corr": rho, "Eff. bets": n / (1.0 + (n - 1) * rho),
         })
     return pd.DataFrame(rows)

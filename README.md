@@ -1,6 +1,6 @@
 # QQQ / BOXX strategy lab
 
-Seven trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
+Eight trading strategies with BOXX as the cash leg, one backtest engine, and a notebook
 that shows you where every signal fired.
 
 - **Larry Connors RSI(2)** — short-term mean reversion, long-only, filtered by SMA(200)
@@ -11,6 +11,8 @@ that shows you where every signal fired.
 - **Top-6 vol-targeted** — the same book, scaled by *its own* realised volatility
 - **Top-20 high momentum screen** — an absolute bar (over $5, over 300k shares a day,
   up more than 28% on the quarter), then ranked by relative strength
+- **Top-6 residual momentum** — the same six slots ranked on what the market *cannot*
+  explain, which is the one change in this lab that survived a paired robustness test
 
 Plus one strategy that does not fit the daily model and runs on its own:
 
@@ -198,10 +200,118 @@ and short-term capital gains. On the bundled synthetic universe, widening the ba
 far noisier than that, which is the point: `sweep_band()` and section 9c of the notebook
 exist so you look for a *plateau* rather than picking the best cell.
 
+**And a plateau is not enough on this sample.** Swept across `(n_hold,
+exit_rank)`, this strategy's own CAGR ranges from 19% to 141%, and the shipped
+`(6, 10)` default is a *below-median* cell of that surface. Any variant you
+measure only at the default is being scored against one of the baseline's
+unluckiest draws. `docs/HYBRID_ANALYSIS.md` shows a candidate that had a
+plateau, two positive sub-periods, a clean look-ahead test and cost robustness
+— and was still noise.
+
 **Slot weighting, not survivor weighting.** With only 4 of 6 slots qualifying, the book
 is 4/6 invested and 2/6 in cash. Spreading 100% across the survivors would concentrate
 the portfolio exactly when the fewest names were qualifying — i.e. in a deteriorating
 market, which is precisely backwards.
+
+### 4b. The correlation cap — six slots, or six bets?
+
+`MomentumParams.max_corr` is off by default and changes nothing when it is.
+Switched on, it refuses a candidate whose trailing correlation with a name
+already selected exceeds the cap; the slot passes to the next name down, or to
+cash. The rank decides which names are strong, the cap decides whether the book
+is holding six bets or one bet six times.
+
+It exists because of a number the rank never looks at:
+
+```
+mean pairwise correlation of the held book   0.43
+effective independent bets, 6/(1+5p)         1.91  of 6 slots
+```
+
+Momentum is a trend signal, so the names trending hardest at any moment tend to
+be one sector — on the last cached bar the book held six semiconductors. The
+concentration blow-up in section 6 (−30% with VIX at 16–20) is that fact
+expressing itself, and it is the drawdown no index-level signal can see.
+
+| Max corr | CAGR | Vol | Sharpe | Max DD | Turnover | Book corr | Eff. bets |
+|---|---|---|---|---|---|---|---|
+| off | 46.1% | 49.0% | 0.94 | −34.8% | 5.7× | 0.43 | 1.91 |
+| 0.85 | 52.7% | 49.1% | 1.03 | −36.0% | 6.4× | 0.40 | 2.01 |
+| 0.75 | 62.4% | 48.1% | 1.17 | −35.7% | 7.4× | 0.37 | 2.11 |
+| 0.65 | 49.4% | 44.9% | 1.03 | −35.7% | 13.5× | 0.32 | 2.31 |
+| 0.55 | 49.9% | 44.6% | 1.04 | −35.7% | 14.1× | 0.30 | 2.39 |
+
+> **Measured against the 12-1 momentum book**, which was the shipped default
+> when this table was produced; the default has since moved to 6-1. The
+> mechanism (effective bets up, volatility down) is not sensitive to that, but
+> the exact cells are. Re-run `sweep_corr_cap()` for current figures.
+
+**Read the last two columns, not the first.** Effective bets rise monotonically
+and volatility falls monotonically; that is close to mechanical and it is what
+the parameter is for. CAGR is not monotone, which is what noise looks like.
+Paired against the plain ranker across a grid of `(n_hold, exit_rank)` cells the
+cap lowers volatility in 12 of 16 cells while its *return* effect is a coin flip
+— so treat the 62.4% as the sample's, not the strategy's, and size off the
+volatility column.
+
+Held names are not re-tested against the cap: the band already decides what is
+held, and re-testing would evict a name for being correlated with something
+bought after it. The cap gates entry only.
+
+`sweep_corr_cap()` runs the table above. **[`docs/HYBRID_ANALYSIS.md`](docs/HYBRID_ANALYSIS.md)**
+is the full study this came out of — including the candidates that did *not*
+survive, and why a 20-month sample cannot resolve most of what people ask it.
+
+---
+
+### 4c. Residual momentum — rank on what the market cannot explain
+
+The one addition to this lab that passed the robustness test several
+better-looking ideas failed. Full write-up:
+**[`docs/RESIDUAL_MOMENTUM.md`](docs/RESIDUAL_MOMENTUM.md)**.
+
+| | Rule |
+|---|---|
+| Market model | rolling single-factor regression against QQQ, `beta_window` (252) days |
+| Residual | `r − β·r_mkt`, net of its own rolling mean |
+| Score | sum of residuals over the 12-1 window ÷ their own standard deviation |
+| Everything else | unchanged — six slots, band 10, absolute filter vs BOXX, cash leg |
+
+Only the ranking changes, so held against `momentum` the difference can only be
+the score.
+
+**Why it helps here.** Total-return momentum ranks a name highly partly for
+having a *large beta in a rising market* — so it keeps selecting the crowded
+trade, and section 6's concentration blow-up is the result. Stripping the
+market component raises effective bets from **1.91 to 2.19** out of six slots,
+better than the explicit correlation cap manages, without any diversification
+constraint at all.
+
+| | CAGR | Vol | Sharpe | Max DD | Calmar | Turnover |
+|---|---|---|---|---|---|---|
+| Top-6 NDX momentum | 48.1% | 49.2% | 0.96 | −40.4% | 1.19 | 21.1× |
+| **Top-6 residual momentum** | **73.6%** | **39.4%** | **1.49** | **−35.3%** | **2.09** | 24.0× |
+
+**Read the paired test, not that table.** Across 41 `(n_hold, exit_rank)`
+cells it wins Sharpe in **36/41** and lowers volatility in **40/41** (median
+−9.6%), but wins CAGR in only 23/41. So this is a *risk* reduction that holds
+return flat-to-better — which is exactly the source paper's claim — not a
+return generator. It trades 2.5× as much as the plain book and still beats it
+at 100bp of slippage, twenty times the default.
+
+Unlike the candidates in `HYBRID_ANALYSIS.md`, its main parameter has a
+plateau: every `beta_window` from 126 to 504 days beats the baseline on both
+Sharpe and volatility.
+
+⚠️ Ehsani & Linnainmaa (2022) argue residual momentum may just be harvesting
+factors *omitted* from the regression. This uses one factor where the paper
+used three, so that critique applies with more force here, not less. Read it
+as "momentum with the market bet removed" — measurable — rather than as a
+separate anomaly, which is contested. It also does **not** compose with the
+correlation cap: both decorrelate, and stacking them over-constrains the
+universe (Sharpe 1.33 against 1.41). Pick one.
+
+---
 
 ### 5. VIX circuit breaker
 
@@ -694,7 +804,9 @@ qbs/
   data.py         yfinance download + CSV cache + synthetic market and VIX generators
   universe.py     Nasdaq-100 membership, point-in-time hook, wide price loader
   indicators.py   Wilder RSI, SMA, EWMA vol, trailing return, drawdown
-  strategies.py   the six ranking/overlay strategies -> weights + diagnostics + events
+  strategies.py   the ranking/overlay strategies -> weights + diagnostics + events;
+                  includes residual momentum, which reuses the Top-N slot machinery
+                  and only swaps the score it sorts on
   screens.py      filter-based screens: the trend template and the high-momentum
                   screen, both rolled forward from a notebook so they can be
                   backtested
@@ -704,7 +816,8 @@ qbs/
   metrics.py      CAGR, Sharpe/Sortino vs BOXX, drawdown, turnover, trade log
   plotting.py     the chart system
   pipeline.py     load -> signals -> backtest in one call; sweep_band(),
-                  sweep_vix(), sweep_target_vol()
+                  sweep_vix(), sweep_target_vol(), sweep_corr_cap(),
+                  book_correlation()
   breadth.py      market breadth: 4% movers, % above the MAs, index stretch in
                   ATR units, momentum leaders and their sector concentration
   agent/          an LLM analyst that READS the results above
@@ -749,7 +862,7 @@ look-ahead would have been worth.
 
 ```python
 from qbs.config import (BookVolTargetParams, Config, MomentumParams,
-                        RSI2Params, VolTargetParams)
+                        RSI2Params, ResidualMomentumParams, VolTargetParams)
 from qbs.pipeline import run, sweep_band
 
 cfg = Config()
@@ -760,6 +873,8 @@ cfg.rsi2 = RSI2Params(entry_threshold=10)                    # trade more often
 cfg.momentum = MomentumParams(n_hold=8, exit_rank=20,        # wider band, less churn
                               rebalance="ME")                # monthly instead of daily
 cfg.book_vol = BookVolTargetParams(target_vol=0.15)          # a calmer momentum book
+cfg.momentum = MomentumParams(max_corr=0.75)                 # decorrelate the six slots
+cfg.resmom = ResidualMomentumParams(beta_window=252)         # rank on residuals
 
 lab = run(cfg)
 lab.summary_pretty
@@ -769,11 +884,13 @@ sweep_band(lab)                                              # is there a platea
 ```bash
 python run_backtest.py --start 2024-09-01 --n-hold 8 --exit-rank 20 --sweep-band --csv
 python run_backtest.py --slippage-bps 20            # does it survive worse fills?
+python run_backtest.py --sweep-corr-cap             # six slots, or six bets?
+python run_backtest.py --beta-window 126            # residual momentum's other end
 python run_backtest.py --sweep-vix --vix-exit 25    # where should the VIX trigger sit?
 python tests/test_qbs.py
 ```
 
-Adding a seventh strategy means writing a function that returns a `StrategySignals`
+Adding another strategy means writing a function that returns a `StrategySignals`
 and adding it to `pipeline.build_signals`. Everything downstream — engine, metrics,
 charts — works on it unchanged.
 

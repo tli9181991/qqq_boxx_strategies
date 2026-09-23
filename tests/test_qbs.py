@@ -21,7 +21,8 @@ from dataclasses import replace
 
 from qbs.config import (
     SAFE_ASSET, BookVolTargetParams, Config, DrawdownStopParams, FinvizScreenParams,
-    GEMParams, MomentumParams, RSI2Params, VixBreakerParams, VolTargetParams,
+    GEMParams, MomentumParams, RSI2Params, ResidualMomentumParams,
+    VixBreakerParams, VolTargetParams,
 )
 from qbs.data import synthetic_prices, synthetic_vix
 from qbs.engine import run_backtest
@@ -30,8 +31,8 @@ from qbs.metrics import summarise
 from qbs.pipeline import build_signals, run, sweep_band, sweep_target_vol, sweep_vix
 from qbs.strategies import (
     StrategySignals, book_vol_target, buy_and_hold, connors_rsi2,
-    cross_sectional_momentum, drawdown_stop, gem, vix_circuit_breaker,
-    vol_target_overlay,
+    cross_sectional_momentum, drawdown_stop, gem, residual_momentum,
+    residual_momentum_score, vix_circuit_breaker, vol_target_overlay,
 )
 from qbs.universe import membership_mask, synthetic_universe
 
@@ -263,6 +264,206 @@ def test_momentum_has_no_lookahead_in_the_score():
     sig2 = cross_sectional_momentum(tampered, safe, p)
     pd.testing.assert_series_equal(
         sig.momentum.loc[:dt, col], sig2.momentum.loc[:dt, col], check_names=False)
+
+
+def _resmom_fixture():
+    uni, safe = _mom_fixture()
+    # The market factor: an equal-weight index of the universe itself, which is
+    # what a market model would be regressing against here.
+    mkt = uni.mean(axis=1)
+    return uni, safe, mkt
+
+
+def test_residual_score_strips_the_market_component():
+    """A name that is purely market beta must score near zero.
+
+    The mechanism test: build one name that is exactly 2x the market with no
+    idiosyncratic component, and one that drifts up on its own. Total-return
+    momentum prefers the leveraged market name in a rising market; residual
+    momentum must not.
+    """
+    n = 700
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    rng = np.random.default_rng(7)
+    mkt_r = rng.normal(0.0008, 0.01, n)               # a rising market
+    mkt = pd.Series(100 * np.cumprod(1 + mkt_r), index=idx)
+
+    # 2x the market plus a little idiosyncratic noise that goes nowhere. Its
+    # TOTAL return is the largest of the three by far, because the market rose.
+    beta_noise = rng.normal(0.0, 0.004, n)
+    pure_beta = pd.Series(100 * np.cumprod(1 + 2.0 * mkt_r + beta_noise), index=idx)
+    # Same market beta, but with idiosyncratic drift on top.
+    drifter = pd.Series(100 * np.cumprod(1 + mkt_r + rng.normal(0.0009, 0.004, n)),
+                        index=idx)
+    uni = pd.DataFrame({"BETA": pure_beta, "DRIFT": drifter})
+
+    p = ResidualMomentumParams(beta_window=252)
+    total = uni / uni.shift(21) - 1.0          # what total-return momentum sees
+    sc = residual_momentum_score(uni, mkt, p)
+    last = sc.dropna().iloc[-1]
+    last_total = total.loc[last.name]
+
+    assert last_total["BETA"] > last_total["DRIFT"], (
+        "fixture is wrong: the leveraged name should win on TOTAL return")
+    assert last["DRIFT"] > last["BETA"], (
+        f"residual momentum should prefer idiosyncratic drift: {dict(last)}")
+
+
+def test_residual_score_is_unrankable_when_the_market_explains_everything():
+    """A perfect market replica is a 0/0, and must not top the book.
+
+    Without the residual-vol floor the ratio of two floating-point dust terms
+    can come back arbitrarily large, which would hand the strongest rank to
+    the one name carrying no idiosyncratic information at all.
+    """
+    n = 700
+    idx = pd.bdate_range("2023-01-02", periods=n)
+    rng = np.random.default_rng(7)
+    mkt_r = rng.normal(0.0008, 0.01, n)
+    mkt = pd.Series(100 * np.cumprod(1 + mkt_r), index=idx)
+    replica = pd.Series(100 * np.cumprod(1 + mkt_r), index=idx)   # residual == 0
+    real = pd.Series(100 * np.cumprod(1 + mkt_r + rng.normal(0.0005, 0.004, n)),
+                     index=idx)
+    uni = pd.DataFrame({"REPLICA": replica, "REAL": real})
+
+    sc = residual_momentum_score(uni, mkt, ResidualMomentumParams())
+    tail = sc.dropna(how="all").iloc[-1]
+    assert np.isnan(tail["REPLICA"]), f"replica should be unrankable, got {tail['REPLICA']}"
+    assert np.isfinite(tail["REAL"])
+
+
+def test_residual_momentum_has_no_look_ahead():
+    """Beta, residuals and the score must all be blind to the future."""
+    uni, safe, mkt = _resmom_fixture()
+    cut = uni.index[len(uni) // 2]
+    rng = np.random.default_rng(0)
+    tu, tm = uni.copy(), mkt.copy()
+    after = tu.index > cut
+    tu.loc[after] = tu.loc[after] * rng.uniform(0.5, 1.5, tu.loc[after].shape)
+    tm.loc[after] = tm.loc[after] * rng.uniform(0.5, 1.5, after.sum())
+
+    p = ResidualMomentumParams()
+    a = residual_momentum(uni, safe, mkt, p).weights.loc[:cut]
+    b = residual_momentum(tu, safe, tm, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_residual_momentum_obeys_the_slot_invariants():
+    """Whatever it ranks on, the book is still six slots and fully allocated."""
+    uni, safe, mkt = _resmom_fixture()
+    p = ResidualMomentumParams(n_hold=6, exit_rank=10)
+    sig = residual_momentum(uni, safe, mkt, p)
+    risk = sig.weights.drop(columns=["BOXX"])
+    assert (risk > 0).sum(axis=1).max() <= p.n_hold
+    assert risk.max().max() <= 1.0 / p.n_hold + 1e-9
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+    assert (sig.weights >= -1e-12).all().all()
+
+
+def test_residual_momentum_standardisation_changes_the_ranking():
+    """`standardise` is a real choice, not a no-op knob."""
+    uni, safe, mkt = _resmom_fixture()
+    raw = residual_momentum_score(uni, mkt, ResidualMomentumParams(standardise=False))
+    std = residual_momentum_score(uni, mkt, ResidualMomentumParams(standardise=True))
+    both = raw.dropna(how="all").index.intersection(std.dropna(how="all").index)
+    assert len(both) > 0
+    changed = (raw.loc[both].rank(axis=1) != std.loc[both].rank(axis=1)).to_numpy().any()
+    assert changed, "standardising did not change any ranking"
+
+
+def test_residual_momentum_rejects_bad_parameters():
+    for kwargs in ({"n_hold": 6, "exit_rank": 3},
+                   {"lookback_months": 1, "skip_months": 1},
+                   {"beta_window": 5}):
+        try:
+            ResidualMomentumParams(**kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"{kwargs} should have been rejected")
+
+
+def test_corr_cap_off_is_bit_identical_to_the_plain_ranker():
+    """The cap must default to OFF and change nothing when it is.
+
+    A new selection filter that quietly moves the shipped strategy would
+    invalidate every number in the README, so this is the test that matters
+    most about it.
+    """
+    uni, safe = _mom_fixture()
+    plain = cross_sectional_momentum(uni, safe, MomentumParams())
+    explicit_off = cross_sectional_momentum(uni, safe, MomentumParams(max_corr=None))
+    pd.testing.assert_frame_equal(plain.weights, explicit_off.weights)
+
+
+def test_corr_cap_raises_the_number_of_independent_bets():
+    """Tightening the cap must lower the held book's mean pairwise correlation.
+
+    This is the mechanism the parameter exists for, and unlike its effect on
+    return it should be close to monotone. The fixture is built so that the
+    top-ranked names are deliberately near-duplicates of each other.
+    """
+    uni, safe = _mom_fixture()
+    rets = uni.pct_change()
+
+    def mean_corr(sig):
+        vals = []
+        for dt, names in sig.holdings_log.items():
+            if len(names) < 2:
+                continue
+            win = rets.loc[:dt, names].tail(60)
+            if len(win) < 30:
+                continue
+            c = win.corr().to_numpy()
+            iu = np.triu_indices_from(c, 1)
+            if np.isfinite(c[iu]).any():
+                vals.append(np.nanmean(c[iu]))
+        return float(np.mean(vals)) if vals else np.nan
+
+    loose = mean_corr(cross_sectional_momentum(uni, safe, MomentumParams()))
+    tight = mean_corr(cross_sectional_momentum(uni, safe, MomentumParams(max_corr=0.5)))
+    assert tight <= loose + 1e-9, f"cap did not decorrelate the book: {loose} -> {tight}"
+
+
+def test_corr_cap_never_exceeds_the_slot_count():
+    """The cap may leave slots in cash, but must never overfill the book."""
+    uni, safe = _mom_fixture()
+    p = MomentumParams(max_corr=0.3, n_hold=6)
+    sig = cross_sectional_momentum(uni, safe, p)
+    assert all(len(v) <= p.n_hold for v in sig.holdings_log.values())
+    risky = sig.weights.drop(columns=["BOXX"]).sum(axis=1)
+    assert (risky <= 1.0 + 1e-9).all()
+    assert np.allclose(sig.weights.sum(axis=1), 1.0)
+
+
+def test_corr_cap_has_no_look_ahead():
+    """The correlation matrix at t must not see a single return after t."""
+    uni, safe = _mom_fixture()
+    cut = uni.index[len(uni) // 2]
+    rng = np.random.default_rng(0)
+    tampered = uni.copy()
+    after = tampered.index > cut
+    tampered.loc[after] = tampered.loc[after] * rng.uniform(0.5, 1.5, tampered.loc[after].shape)
+
+    p = MomentumParams(max_corr=0.7)
+    a = cross_sectional_momentum(uni, safe, p).weights.loc[:cut]
+    b = cross_sectional_momentum(tampered, safe, p).weights.loc[:cut]
+    pd.testing.assert_frame_equal(a, b, check_exact=False, atol=1e-12)
+
+
+def test_corr_cap_rejects_an_impossible_pool():
+    """corr_pool below n_hold could never fill the book -- fail loudly."""
+    try:
+        MomentumParams(n_hold=6, corr_pool=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("corr_pool < n_hold should be rejected")
+    try:
+        MomentumParams(max_corr=1.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an out-of-range max_corr should be rejected")
 
 
 def test_momentum_absolute_filter_goes_to_cash():
