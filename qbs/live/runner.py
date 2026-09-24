@@ -240,7 +240,8 @@ def _write_csv_logs(live: LiveConfig, book=None) -> None:
         if book is not None and book.watchlist:
             st.append_watchlist_csv(live.watchlist_csv_path,
                                     f"{book.asof:%Y-%m-%d}", book.watchlist)
-        if book is not None and book.strategy_daily_returns:
+        if (book is not None and book.strategy_daily_returns
+                and live.residual_notional > 0):
             st.upsert_strategy_comparison_csv(
                 live.strategy_comparison_csv_path, f"{book.asof:%Y-%m-%d}", book)
         store.export_trade_csv(live.db_path, live.trade_csv_path)
@@ -265,6 +266,19 @@ def _strategy_book(broker, live: LiveConfig, universe=None
     account = broker.positions()
 
     if live.position_source == "ledger":
+        if not os.path.exists(live.ledger_path) and account:
+            # Until the Compose file forwarded QBS_POSITION_SOURCE, a ledger
+            # setting in .env never reached the container: every phase ran in
+            # account mode and nothing wrote this file. Reading a missing
+            # ledger as "the strategy is flat" would buy the whole book again
+            # on top of the one already held.
+            raise GuardTripped(
+                f"position_source=ledger but {live.ledger_path} does not exist, "
+                f"while the account holds {dict(sorted(account.items()))}. Reading "
+                "that as a flat strategy would buy the whole book a second time. "
+                "Seed the ledger first: `ledger --rebuild` if those shares are "
+                "the strategy's (rebuilt from its recorded fills), or "
+                "`ledger --start-flat` if every one of them is yours.")
         mine = ldg.positions(live.ledger_path)
         residual, over = ldg.reconcile_against_account(mine, account)
         if over:
@@ -335,7 +349,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
                 notional=live.total_notional,
                 max_order_notional=live.max_order_notional,
                 max_gross_turnover=live.max_gross_turnover,
-                max_positions=live.max_positions,
+                max_positions=live.position_cap,
                 min_shares=live.min_order_shares,
                 min_notional=live.min_order_notional,
                 min_drift=live.rebalance_drift,
@@ -442,7 +456,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
                 notional=live.total_notional,
                 max_order_notional=live.max_order_notional,
                 max_gross_turnover=live.max_gross_turnover,
-                max_positions=live.max_positions,
+                max_positions=live.position_cap,
                 min_shares=live.min_order_shares,
                 min_notional=live.min_order_notional,
                 min_drift=live.rebalance_drift,
@@ -638,11 +652,19 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     comparison = st.strategy_comparison(live.strategy_comparison_csv_path,
                                         days=days)
     if comparison:
+        labels = {"momentum": "momentum book (as traded, vol-scaled)",
+                  "momentum6": "momentum top 6 (equal slots)",
+                  "resmom": "residual top 6 (equal slots)"}
         print("STRATEGY COMPARISON (model return after configured costs)")
         for row in comparison:
-            print(f"  {row['strategy']:<10} {row['return']:>8.2%}  "
-                  f"{row['sessions']:>3} sessions  ${row['notional']:,.0f}  "
+            print(f"  {labels.get(row['strategy'], row['strategy']):<40} "
+                  f"{row['return']:>8.2%}  {row['sessions']:>3} sessions  "
                   f"{row['start']} to {row['end']}")
+        by = {r["strategy"]: r for r in comparison}
+        if "momentum6" in by and "resmom" in by:
+            edge = by["resmom"]["return"] - by["momentum6"]["return"]
+            print(f"  residual six vs momentum six: {edge:+.2%} "
+                  f"({'residual' if edge > 0 else 'momentum'} ahead)")
         print()
 
     nav = store.nav_history(live.db_path, limit=days)
@@ -763,7 +785,7 @@ def phase_baseline(live: LiveConfig, capture: bool = False,
 
 
 def phase_ledger(live: LiveConfig, rebuild: bool = False,
-                 force: bool = False) -> int:
+                 force: bool = False, start_flat: bool = False) -> int:
     """Show the strategy's tallied book, or rebuild it from the run log.
 
     Rebuilding matters because the ledger only starts recording once
@@ -784,6 +806,12 @@ def phase_ledger(live: LiveConfig, rebuild: bool = False,
                 "counting. Pass --force once you have looked at the file.", path)
             return EXIT_CONFIG
         ldg.rebuild_from_db(live.db_path, path)
+    elif start_flat:
+        if os.path.exists(path) and not force:
+            log.error("%s already exists; --start-flat would discard it. Pass "
+                      "--force once you have looked at the file.", path)
+            return EXIT_CONFIG
+        ldg.start_flat(path)
 
     mine = ldg.positions(path)
     account: Dict[str, int] = {}
@@ -809,7 +837,9 @@ def phase_ledger(live: LiveConfig, rebuild: bool = False,
     if not mine and account:
         print("\nThe ledger is empty while the account is not. With "
               "position_source=ledger the strategy would read its book as flat "
-              "and buy it all again.\nRebuild first:  runner ledger --rebuild")
+              "and buy it all again.\nRebuild first:  runner ledger --rebuild\n"
+              "(or, if every share in the account is yours: runner ledger "
+              "--start-flat)")
     return EXIT_OK
 
 
@@ -873,6 +903,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true",
                    help="ledger: reconstruct the tally from the fills already "
                         "recorded in the run log")
+    p.add_argument("--start-flat", action="store_true",
+                   help="ledger: create an empty ledger, declaring that the "
+                        "strategy holds nothing and every share is yours")
     p.add_argument("--capture", action="store_true",
                    help="baseline: record the account's current holdings as "
                         "yours, so the strategy never sells them")
@@ -923,7 +956,8 @@ def main(argv=None) -> int:
     if args.phase == "sheets":
         return phase_sheets(live)
     if args.phase == "ledger":
-        return phase_ledger(live, rebuild=args.rebuild, force=args.force)
+        return phase_ledger(live, rebuild=args.rebuild, force=args.force,
+                            start_flat=args.start_flat)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":

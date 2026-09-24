@@ -44,6 +44,10 @@ def _env_bool(key: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Slots in the optional residual-momentum sleeve (cfg.resmom.n_hold).
+RESIDUAL_SLOTS = 6
+
+
 @dataclass
 class LiveConfig:
     """Deployment settings for the Top-6 vol-targeted book.
@@ -228,6 +232,17 @@ class LiveConfig:
         a $100k account plus a $36k sleeve from silently becoming a $136k book.
         """
         return self.notional
+
+    @property
+    def position_cap(self) -> int:
+        """`max_positions`, widened by the residual sleeve's six slots when on.
+
+        The two sleeves pick independently, so with the sleeve on the book can
+        hold six momentum names, six residual names and BOXX. Widening here
+        means turning the sleeve on cannot trip the cap on a day the picks
+        happen not to overlap.
+        """
+        return self.max_positions + (RESIDUAL_SLOTS if self.residual_notional > 0 else 0)
 
     def looks_like_paper_account(self, account: str) -> bool:
         """IB paper accounts are DU (individual) or DF (advisor); live are U/F."""

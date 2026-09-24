@@ -360,6 +360,11 @@ def test_live_config_residual_sleeve_is_opt_in(monkeypatch):
     assert cfg.max_positions == 13
 
 
+def test_the_residual_sleeve_widens_the_position_cap_by_its_six_slots():
+    assert LiveConfig(max_positions=12).position_cap == 12
+    assert LiveConfig(max_positions=12, residual_notional=36_000).position_cap == 18
+
+
 def test_docker_compose_forwards_the_position_source():
     """A ledger setting in .env must reach the container without its secrets."""
     compose = open(os.path.join(
@@ -386,15 +391,18 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
 
     assert set(book.strategy_weights) == {"momentum", "resmom"}
     assert len(book.strategy_holdings["resmom"]) <= 6
-    assert book.strategy_notionals == {"momentum": 100_000, "resmom": 36_000}
+    assert book.strategy_notionals == {"momentum": 100_000, "momentum6": 36_000,
+                                       "resmom": 36_000}
     for symbol in set(book.strategy_weights["momentum"]) | set(book.strategy_weights["resmom"]):
         expected = (100_000 * book.strategy_weights["momentum"].get(symbol, 0.0)
                     + 36_000 * book.strategy_weights["resmom"].get(symbol, 0.0))
         if symbol == cfg.momentum.safe_asset:
             expected -= 36_000
         assert abs(book.weights.get(symbol, 0.0) * 100_000 - expected) < 1e-8
-    assert set(book.strategy_daily_returns) == {"momentum", "resmom"}
-    assert all(np.isfinite(v) for v in book.strategy_daily_returns.values())
+    assert set(book.strategy_daily_returns) == {"momentum", "momentum6", "resmom"}
+    for by_day in book.strategy_daily_returns.values():
+        assert len(by_day) == 10
+        assert all(np.isfinite(e["return"]) for e in by_day.values())
     description = book.describe()
     assert "momentum:" in description and "residual:" in description
     # Six equal residual slots contribute 6% apiece to the $100k aggregate
@@ -404,17 +412,42 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "comparison.csv")
+        # The first run is the trial's first day: the backfilled history
+        # before it is not written.
         assert st.upsert_strategy_comparison_csv(
-            path, f"{book.asof:%Y-%m-%d}", book) == 2
+            path, f"{book.asof:%Y-%m-%d}", book) == 3
         # A second preflight for the same close replaces, rather than doubles,
-        # the two strategy rows.
+        # the three strategy rows.
         st.upsert_strategy_comparison_csv(path, f"{book.asof:%Y-%m-%d}", book)
         rows = st.strategy_comparison(path, days=31)
-        assert {r["strategy"] for r in rows} == {"momentum", "resmom"}
+        assert {r["strategy"] for r in rows} == {"momentum", "momentum6", "resmom"}
         assert all(r["sessions"] == 1 for r in rows)
 
 
-def test_residual_sleeve_refuses_to_borrow_when_boxx_is_too_small():
+def test_the_comparison_fills_in_a_missed_session(tmp_path):
+    from types import SimpleNamespace
+
+    def book(days):
+        return SimpleNamespace(
+            strategy_notionals={"resmom": 36_000},
+            strategy_daily_returns={"resmom": {
+                d: {"return": 0.01, "holdings": ["MU"]} for d in days}})
+
+    path = str(tmp_path / "comparison.csv")
+    st.upsert_strategy_comparison_csv(path, "2026-09-21",
+                                      book(["2026-09-18", "2026-09-21"]))
+    # No run on the 22nd; the run on the 23rd rescores it.
+    st.upsert_strategy_comparison_csv(
+        path, "2026-09-23", book(["2026-09-18", "2026-09-21", "2026-09-22",
+                                  "2026-09-23"]))
+    rows = st.strategy_comparison(path, days=31)
+    assert rows[0]["sessions"] == 3
+    assert rows[0]["start"] == "2026-09-21"
+    assert abs(rows[0]["return"] - (1.01 ** 3 - 1)) < 1e-12
+
+
+def test_residual_sleeve_shrinks_to_the_boxx_there_rather_than_borrowing():
+    """Too little BOXX must not fail the signal: that would stop the main book."""
     cfg = Config()
     cfg.momentum.min_history = 200
     cfg.resmom.min_history = 200
@@ -425,11 +458,23 @@ def test_residual_sleeve_refuses_to_borrow_when_boxx_is_too_small():
     frame["BOXX"] = px["BOXX"]
     frame["QQQ"] = px["QQQ"]
 
-    with pytest.raises(SignalError, match="Refusing to add leverage"):
-        compute_targets(
-            cfg, frame, requested=list(uni.columns), now=frame.index[-1],
-            base_notional=100_000, residual_notional=36_000,
-        )
+    plain = compute_targets(cfg, frame, requested=list(uni.columns),
+                            now=frame.index[-1], base_notional=100_000)
+    boxx = plain.weights.get("BOXX", 0.0) * 100_000
+    assert boxx < 36_000, "fixture no longer exercises the shortfall"
+
+    book = compute_targets(
+        cfg, frame, requested=list(uni.columns), now=frame.index[-1],
+        base_notional=100_000, residual_notional=36_000,
+    )
+    assert abs(book.strategy_notionals["resmom"] - boxx) < 1e-6
+    assert book.weights.get("BOXX", 0.0) * 100_000 < 1e-6 + (
+        book.strategy_weights["resmom"].get("BOXX", 0.0) * boxx)
+    assert abs(sum(book.weights.values()) - 1.0) < 1e-9
+    # The main book's stocks are exactly what they were without the sleeve.
+    for t, w in plain.weights.items():
+        if t != "BOXX":
+            assert abs(book.strategy_weights["momentum"][t] - w) < 1e-12
 
 
 def test_live_config_knows_the_paper_ports():
@@ -1493,6 +1538,40 @@ def test_the_key_defaults_into_the_gitignored_state_dir(tmp_path):
 
     live.sheets_key_file = "/etc/qbs/sa.json"
     assert live.sheets_key_path == "/etc/qbs/sa.json"
+
+
+class _Account:
+    def __init__(self, held):
+        self.held = held
+
+    def positions(self):
+        return dict(self.held)
+
+
+def test_a_missing_ledger_beside_a_held_account_refuses_to_trade(tmp_path):
+    """The Compose fix switched ledger mode on for deployments with no ledger.
+
+    Reading the missing file as a flat strategy would buy the book twice.
+    """
+    from qbs.live.orders import GuardTripped
+    from qbs.live.runner import _strategy_book
+
+    live = LiveConfig(state_dir=str(tmp_path), position_source="ledger")
+    with pytest.raises(GuardTripped, match="ledger --rebuild"):
+        _strategy_book(_Account({"MU": 6, "BOXX": 500}), live)
+
+    # An explicitly flat ledger is a statement, not an absence.
+    from qbs.live import ledger
+    ledger.start_flat(live.ledger_path)
+    mine, account, yours = _strategy_book(_Account({"MU": 6}), live)
+    assert mine == {} and yours == {"MU": 6}
+
+
+def test_a_missing_ledger_beside_a_flat_account_is_a_clean_start(tmp_path):
+    from qbs.live.runner import _strategy_book
+
+    live = LiveConfig(state_dir=str(tmp_path), position_source="ledger")
+    assert _strategy_book(_Account({}), live) == ({}, {}, {})
 
 
 def test_the_ledger_can_be_rebuilt_from_the_recorded_fills(db, tmp_path):

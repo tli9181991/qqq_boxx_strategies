@@ -112,6 +112,18 @@ def append_fills(path: str, session_date: str, fills: Iterable) -> int:
     return len(new)
 
 
+def start_flat(path: str) -> None:
+    """Write a header-only ledger: the strategy holds nothing yet.
+
+    An explicit file is what separates "the strategy is flat" from "the ledger
+    was never written", which the runner refuses to guess between.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="") as fh:
+        csv.DictWriter(fh, fieldnames=COLUMNS).writeheader()
+    log.info("ledger: started flat at %s", path)
+
+
 def rebuild_from_db(db_path: str, ledger_path: str) -> int:
     """Reconstruct the ledger from the fills already in the run log.
 
