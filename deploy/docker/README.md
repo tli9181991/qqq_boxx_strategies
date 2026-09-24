@@ -416,7 +416,10 @@ $C run --rm --no-deps qbs ledger               # check: ledger vs account
 ```
 
 `--rebuild` replays every fill in the run log, which was recorded in account
-mode too. If you also traded by hand in that account, check the side-by-side
+mode too. Older run logs hold the same fill more than once (every reconcile
+re-logged the day's executions); the rebuild counts each execution once. A
+ledger rebuilt before that fix can claim more than the account holds -- rebuild
+it again with `ledger --rebuild --force`. If you also traded by hand in that account, check the side-by-side
 table afterwards: those fills are in the log as well.
 
 Switch it on **while the account is flat**. That is the only moment a tally

@@ -35,6 +35,7 @@ import csv
 import logging
 import os
 import tempfile
+from collections import Counter
 from typing import Dict, Iterable, List, Optional
 
 from .state import utc_now_iso
@@ -74,9 +75,17 @@ def append_fills(path: str, session_date: str, fills: Iterable) -> int:
     without an id fall back to a composite key, which is weaker but still
     catches the common case of the same reconcile running twice.
     """
+    existing = read_rows(path)
     seen = {_key(r["exec_id"], r["session_date"], r["symbol"], r["side"],
                  r["quantity"], r["order_id"])
-            for r in read_rows(path)}
+            for r in existing}
+    # Rows rebuilt from the run log carry no execution id, so an id-keyed fill
+    # can never match them by key. IB re-reports a day's executions on every
+    # connect, so the reconcile after a rebuild would add the same fills again.
+    # Match those rows on what they do record instead, each one only once.
+    unkeyed = Counter(_fill_identity(r["symbol"], r["side"], r["quantity"],
+                                     r["order_id"])
+                      for r in existing if not r.get("exec_id"))
 
     new: List[Dict[str, object]] = []
     for f in fills:
@@ -85,6 +94,11 @@ def append_fills(path: str, session_date: str, fills: Iterable) -> int:
         key = _key(f.exec_id, session_date, f.symbol, f.action,
                    f.quantity, f.order_id)
         if key in seen:
+            continue
+        ident = _fill_identity(f.symbol, f.action, f.quantity, f.order_id)
+        if unkeyed[ident] > 0:
+            unkeyed[ident] -= 1
+            seen.add(key)
             continue
         seen.add(key)
         new.append({
@@ -141,10 +155,30 @@ def rebuild_from_db(db_path: str, ledger_path: str) -> int:
     from .store import connect
 
     with connect(db_path) as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT session_date, symbol, action, quantity, price, order_id "
+        raw = [dict(r) for r in conn.execute(
+            "SELECT session_date, symbol, action, quantity, price, order_id, exec_id "
             "FROM trade_events WHERE event='filled' AND COALESCE(dry_run,0)=0 "
             "AND symbol IS NOT NULL ORDER BY id")]
+
+    # The run log recorded every execution IB reported on every reconcile, and
+    # IB re-reports a day's executions on each connect (and earlier days' while
+    # the Gateway stays up). A second reconcile therefore logged the same fills
+    # again, sometimes under the next day's date. One execution is one row
+    # here: by IB's id where the log has it, otherwise by order, side,
+    # quantity and price -- which a genuinely separate fill does not share.
+    rows, seen = [], set()
+    for r in raw:
+        key = (("id", r["exec_id"]) if r.get("exec_id") else
+               ("fill", str(r["symbol"]).upper(), str(r["action"] or "").upper(),
+                f"{float(r['quantity'] or 0):g}", f"{float(r['price'] or 0):.4f}",
+                r["order_id"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(r)
+    if len(rows) < len(raw):
+        log.warning("ledger: %d repeated fill record(s) in the run log ignored",
+                    len(raw) - len(rows))
 
     os.makedirs(os.path.dirname(ledger_path) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(ledger_path) or ".", suffix=".tmp")
@@ -161,7 +195,7 @@ def rebuild_from_db(db_path: str, ledger_path: str) -> int:
                     "quantity": f"{float(r['quantity'] or 0):g}",
                     "price": f"{float(r['price'] or 0):.4f}",
                     "order_id": r["order_id"] or "",
-                    "exec_id": "",      # not recorded in the run log
+                    "exec_id": r.get("exec_id") or "",
                 })
         os.replace(tmp, ledger_path)
     except Exception:
@@ -170,6 +204,11 @@ def rebuild_from_db(db_path: str, ledger_path: str) -> int:
         raise
     log.info("ledger: rebuilt %s from %d recorded fill(s)", ledger_path, len(rows))
     return len(rows)
+
+
+def _fill_identity(symbol, side, quantity, order_id) -> tuple:
+    return (str(symbol).upper(), str(side).upper()[:1], f"{float(quantity):g}",
+            str(order_id))
 
 
 def _key(exec_id, session_date, symbol, side, quantity, order_id) -> str:
