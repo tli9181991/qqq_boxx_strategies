@@ -31,7 +31,8 @@ import numpy as np
 import pandas as pd
 
 from ..config import Config, SAFE_ASSET
-from ..strategies import book_vol_target, cross_sectional_momentum, drawdown_stop
+from ..strategies import (book_vol_target, cross_sectional_momentum, drawdown_stop,
+                          residual_momentum)
 from ..data import load_prices
 from ..universe import load_universe, load_universe_prices
 
@@ -65,18 +66,48 @@ class TargetBook:
     shadow: List[Dict] = field(default_factory=list)
     # Where a watched non-constituent would have ranked. Same guarantee.
     watchlist: List[Dict] = field(default_factory=list)
+    # Per-strategy targets are retained even though IB sees their aggregate.
+    # This makes an overlap explicit: $6k MRVL in each sleeve becomes a $12k
+    # broker target while the residual sleeve is funded by reducing BOXX.
+    strategy_weights: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    strategy_holdings: Dict[str, List[str]] = field(default_factory=dict)
+    strategy_notionals: Dict[str, float] = field(default_factory=dict)
+    strategy_daily_returns: Dict[str, float] = field(default_factory=dict)
 
     @property
     def risk_weight(self) -> float:
         return float(sum(w for t, w in self.weights.items() if t != SAFE_ASSET))
 
     def describe(self) -> str:
-        held = ", ".join(f"{t} {self.weights[t]:.1%}"
-                         for t in self.raw_holdings if self.weights.get(t, 0) > 0)
+        # Sleeve weights live on different denominators: the momentum signal
+        # is a fraction of the whole book, while residual is a fraction of its
+        # $36k carve-out. Display both as contributions to the aggregate book
+        # so an overlap is readable (MRVL 6.7% + 6.0% = 12.7% held at IB).
+        book_notional = self.strategy_notionals.get("momentum", 0.0)
+
+        def _sleeve(key: str, fallback: Optional[List[str]] = None) -> str:
+            names = self.strategy_holdings.get(key, fallback or [])
+            sleeve_notional = self.strategy_notionals.get(key, book_notional)
+            sleeve_weights = self.strategy_weights.get(key, {})
+            parts = []
+            for ticker in names:
+                if book_notional and ticker in sleeve_weights:
+                    dollars = sleeve_weights[ticker] * sleeve_notional
+                    parts.append(f"{ticker} {dollars / book_notional:.1%} "
+                                 f"(${dollars:,.0f})")
+                elif self.weights.get(ticker, 0) > 0:
+                    parts.append(f"{ticker} {self.weights[ticker]:.1%}")
+            return ", ".join(parts) or "(none)"
+
+        momentum = _sleeve("momentum", self.raw_holdings)
+        extra = ""
+        if "resmom" in self.strategy_holdings:
+            extra = f"\n  residual: {_sleeve('resmom')}"
         return (f"{self.asof:%Y-%m-%d}  book {self.risk_weight:.0%} "
                 f"(scalar {self.scalar:.2f}, book vol {self.book_vol:.0%})\n"
-                f"  holdings: {held or '(none)'}\n"
-                f"  {SAFE_ASSET}: {self.weights.get(SAFE_ASSET, 0.0):.1%}")
+                f"  momentum: {momentum}\n"
+                f"  {SAFE_ASSET}: {self.weights.get(SAFE_ASSET, 0.0):.1%}"
+                f"{extra}")
 
 
 class SignalError(RuntimeError):
@@ -279,6 +310,8 @@ def compute_targets(
     record_ranks: int = 25,
     shadow_weights: Sequence[float] = (),
     watch_names: Sequence[str] = (),
+    base_notional: float = 1.0,
+    residual_notional: float = 0.0,
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -371,7 +404,59 @@ def compute_targets(
 
     asof = vt.weights.index[-1]
     row = vt.weights.loc[asof]
-    weights = {t: float(w) for t, w in row.items() if abs(float(w)) > 1e-9}
+    momentum_weights = {t: float(w) for t, w in row.items()
+                        if abs(float(w)) > 1e-9}
+    residual_weights: Dict[str, float] = {}
+    residual_held: List[str] = []
+    residual_sig = None
+    if residual_notional > 0:
+        if cfg.resmom.n_hold != 6:
+            raise SignalError("the live residual sleeve must have exactly six slots")
+        market = prices.get(cfg.resmom.market_asset)
+        if market is None:
+            raise SignalError(
+                f"the residual sleeve needs market series {cfg.resmom.market_asset}")
+        residual_sig = residual_momentum(uni, prices[safe], market, cfg.resmom)
+        rrow = residual_sig.weights.loc[asof]
+        residual_weights = {t: float(w) for t, w in rrow.items()
+                            if abs(float(w)) > 1e-9}
+        residual_held = list((residual_sig.holdings_log or {}).get(asof, []))
+
+    if base_notional <= 0:
+        raise SignalError("base_notional must be positive")
+    if residual_notional < 0:
+        raise SignalError("residual_notional must not be negative")
+    if residual_notional > base_notional:
+        raise SignalError("residual_notional cannot exceed the aggregate book")
+    target_dollars: Dict[str, float] = {}
+    for ticker, weight in momentum_weights.items():
+        target_dollars[ticker] = target_dollars.get(ticker, 0.0) + weight * base_notional
+    available_safe = target_dollars.get(safe, 0.0)
+    if residual_notional > available_safe + 1e-6:
+        raise SignalError(
+            f"residual sleeve needs ${residual_notional:,.0f} from {safe}, but the "
+            f"main strategy currently allocates only ${available_safe:,.0f}. "
+            "Refusing to add leverage; reduce QBS_RESMOM_NOTIONAL or wait for a "
+            "larger safe-asset allocation.")
+    target_dollars[safe] = available_safe - residual_notional
+    for ticker, weight in residual_weights.items():
+        target_dollars[ticker] = (target_dollars.get(ticker, 0.0)
+                                  + weight * residual_notional)
+    weights = {t: dollars / base_notional for t, dollars in target_dollars.items()
+               if abs(dollars) > 1e-9}
+
+    def _last_net_return(signal) -> float:
+        held_weights = signal.weights.reindex(combined.index).ffill().shift(
+            cfg.execution_lag).fillna(0.0)
+        asset_returns = combined.pct_change().fillna(0.0)
+        gross = (held_weights * asset_returns[held_weights.columns]).sum(axis=1)
+        turnover = held_weights.diff().abs().sum(axis=1)
+        cost_rate = (cfg.cost_bps + cfg.slippage_bps) / 1e4
+        return float(gross.loc[asof] - turnover.loc[asof] * cost_rate)
+
+    daily_returns = {"momentum": _last_net_return(vt)}
+    if residual_sig is not None:
+        daily_returns["resmom"] = _last_net_return(residual_sig)
 
     vdiag = vt.diagnostics.loc[asof]
     halted = bool(vt.diagnostics.get("blocked", pd.Series(dtype=float)).get(asof, 0.0))
@@ -449,6 +534,13 @@ def compute_targets(
         ranking=ranking,
         shadow=shadow,
         watchlist=watchlist,
+        strategy_weights={"momentum": momentum_weights,
+                          **({"resmom": residual_weights} if residual_weights else {})},
+        strategy_holdings={"momentum": held,
+                           **({"resmom": residual_held} if residual_weights else {})},
+        strategy_notionals={"momentum": base_notional,
+                            **({"resmom": residual_notional} if residual_weights else {})},
+        strategy_daily_returns=daily_returns,
     )
 
     total = sum(book.weights.values())
