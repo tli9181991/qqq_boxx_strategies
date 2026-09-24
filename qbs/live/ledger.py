@@ -126,6 +126,44 @@ def append_fills(path: str, session_date: str, fills: Iterable) -> int:
     return len(new)
 
 
+def adopt_account(path: str, session_date: str, mine: Dict[str, int],
+                  account: Dict[str, int], symbols: Iterable[str]) -> Dict[str, int]:
+    """Set the ledger's count for `symbols` to what the account holds.
+
+    For a session whose fills never reached the ledger -- a reconcile that did
+    not run, since IB only reports the current day's executions. Written as
+    explicit ADJUST rows, not by editing history, so the file still shows what
+    was recorded and what was corrected. Returns {symbol: change}.
+    """
+    changes = {}
+    for sym in sorted({str(s).upper() for s in symbols}):
+        delta = int(account.get(sym, 0)) - int(mine.get(sym, 0))
+        if delta:
+            changes[sym] = delta
+    if not changes:
+        return {}
+    stamp = utc_now_iso()
+    fresh = not os.path.exists(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=COLUMNS)
+        if fresh:
+            w.writeheader()
+        for sym, delta in changes.items():
+            w.writerow({
+                "timestamp": stamp,
+                "session_date": session_date,
+                "symbol": sym,
+                "side": "BUY" if delta > 0 else "SELL",
+                "quantity": f"{abs(delta):g}",
+                "price": "",
+                "order_id": "ADJUST",
+                "exec_id": f"adjust:{stamp}:{sym}",
+            })
+    log.warning("ledger: adjusted to the account: %s", changes)
+    return changes
+
+
 def start_flat(path: str) -> None:
     """Write a header-only ledger: the strategy holds nothing yet.
 

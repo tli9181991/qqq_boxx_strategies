@@ -785,7 +785,8 @@ def phase_baseline(live: LiveConfig, capture: bool = False,
 
 
 def phase_ledger(live: LiveConfig, rebuild: bool = False,
-                 force: bool = False, start_flat: bool = False) -> int:
+                 force: bool = False, start_flat: bool = False,
+                 adopt: Optional[List[str]] = None) -> int:
     """Show the strategy's tallied book, or rebuild it from the run log.
 
     Rebuilding matters because the ledger only starts recording once
@@ -819,7 +820,19 @@ def phase_ledger(live: LiveConfig, rebuild: bool = False,
         with IBBroker(live) as broker:
             account = broker.positions()
     except BrokerError as exc:
+        if adopt:
+            log.error("could not read the account (%s); nothing adjusted", exc)
+            return EXIT_CONFIG
         log.warning("could not read the account (%s); showing the ledger alone", exc)
+
+    if adopt:
+        # "all" adopts every difference, including shares the ledger does not
+        # claim -- so it declares nothing in the account is yours.
+        wanted = (set(mine) | set(account)) if [a.lower() for a in adopt] == ["all"] \
+            else set(adopt)
+        session = f"{market_today(live.market_tz).date()}"
+        ldg.adopt_account(path, session, mine, account, wanted)
+        mine = ldg.positions(path)
 
     residual, over = ldg.reconcile_against_account(mine, account) if account \
         else ({}, {})
@@ -833,6 +846,9 @@ def phase_ledger(live: LiveConfig, rebuild: bool = False,
     if over:
         print("\nMISMATCH: the ledger claims more than the account holds: "
               f"{dict(sorted(over.items()))}")
+        print("If a session's fills were never recorded, set those names (and "
+              "whatever that session bought) to the account:\n  runner ledger "
+              f"--adopt {' '.join(sorted(over))} <names it bought>")
     print(f"\nledger file: {path}")
     if not mine and account:
         print("\nThe ledger is empty while the account is not. With "
@@ -903,6 +919,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true",
                    help="ledger: reconstruct the tally from the fills already "
                         "recorded in the run log")
+    p.add_argument("--adopt", nargs="+", metavar="SYMBOL",
+                   help="ledger: set the ledger's count for these symbols to what "
+                        "the account holds, for fills that were never recorded. "
+                        "'all' adopts every symbol (nothing in the account is yours)")
     p.add_argument("--start-flat", action="store_true",
                    help="ledger: create an empty ledger, declaring that the "
                         "strategy holds nothing and every share is yours")
@@ -957,7 +977,7 @@ def main(argv=None) -> int:
         return phase_sheets(live)
     if args.phase == "ledger":
         return phase_ledger(live, rebuild=args.rebuild, force=args.force,
-                            start_flat=args.start_flat)
+                            start_flat=args.start_flat, adopt=args.adopt)
     if args.phase == "preflight":
         return phase_preflight(cfg, live)
     if args.phase == "trade":
