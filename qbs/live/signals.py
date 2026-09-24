@@ -79,15 +79,33 @@ class TargetBook:
         return float(sum(w for t, w in self.weights.items() if t != SAFE_ASSET))
 
     def describe(self) -> str:
-        held = ", ".join(f"{t} {self.weights[t]:.1%}"
-                         for t in self.raw_holdings if self.weights.get(t, 0) > 0)
+        # Sleeve weights live on different denominators: the momentum signal
+        # is a fraction of the whole book, while residual is a fraction of its
+        # $36k carve-out. Display both as contributions to the aggregate book
+        # so an overlap is readable (MRVL 6.7% + 6.0% = 12.7% held at IB).
+        book_notional = self.strategy_notionals.get("momentum", 0.0)
+
+        def _sleeve(key: str, fallback: Optional[List[str]] = None) -> str:
+            names = self.strategy_holdings.get(key, fallback or [])
+            sleeve_notional = self.strategy_notionals.get(key, book_notional)
+            sleeve_weights = self.strategy_weights.get(key, {})
+            parts = []
+            for ticker in names:
+                if book_notional and ticker in sleeve_weights:
+                    dollars = sleeve_weights[ticker] * sleeve_notional
+                    parts.append(f"{ticker} {dollars / book_notional:.1%} "
+                                 f"(${dollars:,.0f})")
+                elif self.weights.get(ticker, 0) > 0:
+                    parts.append(f"{ticker} {self.weights[ticker]:.1%}")
+            return ", ".join(parts) or "(none)"
+
+        momentum = _sleeve("momentum", self.raw_holdings)
         extra = ""
-        if self.strategy_holdings.get("resmom"):
-            extra = ("\n  residual: "
-                     + ", ".join(self.strategy_holdings["resmom"]))
+        if "resmom" in self.strategy_holdings:
+            extra = f"\n  residual: {_sleeve('resmom')}"
         return (f"{self.asof:%Y-%m-%d}  book {self.risk_weight:.0%} "
                 f"(scalar {self.scalar:.2f}, book vol {self.book_vol:.0%})\n"
-                f"  holdings: {held or '(none)'}\n"
+                f"  momentum: {momentum}\n"
                 f"  {SAFE_ASSET}: {self.weights.get(SAFE_ASSET, 0.0):.1%}"
                 f"{extra}")
 

@@ -386,6 +386,12 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
         assert abs(book.weights.get(symbol, 0.0) * 100_000 - expected) < 1e-8
     assert set(book.strategy_daily_returns) == {"momentum", "resmom"}
     assert all(np.isfinite(v) for v in book.strategy_daily_returns.values())
+    description = book.describe()
+    assert "momentum:" in description and "residual:" in description
+    # Six equal residual slots contribute 6% apiece to the $100k aggregate
+    # book, and the dollar label makes that denominator unambiguous.
+    for symbol in book.strategy_holdings["resmom"]:
+        assert f"{symbol} 6.0% ($6,000)" in description
 
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "comparison.csv")
