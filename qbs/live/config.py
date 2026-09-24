@@ -82,6 +82,9 @@ class LiveConfig:
 
     # ---- sizing ----------------------------------------------------------
     notional: float = 100_000.0
+    # Optional second paper book. 36,000 means six residual-momentum slots at
+    # $6,000 each. Zero keeps the original single-book deployment unchanged.
+    residual_notional: float = 0.0
     hold_safe_asset: bool = True   # False -> leave the cash leg as cash, not BOXX
     safe_asset: str = SAFE_ASSET
 
@@ -179,6 +182,8 @@ class LiveConfig:
             self.kill_switch = os.path.join(self.state_dir, "HALT")
         if self.notional <= 0:
             raise ValueError("notional must be positive")
+        if self.residual_notional < 0:
+            raise ValueError("residual_notional must not be negative")
         if self.max_gross_turnover <= 0:
             raise ValueError("max_gross_turnover must be positive")
         if not 0.0 < self.min_universe_coverage <= 1.0:
@@ -212,6 +217,11 @@ class LiveConfig:
         avoids opening a socket to something obviously live.
         """
         return self.ib_port in self.paper_ports
+
+    @property
+    def total_notional(self) -> float:
+        """Capital used by the aggregate broker position."""
+        return self.notional + self.residual_notional
 
     def looks_like_paper_account(self, account: str) -> bool:
         """IB paper accounts are DU (individual) or DF (advisor); live are U/F."""
@@ -257,6 +267,11 @@ class LiveConfig:
         return os.path.join(self.state_dir, "shadow_log.csv")
 
     @property
+    def strategy_comparison_csv_path(self) -> str:
+        """Daily model returns for the momentum-vs-residual paper trial."""
+        return os.path.join(self.state_dir, "strategy_comparison.csv")
+
+    @property
     def trade_csv_path(self) -> str:
         """Every trading event, rewritten from the database on each run."""
         return os.path.join(self.state_dir, "trade_log.csv")
@@ -300,6 +315,8 @@ class LiveConfig:
         cfg.ib_client_id = _env_int("QBS_IB_CLIENT_ID", cfg.ib_client_id)
         cfg.ib_account = os.environ.get("QBS_IB_ACCOUNT", cfg.ib_account)
         cfg.notional = _env_float("QBS_NOTIONAL", cfg.notional)
+        cfg.residual_notional = _env_float("QBS_RESMOM_NOTIONAL",
+                                           cfg.residual_notional)
         cfg.state_dir = os.environ.get("QBS_STATE_DIR", cfg.state_dir)
         cfg.dry_run = _env_bool("QBS_DRY_RUN", cfg.dry_run)
         cfg.allow_live_account = _env_bool("QBS_ALLOW_LIVE", cfg.allow_live_account)
@@ -313,6 +330,7 @@ class LiveConfig:
         cfg.position_source = os.environ.get("QBS_POSITION_SOURCE",
                                              cfg.position_source)
         cfg.rebalance_drift = _env_float("QBS_REBALANCE_DRIFT", cfg.rebalance_drift)
+        cfg.max_positions = _env_int("QBS_MAX_POSITIONS", cfg.max_positions)
         cfg.ranking_log_top = _env_int("QBS_RANKING_TOP", cfg.ranking_log_top)
         cfg.early_close_hhmm = os.environ.get("QBS_EARLY_CLOSE_HHMM",
                                               cfg.early_close_hhmm)

@@ -304,6 +304,48 @@ When the order lists stop surprising you, set `QBS_DRY_RUN=0` in
 `deploy/docker/.env`. No restart is needed — each phase reads the file when it
 runs.
 
+### Add the six-stock residual-momentum paper sleeve
+
+The original momentum sleeve continues to use `QBS_NOTIONAL`. To compare it
+against six residual-momentum picks at $6,000 per slot, add:
+
+```bash
+QBS_NOTIONAL=36000
+QBS_RESMOM_NOTIONAL=36000
+QBS_MAX_POSITIONS=13
+QBS_DRY_RUN=1
+```
+
+The broker sees the aggregate target. If MRVL occupies one $6,000 slot in both
+sleeves, its combined target is $12,000; it is not deduplicated and spread
+across the other names. BOXX can be the thirteenth position when either
+strategy has an unfilled slot, hence the position-cap increase to 13.
+
+Run preflight and read the two labelled holding lists before allowing the paper
+trade timer to send anything:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
+```
+
+Each successful preflight/trade run upserts that session's net model return in
+`var/strategy_comparison.csv`. After the trial, the normal report compounds
+each sleeve separately (including the configured commission and slippage):
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
+  qbs report --days 31
+```
+
+These are strategy-model returns, not an attempt to split the IB account's
+combined P&L. That distinction matters for an overlap such as MRVL: IB holds
+one aggregate position, while the comparison keeps one $6,000 contribution in
+each strategy.
+
+Set `QBS_RESMOM_NOTIONAL=0` to return to the original single strategy. This
+switch does not enable a live IB account; the live-account guard remains
+independent.
+
 ## Sharing an account with your own holdings
 
 Skip this if the strategy has an account to itself — which is the arrangement to
