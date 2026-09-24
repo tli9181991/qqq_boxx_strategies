@@ -348,6 +348,90 @@ def test_live_config_refuses_a_bad_notional():
         LiveConfig(notional=0)
 
 
+def test_live_config_residual_sleeve_is_opt_in(monkeypatch):
+    assert LiveConfig().residual_notional == 0.0
+    assert LiveConfig(notional=100_000, residual_notional=36_000).total_notional == 100_000
+    with pytest.raises(ValueError, match="residual_notional"):
+        LiveConfig(residual_notional=-1)
+    monkeypatch.setenv("QBS_RESMOM_NOTIONAL", "36000")
+    monkeypatch.setenv("QBS_MAX_POSITIONS", "13")
+    cfg = LiveConfig.from_env()
+    assert cfg.residual_notional == 36_000
+    assert cfg.max_positions == 13
+
+
+def test_docker_compose_forwards_the_position_source():
+    """A ledger setting in .env must reach the container without its secrets."""
+    compose = open(os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "deploy", "docker", "docker-compose.yml",
+    )).read()
+    assert 'QBS_POSITION_SOURCE: "${QBS_POSITION_SOURCE:-account}"' in compose
+
+
+def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    cfg.resmom.min_history = 200
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]
+
+    book = compute_targets(
+        cfg, frame, requested=list(uni.columns), now=frame.index[-1],
+        base_notional=100_000, residual_notional=36_000,
+    )
+
+    assert set(book.strategy_weights) == {"momentum", "resmom"}
+    assert len(book.strategy_holdings["resmom"]) <= 6
+    assert book.strategy_notionals == {"momentum": 100_000, "resmom": 36_000}
+    for symbol in set(book.strategy_weights["momentum"]) | set(book.strategy_weights["resmom"]):
+        expected = (100_000 * book.strategy_weights["momentum"].get(symbol, 0.0)
+                    + 36_000 * book.strategy_weights["resmom"].get(symbol, 0.0))
+        if symbol == cfg.momentum.safe_asset:
+            expected -= 36_000
+        assert abs(book.weights.get(symbol, 0.0) * 100_000 - expected) < 1e-8
+    assert set(book.strategy_daily_returns) == {"momentum", "resmom"}
+    assert all(np.isfinite(v) for v in book.strategy_daily_returns.values())
+    description = book.describe()
+    assert "momentum:" in description and "residual:" in description
+    # Six equal residual slots contribute 6% apiece to the $100k aggregate
+    # book, and the dollar label makes that denominator unambiguous.
+    for symbol in book.strategy_holdings["resmom"]:
+        assert f"{symbol} 6.0% ($6,000)" in description
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "comparison.csv")
+        assert st.upsert_strategy_comparison_csv(
+            path, f"{book.asof:%Y-%m-%d}", book) == 2
+        # A second preflight for the same close replaces, rather than doubles,
+        # the two strategy rows.
+        st.upsert_strategy_comparison_csv(path, f"{book.asof:%Y-%m-%d}", book)
+        rows = st.strategy_comparison(path, days=31)
+        assert {r["strategy"] for r in rows} == {"momentum", "resmom"}
+        assert all(r["sessions"] == 1 for r in rows)
+
+
+def test_residual_sleeve_refuses_to_borrow_when_boxx_is_too_small():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    cfg.resmom.min_history = 200
+    cfg.dd_stop.enabled = False
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]
+
+    with pytest.raises(SignalError, match="Refusing to add leverage"):
+        compute_targets(
+            cfg, frame, requested=list(uni.columns), now=frame.index[-1],
+            base_notional=100_000, residual_notional=36_000,
+        )
+
+
 def test_live_config_knows_the_paper_ports():
     assert LiveConfig(ib_port=4002).is_paper_port
     assert LiveConfig(ib_port=7497).is_paper_port

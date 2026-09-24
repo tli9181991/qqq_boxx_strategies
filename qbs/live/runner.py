@@ -217,6 +217,8 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         record_ranks=live.ranking_log_top,
         shadow_weights=live.shadow_weights if shadow else (),
         watch_names=live.watchlist if shadow else (),
+        base_notional=live.notional,
+        residual_notional=live.residual_notional,
     )
     return px, book
 
@@ -238,6 +240,9 @@ def _write_csv_logs(live: LiveConfig, book=None) -> None:
         if book is not None and book.watchlist:
             st.append_watchlist_csv(live.watchlist_csv_path,
                                     f"{book.asof:%Y-%m-%d}", book.watchlist)
+        if book is not None and book.strategy_daily_returns:
+            st.upsert_strategy_comparison_csv(
+                live.strategy_comparison_csv_path, f"{book.asof:%Y-%m-%d}", book)
         store.export_trade_csv(live.db_path, live.trade_csv_path)
     except Exception as exc:
         log.warning("could not refresh the CSV logs (%s: %s); the database is "
@@ -327,7 +332,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
-                notional=live.notional,
+                notional=live.total_notional,
                 max_order_notional=live.max_order_notional,
                 max_gross_turnover=live.max_gross_turnover,
                 max_positions=live.max_positions,
@@ -342,7 +347,7 @@ def phase_preflight(cfg: Config, live: LiveConfig) -> int:
                      format_order_table(orders, target, positions))
             st.write_book_csv(live.book_csv_path, account, external, positions,
                               prices=book.prices, target=target,
-                              notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
+                              notional=live.total_notional, asof=f"{book.asof:%Y-%m-%d}")
             _write_csv_logs(live, book)
             broker.qualify(sorted({o.symbol for o in orders} | set(target)))
             log.info("all symbols qualified with IB")
@@ -434,7 +439,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
 
             orders, target = build_orders(
                 book.weights, book.prices, positions,
-                notional=live.notional,
+                notional=live.total_notional,
                 max_order_notional=live.max_order_notional,
                 max_gross_turnover=live.max_gross_turnover,
                 max_positions=live.max_positions,
@@ -448,7 +453,7 @@ def phase_trade(cfg: Config, live: LiveConfig, force: bool = False) -> int:
             log.info("order list:\n%s", format_order_table(orders, target, positions))
             st.write_book_csv(live.book_csv_path, account, external, positions,
                               prices=book.prices, target=target,
-                              notional=live.notional, asof=f"{book.asof:%Y-%m-%d}")
+                              notional=live.total_notional, asof=f"{book.asof:%Y-%m-%d}")
             _write_csv_logs(live, book)
 
             # Checked here, immediately before sending, not at the top of the
@@ -568,7 +573,7 @@ def phase_reconcile(cfg: Config, live: LiveConfig) -> int:
             # Actual weights are measured against the book we intended to run,
             # not against NLV: the whole point of a fixed notional is that
             # target and actual are comparable on the same denominator.
-            denom = live.notional or total_mv or 1.0
+            denom = live.total_notional or total_mv or 1.0
             last = st.load_state(live.state_path).get("last_trade") or {}
             for m in marks:
                 m["actual_weight"] = m["market_value"] / denom
@@ -629,6 +634,16 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     counts = store.summary(live.db_path)
     print(f"\nrun log: {live.db_path}")
     print("  " + "   ".join(f"{k}={v}" for k, v in counts.items()) + "\n")
+
+    comparison = st.strategy_comparison(live.strategy_comparison_csv_path,
+                                        days=days)
+    if comparison:
+        print("STRATEGY COMPARISON (model return after configured costs)")
+        for row in comparison:
+            print(f"  {row['strategy']:<10} {row['return']:>8.2%}  "
+                  f"{row['sessions']:>3} sessions  ${row['notional']:,.0f}  "
+                  f"{row['start']} to {row['end']}")
+        print()
 
     nav = store.nav_history(live.db_path, limit=days)
     if nav:

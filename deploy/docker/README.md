@@ -304,6 +304,52 @@ When the order lists stop surprising you, set `QBS_DRY_RUN=0` in
 `deploy/docker/.env`. No restart is needed — each phase reads the file when it
 runs.
 
+### Add the six-stock residual-momentum paper sleeve
+
+Keep the existing `QBS_NOTIONAL`; it remains the total account book. To fund
+six residual-momentum picks at $6,000 per slot from BOXX, add:
+
+```bash
+# Keep this at its existing value (100000 in the standard deployment).
+QBS_NOTIONAL=100000
+QBS_RESMOM_NOTIONAL=36000
+QBS_MAX_POSITIONS=13
+QBS_DRY_RUN=1
+```
+
+`QBS_RESMOM_NOTIONAL` is carved out of the main strategy's BOXX target: a
+$100,000 book remains a $100,000 book rather than becoming a leveraged
+$136,000 book. The signal refuses if the main strategy currently wants less
+than $36,000 in BOXX. If MRVL occupies one $6,000 slot in both sleeves, its
+combined target is $12,000; it is not deduplicated and spread across the other
+names. BOXX can be the thirteenth position when either strategy has an
+unfilled slot, hence the position-cap increase to 13.
+
+Run preflight and read the two labelled holding lists before allowing the paper
+trade timer to send anything:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
+```
+
+Each successful preflight/trade run upserts that session's net model return in
+`var/strategy_comparison.csv`. After the trial, the normal report compounds
+each sleeve separately (including the configured commission and slippage):
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
+  qbs report --days 31
+```
+
+These are strategy-model returns, not an attempt to split the IB account's
+combined P&L. That distinction matters for an overlap such as MRVL: IB holds
+one aggregate position, while the comparison keeps one $6,000 contribution in
+each strategy.
+
+Set `QBS_RESMOM_NOTIONAL=0` to return to the original single strategy. This
+switch does not enable a live IB account; the live-account guard remains
+independent.
+
 ## Sharing an account with your own holdings
 
 Skip this if the strategy has an account to itself — which is the arrangement to
@@ -329,6 +375,17 @@ the reconcile unit fail, and is cross-checked on every run.
 ```bash
 QBS_POSITION_SOURCE=ledger
 ```
+
+Verify Compose actually forwards it to the short-lived trader container:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml config \
+  | grep QBS_POSITION_SOURCE
+```
+
+It must print `QBS_POSITION_SOURCE: ledger`. The trader deliberately does not
+receive the whole `.env` file because it contains the IB password, so each
+non-secret trader setting has to be mapped explicitly in Compose.
 
 Switch it on **while the account is flat**. That is the only moment a tally
 starts from a guaranteed-correct zero. Switching later leaves an empty ledger
