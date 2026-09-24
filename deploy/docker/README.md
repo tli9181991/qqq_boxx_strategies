@@ -419,7 +419,21 @@ $C run --rm --no-deps qbs ledger               # check: ledger vs account
 mode too. Older run logs hold the same fill more than once (every reconcile
 re-logged the day's executions); the rebuild counts each execution once. A
 ledger rebuilt before that fix can claim more than the account holds -- rebuild
-it again with `ledger --rebuild --force`. If you also traded by hand in that account, check the side-by-side
+it again with `ledger --rebuild --force`.
+
+**A session the ledger missed.** IB reports only the current day's executions,
+so a reconcile that did not run loses that day's fills for good. The table then
+shows a rotation: names the ledger still claims but the account no longer holds,
+and the names bought in their place counted as yours. Set exactly those names to
+the account:
+
+```bash
+$C run --rm --no-deps qbs ledger --adopt AMAT LRCX AMD PANW TEAM
+$C run --rm --no-deps qbs ledger --adopt all   # nothing in the account is yours
+```
+
+Adjustments are appended as `ADJUST` rows, so the file keeps what was recorded
+and what was corrected. A later `--rebuild` discards them. If you also traded by hand in that account, check the side-by-side
 table afterwards: those fills are in the log as well.
 
 Switch it on **while the account is flat**. That is the only moment a tally

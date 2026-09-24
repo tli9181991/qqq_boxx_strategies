@@ -1567,6 +1567,43 @@ def test_a_missing_ledger_beside_a_held_account_refuses_to_trade(tmp_path):
     assert mine == {} and yours == {"MU": 6}
 
 
+def test_adopting_the_account_writes_the_missed_rotation(tmp_path, monkeypatch):
+    """The ledger missed a session: AMAT/LRCX sold, AMD trimmed, PANW/TEAM bought."""
+    from qbs.live import broker as brk, ledger
+    from qbs.live.runner import phase_ledger
+
+    live = LiveConfig(state_dir=str(tmp_path), position_source="ledger")
+    ledger.append_fills(live.ledger_path, "2026-09-18", [
+        _fill("AMAT", "BUY", 14, 190.0, 1, "a"), _fill("AMD", "BUY", 12, 160.0, 2, "b"),
+        _fill("LRCX", "BUY", 21, 95.0, 3, "c"), _fill("MU", "BUY", 6, 900.0, 4, "d")])
+    held = {"AMD": 11, "MU": 6, "PANW": 18, "TEAM": 35, "NVDA": 5}
+
+    class FakeIB:
+        def __init__(self, cfg):
+            pass
+
+        def __enter__(self):
+            return _Account(held)
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(brk, "IBBroker", FakeIB)
+    assert phase_ledger(live, adopt=["AMAT", "AMD", "LRCX", "PANW", "TEAM"]) == 0
+    # NVDA was not named, so it stays yours.
+    assert ledger.positions(live.ledger_path) == {"AMD": 11, "MU": 6, "PANW": 18,
+                                                  "TEAM": 35}
+    residual, over = ledger.reconcile_against_account(
+        ledger.positions(live.ledger_path), held)
+    assert over == {} and residual == {"NVDA": 5}
+    # Adopting again changes nothing.
+    assert ledger.adopt_account(live.ledger_path, "2026-09-24",
+                                ledger.positions(live.ledger_path), held,
+                                ["AMD", "PANW"]) == {}
+    assert phase_ledger(live, adopt=["all"]) == 0
+    assert ledger.positions(live.ledger_path) == held
+
+
 def test_a_missing_ledger_beside_a_flat_account_is_a_clean_start(tmp_path):
     from qbs.live.runner import _strategy_book
 
