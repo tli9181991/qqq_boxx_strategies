@@ -79,8 +79,8 @@ services:
       # 15:30 you want a clean log where a real error stands out.
       HOME: /tmp
       QBS_NOTIONAL: "${QBS_NOTIONAL:-100000}"
-      # Optional second six-slot paper sleeve. At 36000 each residual pick has
-      # a $6000 target; overlapping names add at the broker-account level.
+      # Optional six-slot sleeve funded from BOXX. At 36000 each residual pick
+      # has a $6000 target; total account notional does not increase.
       QBS_RESMOM_NOTIONAL: "${QBS_RESMOM_NOTIONAL:-0}"
       QBS_MAX_POSITIONS: "${QBS_MAX_POSITIONS:-12}"
       QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"

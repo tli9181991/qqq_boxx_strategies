@@ -82,8 +82,9 @@ class LiveConfig:
 
     # ---- sizing ----------------------------------------------------------
     notional: float = 100_000.0
-    # Optional second paper book. 36,000 means six residual-momentum slots at
-    # $6,000 each. Zero keeps the original single-book deployment unchanged.
+    # Optional paper sleeve funded from the main book's BOXX allocation.
+    # 36,000 means six residual-momentum slots at $6,000 each; it does NOT add
+    # $36,000 of leverage to `notional`.
     residual_notional: float = 0.0
     hold_safe_asset: bool = True   # False -> leave the cash leg as cash, not BOXX
     safe_asset: str = SAFE_ASSET
@@ -220,8 +221,13 @@ class LiveConfig:
 
     @property
     def total_notional(self) -> float:
-        """Capital used by the aggregate broker position."""
-        return self.notional + self.residual_notional
+        """Capital used by the aggregate broker position.
+
+        The residual sleeve is carved out of BOXX, not added on top. Keeping
+        this property makes the order/NAV call sites explicit while preventing
+        a $100k account plus a $36k sleeve from silently becoming a $136k book.
+        """
+        return self.notional
 
     def looks_like_paper_account(self, account: str) -> bool:
         """IB paper accounts are DU (individual) or DF (advisor); live are U/F."""

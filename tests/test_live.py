@@ -350,7 +350,7 @@ def test_live_config_refuses_a_bad_notional():
 
 def test_live_config_residual_sleeve_is_opt_in(monkeypatch):
     assert LiveConfig().residual_notional == 0.0
-    assert LiveConfig(notional=36_000, residual_notional=36_000).total_notional == 72_000
+    assert LiveConfig(notional=100_000, residual_notional=36_000).total_notional == 100_000
     with pytest.raises(ValueError, match="residual_notional"):
         LiveConfig(residual_notional=-1)
     monkeypatch.setenv("QBS_RESMOM_NOTIONAL", "36000")
@@ -364,7 +364,6 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
     cfg = Config()
     cfg.momentum.min_history = 200
     cfg.resmom.min_history = 200
-    cfg.dd_stop.enabled = False
     px = synthetic_prices()
     uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
     frame = uni.copy()
@@ -373,16 +372,18 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
 
     book = compute_targets(
         cfg, frame, requested=list(uni.columns), now=frame.index[-1],
-        base_notional=36_000, residual_notional=36_000,
+        base_notional=100_000, residual_notional=36_000,
     )
 
     assert set(book.strategy_weights) == {"momentum", "resmom"}
     assert len(book.strategy_holdings["resmom"]) <= 6
-    assert book.strategy_notionals == {"momentum": 36_000, "resmom": 36_000}
+    assert book.strategy_notionals == {"momentum": 100_000, "resmom": 36_000}
     for symbol in set(book.strategy_weights["momentum"]) | set(book.strategy_weights["resmom"]):
-        expected = (36_000 * book.strategy_weights["momentum"].get(symbol, 0.0)
+        expected = (100_000 * book.strategy_weights["momentum"].get(symbol, 0.0)
                     + 36_000 * book.strategy_weights["resmom"].get(symbol, 0.0))
-        assert abs(book.weights.get(symbol, 0.0) * 72_000 - expected) < 1e-8
+        if symbol == cfg.momentum.safe_asset:
+            expected -= 36_000
+        assert abs(book.weights.get(symbol, 0.0) * 100_000 - expected) < 1e-8
     assert set(book.strategy_daily_returns) == {"momentum", "resmom"}
     assert all(np.isfinite(v) for v in book.strategy_daily_returns.values())
 
@@ -396,6 +397,24 @@ def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
         rows = st.strategy_comparison(path, days=31)
         assert {r["strategy"] for r in rows} == {"momentum", "resmom"}
         assert all(r["sessions"] == 1 for r in rows)
+
+
+def test_residual_sleeve_refuses_to_borrow_when_boxx_is_too_small():
+    cfg = Config()
+    cfg.momentum.min_history = 200
+    cfg.resmom.min_history = 200
+    cfg.dd_stop.enabled = False
+    px = synthetic_prices()
+    uni = synthetic_universe(n=30, start="2023-06-01").reindex(px.index).ffill()
+    frame = uni.copy()
+    frame["BOXX"] = px["BOXX"]
+    frame["QQQ"] = px["QQQ"]
+
+    with pytest.raises(SignalError, match="Refusing to add leverage"):
+        compute_targets(
+            cfg, frame, requested=list(uni.columns), now=frame.index[-1],
+            base_notional=100_000, residual_notional=36_000,
+        )
 
 
 def test_live_config_knows_the_paper_ports():

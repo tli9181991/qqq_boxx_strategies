@@ -306,20 +306,24 @@ runs.
 
 ### Add the six-stock residual-momentum paper sleeve
 
-The original momentum sleeve continues to use `QBS_NOTIONAL`. To compare it
-against six residual-momentum picks at $6,000 per slot, add:
+Keep the existing `QBS_NOTIONAL`; it remains the total account book. To fund
+six residual-momentum picks at $6,000 per slot from BOXX, add:
 
 ```bash
-QBS_NOTIONAL=36000
+# Keep this at its existing value (100000 in the standard deployment).
+QBS_NOTIONAL=100000
 QBS_RESMOM_NOTIONAL=36000
 QBS_MAX_POSITIONS=13
 QBS_DRY_RUN=1
 ```
 
-The broker sees the aggregate target. If MRVL occupies one $6,000 slot in both
-sleeves, its combined target is $12,000; it is not deduplicated and spread
-across the other names. BOXX can be the thirteenth position when either
-strategy has an unfilled slot, hence the position-cap increase to 13.
+`QBS_RESMOM_NOTIONAL` is carved out of the main strategy's BOXX target: a
+$100,000 book remains a $100,000 book rather than becoming a leveraged
+$136,000 book. The signal refuses if the main strategy currently wants less
+than $36,000 in BOXX. If MRVL occupies one $6,000 slot in both sleeves, its
+combined target is $12,000; it is not deduplicated and spread across the other
+names. BOXX can be the thirteenth position when either strategy has an
+unfilled slot, hence the position-cap increase to 13.
 
 Run preflight and read the two labelled holding lists before allowing the paper
 trade timer to send anything:

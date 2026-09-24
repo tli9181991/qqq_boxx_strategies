@@ -68,7 +68,7 @@ class TargetBook:
     watchlist: List[Dict] = field(default_factory=list)
     # Per-strategy targets are retained even though IB sees their aggregate.
     # This makes an overlap explicit: $6k MRVL in each sleeve becomes a $12k
-    # broker target while each strategy's one-month return remains measurable.
+    # broker target while the residual sleeve is funded by reducing BOXX.
     strategy_weights: Dict[str, Dict[str, float]] = field(default_factory=dict)
     strategy_holdings: Dict[str, List[str]] = field(default_factory=dict)
     strategy_notionals: Dict[str, float] = field(default_factory=dict)
@@ -404,16 +404,27 @@ def compute_targets(
                             if abs(float(w)) > 1e-9}
         residual_held = list((residual_sig.holdings_log or {}).get(asof, []))
 
-    total_notional = base_notional + residual_notional
-    if base_notional <= 0 or total_notional <= 0:
-        raise SignalError("strategy notionals must leave a positive aggregate book")
+    if base_notional <= 0:
+        raise SignalError("base_notional must be positive")
+    if residual_notional < 0:
+        raise SignalError("residual_notional must not be negative")
+    if residual_notional > base_notional:
+        raise SignalError("residual_notional cannot exceed the aggregate book")
     target_dollars: Dict[str, float] = {}
     for ticker, weight in momentum_weights.items():
         target_dollars[ticker] = target_dollars.get(ticker, 0.0) + weight * base_notional
+    available_safe = target_dollars.get(safe, 0.0)
+    if residual_notional > available_safe + 1e-6:
+        raise SignalError(
+            f"residual sleeve needs ${residual_notional:,.0f} from {safe}, but the "
+            f"main strategy currently allocates only ${available_safe:,.0f}. "
+            "Refusing to add leverage; reduce QBS_RESMOM_NOTIONAL or wait for a "
+            "larger safe-asset allocation.")
+    target_dollars[safe] = available_safe - residual_notional
     for ticker, weight in residual_weights.items():
         target_dollars[ticker] = (target_dollars.get(ticker, 0.0)
                                   + weight * residual_notional)
-    weights = {t: dollars / total_notional for t, dollars in target_dollars.items()
+    weights = {t: dollars / base_notional for t, dollars in target_dollars.items()
                if abs(dollars) > 1e-9}
 
     def _last_net_return(signal) -> float:
