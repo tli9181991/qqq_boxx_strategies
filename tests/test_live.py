@@ -360,6 +360,15 @@ def test_live_config_residual_sleeve_is_opt_in(monkeypatch):
     assert cfg.max_positions == 13
 
 
+def test_docker_compose_forwards_the_position_source():
+    """A ledger setting in .env must reach the container without its secrets."""
+    compose = open(os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "deploy", "docker", "docker-compose.yml",
+    )).read()
+    assert 'QBS_POSITION_SOURCE: "${QBS_POSITION_SOURCE:-account}"' in compose
+
+
 def test_residual_sleeve_adds_overlapping_targets_instead_of_deduplicating():
     cfg = Config()
     cfg.momentum.min_history = 200

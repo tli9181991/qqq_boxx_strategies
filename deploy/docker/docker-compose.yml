@@ -84,6 +84,11 @@ services:
       QBS_RESMOM_NOTIONAL: "${QBS_RESMOM_NOTIONAL:-0}"
       QBS_MAX_POSITIONS: "${QBS_MAX_POSITIONS:-12}"
       QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"
+      # Explicitly forward this setting: the trader deliberately does not get
+      # env_file because that would expose the Gateway login to it. Without
+      # this mapping, QBS_POSITION_SOURCE=ledger in .env silently falls back to
+      # `account` inside the container and can trade manually owned shares.
+      QBS_POSITION_SOURCE: "${QBS_POSITION_SOURCE:-account}"
       # Leave DRY_RUN on until you have watched a few sessions.
       QBS_DRY_RUN: "${QBS_DRY_RUN:-1}"
       TZ: America/New_York

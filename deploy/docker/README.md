@@ -376,6 +376,17 @@ the reconcile unit fail, and is cross-checked on every run.
 QBS_POSITION_SOURCE=ledger
 ```
 
+Verify Compose actually forwards it to the short-lived trader container:
+
+```bash
+docker compose -f deploy/docker/docker-compose.yml config \
+  | grep QBS_POSITION_SOURCE
+```
+
+It must print `QBS_POSITION_SOURCE: ledger`. The trader deliberately does not
+receive the whole `.env` file because it contains the IB password, so each
+non-secret trader setting has to be mapped explicitly in Compose.
+
 Switch it on **while the account is flat**. That is the only moment a tally
 starts from a guaranteed-correct zero. Switching later leaves an empty ledger
 beside a non-empty account, and the strategy then reads its own book as flat
