@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS trade_events (
     order_id      INTEGER,
     status        TEXT,
     reason        TEXT,
-    dry_run       INTEGER NOT NULL DEFAULT 0
+    dry_run       INTEGER NOT NULL DEFAULT 0,
+    exec_id       TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_trade_events_date   ON trade_events(session_date);
 CREATE INDEX IF NOT EXISTS ix_trade_events_symbol ON trade_events(symbol);
@@ -169,6 +170,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Idempotent: every statement is CREATE ... IF NOT EXISTS, so this also
         # adds tables introduced by a later version to an older file.
         conn.executescript(SCHEMA)
+    # Columns added after v1 shipped. CREATE TABLE IF NOT EXISTS cannot add a
+    # column to an existing table, so each is added here if it is missing.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(trade_events)")}
+    if "exec_id" not in have:
+        conn.execute("ALTER TABLE trade_events ADD COLUMN exec_id TEXT")
 
 
 # --------------------------------------------------------------------------
@@ -194,12 +200,13 @@ def log_trade_events(path: str, rows: Sequence[Dict[str, Any]]) -> int:
         r.get("status"),
         r.get("reason"),
         int(bool(r.get("dry_run", False))),
+        r.get("exec_id") or None,
     ) for r in rows]
     with connect(path) as conn:
         conn.executemany(
             "INSERT INTO trade_events (ts_utc, session_date, phase, event, symbol, "
-            "action, quantity, price, notional, order_id, status, reason, dry_run) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", payload)
+            "action, quantity, price, notional, order_id, status, reason, dry_run, "
+            "exec_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", payload)
     return len(payload)
 
 
@@ -224,6 +231,31 @@ def log_orders(path: str, session_date, phase: str, orders: Iterable,
 
 
 def log_fills(path: str, session_date, fills: Iterable, phase: str = "reconcile") -> int:
+    """Record executions, skipping any already recorded under the same IB id.
+
+    IB hands back the whole day's executions on every connect -- and, when the
+    Gateway has not restarted, earlier days' too -- so a second reconcile would
+    otherwise log every fill again. The log would then say the strategy bought
+    twice, and a ledger rebuilt from it would claim shares that do not exist.
+    """
+    fills = list(fills)
+    ids = [f.exec_id for f in fills if getattr(f, "exec_id", "")]
+    seen = set()
+    if ids:
+        with connect(path) as conn:
+            seen = {r[0] for r in conn.execute(
+                "SELECT exec_id FROM trade_events WHERE event='filled' "
+                "AND exec_id IS NOT NULL")}
+    fresh = []
+    for f in fills:
+        eid = getattr(f, "exec_id", "")
+        if eid and eid in seen:
+            continue
+        seen.add(eid)
+        fresh.append(f)
+    if len(fresh) < len(fills):
+        log.info("run log: %d execution(s) already recorded, not logged again",
+                 len(fills) - len(fresh))
     return log_trade_events(path, [{
         "session_date": session_date,
         "phase": phase,
@@ -235,7 +267,8 @@ def log_fills(path: str, session_date, fills: Iterable, phase: str = "reconcile"
         "notional": (f.quantity or 0) * (f.avg_price or 0),
         "order_id": f.order_id,
         "status": f.status,
-    } for f in fills])
+        "exec_id": getattr(f, "exec_id", ""),
+    } for f in fresh])
 
 
 def log_note(path: str, session_date, phase: str, event: str, reason: str,
@@ -400,7 +433,7 @@ def export_trade_csv(db_path: str, out_path: str) -> int:
     cols = (list(rows[0].keys()) if rows else
             ["id", "ts_utc", "session_date", "phase", "event", "symbol", "action",
              "quantity", "price", "notional", "order_id", "status", "reason",
-             "dry_run"])
+             "dry_run", "exec_id"])
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out_path) or ".", suffix=".tmp")

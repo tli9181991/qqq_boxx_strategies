@@ -1593,6 +1593,74 @@ def test_the_ledger_can_be_rebuilt_from_the_recorded_fills(db, tmp_path):
     assert ledger.positions(path) == {"MU": 6, "MRVL": 27, "BOXX": 539}
 
 
+def test_a_rerun_reconcile_does_not_log_the_same_fills_twice(db):
+    """IB re-reports a day's executions on every connect."""
+    fills = [_fill("AMAT", "BUY", 14, 190.0, 21, "e1"),
+             _fill("LRCX", "BUY", 21, 95.0, 22, "e2")]
+    assert store.log_fills(db, "2026-09-22", fills) == 2
+    assert store.log_fills(db, "2026-09-22", fills) == 0
+    # The Gateway stayed up, so the next day's reconcile sees them again.
+    assert store.log_fills(db, "2026-09-23", fills) == 0
+
+
+def test_a_rebuild_counts_a_fill_logged_twice_once(db, tmp_path):
+    """The run log from before exec ids were recorded holds repeats.
+
+    Rebuilding from it claimed AMAT 14 / LRCX 21 more than the account held.
+    """
+    from qbs.live import ledger
+    from qbs.live.broker import Fill
+
+    day1 = [Fill("AMAT", "BUY", 14, 190.12, "Filled", 21),
+            Fill("LRCX", "BUY", 21, 95.40, "Filled", 22),
+            Fill("AMD", "BUY", 1, 160.00, "Filled", 23)]
+    store.log_fills(db, "2026-09-22", day1)
+    store.log_fills(db, "2026-09-22", day1)        # reconcile re-run
+    store.log_fills(db, "2026-09-23", day1)        # re-reported next day
+    # A genuinely separate fill: another order, so it counts.
+    store.log_fills(db, "2026-09-23", [Fill("AMAT", "BUY", 14, 190.12,
+                                            "Filled", 31)])
+
+    path = str(tmp_path / "strategy_trades.csv")
+    assert ledger.rebuild_from_db(db, path) == 4
+    assert ledger.positions(path) == {"AMAT": 28, "LRCX": 21, "AMD": 1}
+
+
+def test_a_reconcile_after_a_rebuild_does_not_add_the_fills_again(db, tmp_path):
+    """Rebuilt rows have no exec id; the same fills arrive with one."""
+    from qbs.live import ledger
+    from qbs.live.broker import Fill
+
+    store.log_trade_events(db, [{
+        "session_date": "2026-09-23", "phase": "reconcile", "event": "filled",
+        "symbol": "AMAT", "action": "BUY", "quantity": 14, "price": 190.12,
+        "order_id": 21}])
+    path = str(tmp_path / "strategy_trades.csv")
+    ledger.rebuild_from_db(db, path)
+
+    again = [_fill("AMAT", "BUY", 14, 190.12, 21, "e1")]
+    assert ledger.append_fills(path, "2026-09-23", again) == 0
+    assert ledger.append_fills(path, "2026-09-24", again) == 0
+    assert ledger.positions(path) == {"AMAT": 14}
+    # A new order still records.
+    assert ledger.append_fills(
+        path, "2026-09-24", [_fill("AMAT", "SELL", 4, 200.0, 40, "e9")]) == 1
+    assert ledger.positions(path) == {"AMAT": 10}
+
+
+def test_an_old_run_log_gains_the_exec_id_column(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(store.SCHEMA.replace(",\n    exec_id       TEXT", ""))
+    conn.execute("PRAGMA user_version=1")
+    conn.commit()
+    conn.close()
+    store.log_fills(path, "2026-09-23", [_fill("MU", "BUY", 6, 900.0, 1, "x")])
+    with store.connect(path) as c:
+        assert c.execute("SELECT exec_id FROM trade_events").fetchone()[0] == "x"
+
+
 def test_a_rebuild_ignores_dry_run_orders(db, tmp_path):
     from qbs.live import ledger
     from qbs.live.orders import Order
