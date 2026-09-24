@@ -228,6 +228,61 @@ RANKING_CSV_COLUMNS = ["asof", "rank", "symbol", "score", "held"]
 SHADOW_CSV_COLUMNS = ["asof", "weight", "slot", "symbol", "rank", "live_held"]
 WATCHLIST_CSV_COLUMNS = ["asof", "symbol", "constituent", "rank", "score",
                          "book_cutoff", "band_cutoff", "beats_book"]
+COMPARISON_CSV_COLUMNS = ["asof", "strategy", "daily_return", "notional",
+                          "holdings"]
+
+
+def upsert_strategy_comparison_csv(path: str, asof: str, book) -> int:
+    """Record one model return per sleeve and day, replacing intraday reruns."""
+    rows = []
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            rows = [r for r in csv.DictReader(f)
+                    if not (r.get("asof") == asof
+                            and r.get("strategy") in book.strategy_daily_returns)]
+    for strategy, daily_return in book.strategy_daily_returns.items():
+        rows.append({
+            "asof": asof,
+            "strategy": strategy,
+            "daily_return": f"{daily_return:.10f}",
+            "notional": f"{book.strategy_notionals.get(strategy, 0.0):.2f}",
+            "holdings": ",".join(book.strategy_holdings.get(strategy, [])),
+        })
+    rows.sort(key=lambda r: (r["asof"], r["strategy"]))
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COMPARISON_CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return len(book.strategy_daily_returns)
+
+
+def strategy_comparison(path: str, days: int = 31) -> List[Dict[str, Any]]:
+    """Compound each sleeve's logged net model returns over the recent trial."""
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    dates = sorted({r["asof"] for r in rows})[-days:]
+    result = []
+    for strategy in sorted({r["strategy"] for r in rows}):
+        sample = [r for r in rows if r["strategy"] == strategy and r["asof"] in dates]
+        growth = 1.0
+        for row in sample:
+            growth *= 1.0 + float(row["daily_return"])
+        if sample:
+            result.append({"strategy": strategy, "sessions": len(sample),
+                           "start": sample[0]["asof"], "end": sample[-1]["asof"],
+                           "return": growth - 1.0,
+                           "notional": float(sample[-1]["notional"])})
+    return result
 
 
 def append_watchlist_csv(path: str, asof: str, rows: List[Dict[str, Any]]) -> int:
