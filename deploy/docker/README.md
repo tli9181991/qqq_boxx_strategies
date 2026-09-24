@@ -313,17 +313,21 @@ six residual-momentum picks at $6,000 per slot from BOXX, add:
 # Keep this at its existing value (100000 in the standard deployment).
 QBS_NOTIONAL=100000
 QBS_RESMOM_NOTIONAL=36000
-QBS_MAX_POSITIONS=13
 QBS_DRY_RUN=1
 ```
 
 `QBS_RESMOM_NOTIONAL` is carved out of the main strategy's BOXX target: a
 $100,000 book remains a $100,000 book rather than becoming a leveraged
-$136,000 book. The signal refuses if the main strategy currently wants less
-than $36,000 in BOXX. If MRVL occupies one $6,000 slot in both sleeves, its
-combined target is $12,000; it is not deduplicated and spread across the other
-names. BOXX can be the thirteenth position when either strategy has an
-unfilled slot, hence the position-cap increase to 13.
+$136,000 book. If MRVL occupies one $6,000 slot in both sleeves, its combined
+target is $12,000; it is not deduplicated and spread across the other names.
+The position cap widens by six on its own while the sleeve is on, so
+`QBS_MAX_POSITIONS` needs no change.
+
+**When BOXX is short.** The main strategy is vol-scaled, and on roughly half of
+all sessions it wants less than $36,000 in BOXX. On those days the sleeve runs
+at whatever BOXX there is (the log says so: `running the sleeve at $30,000
+($5,000 a slot)`) rather than borrowing, and rather than failing the signal --
+which would stop the main strategy trading too.
 
 Run preflight and read the two labelled holding lists before allowing the paper
 trade timer to send anything:
@@ -332,9 +336,19 @@ trade timer to send anything:
 docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps qbs preflight
 ```
 
-Each successful preflight/trade run upserts that session's net model return in
-`var/strategy_comparison.csv`. After the trial, the normal report compounds
-each sleeve separately (including the configured commission and slippage):
+Each successful preflight/trade run writes net model returns to
+`var/strategy_comparison.csv`, rescoring the last ten sessions so a missed run
+leaves no gap. Three lines are kept:
+
+| strategy | what it is |
+|---|---|
+| `momentum` | the main book as traded: vol-scaled, so often mostly BOXX |
+| `momentum6` | the main strategy's six picks in equal slots, no vol scaling |
+| `resmom` | the six residual picks in equal slots |
+
+`momentum6` against `resmom` is the like-for-like race: six stocks against six
+stocks. After the trial, the normal report compounds each (after the
+configured commission and slippage) and prints which six is ahead:
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
@@ -343,8 +357,8 @@ docker compose -f deploy/docker/docker-compose.yml run --rm --no-deps \
 
 These are strategy-model returns, not an attempt to split the IB account's
 combined P&L. That distinction matters for an overlap such as MRVL: IB holds
-one aggregate position, while the comparison keeps one $6,000 contribution in
-each strategy.
+one aggregate position, and so does the ledger, while the comparison keeps one
+$6,000 contribution in each strategy.
 
 Set `QBS_RESMOM_NOTIONAL=0` to return to the original single strategy. This
 switch does not enable a live IB account; the live-account guard remains
@@ -386,6 +400,24 @@ docker compose -f deploy/docker/docker-compose.yml config \
 It must print `QBS_POSITION_SOURCE: ledger`. The trader deliberately does not
 receive the whole `.env` file because it contains the IB password, so each
 non-secret trader setting has to be mapped explicitly in Compose.
+
+**If you set `ledger` before this mapping existed**, the setting never reached
+the container: every phase ran in `account` mode and nothing wrote
+`var/strategy_trades.csv`. With the mapping in place the strategy now looks for
+that file, and if it is missing while the account holds shares, preflight and
+trade stop with a guard rather than read the book as flat and buy it twice.
+Seed it once:
+
+```bash
+C="docker compose -f deploy/docker/docker-compose.yml"
+$C run --rm --no-deps qbs ledger --rebuild     # the shares are the strategy's
+$C run --rm --no-deps qbs ledger --start-flat  # every share is yours
+$C run --rm --no-deps qbs ledger               # check: ledger vs account
+```
+
+`--rebuild` replays every fill in the run log, which was recorded in account
+mode too. If you also traded by hand in that account, check the side-by-side
+table afterwards: those fills are in the log as well.
 
 Switch it on **while the account is flat**. That is the only moment a tally
 starts from a guaranteed-correct zero. Switching later leaves an empty ledger

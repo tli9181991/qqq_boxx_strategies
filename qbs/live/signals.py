@@ -72,7 +72,9 @@ class TargetBook:
     strategy_weights: Dict[str, Dict[str, float]] = field(default_factory=dict)
     strategy_holdings: Dict[str, List[str]] = field(default_factory=dict)
     strategy_notionals: Dict[str, float] = field(default_factory=dict)
-    strategy_daily_returns: Dict[str, float] = field(default_factory=dict)
+    # strategy -> {"YYYY-MM-DD": {"return": net model return, "holdings": [...]}}
+    # for the last few sessions, so a missed run is filled in on the next one.
+    strategy_daily_returns: Dict[str, Dict[str, Dict]] = field(default_factory=dict)
 
     @property
     def risk_weight(self) -> float:
@@ -108,6 +110,10 @@ class TargetBook:
                 f"  momentum: {momentum}\n"
                 f"  {SAFE_ASSET}: {self.weights.get(SAFE_ASSET, 0.0):.1%}"
                 f"{extra}")
+
+
+# How many recent sessions each run rescores for the strategy comparison.
+RETURN_BACKFILL_SESSIONS = 10
 
 
 class SignalError(RuntimeError):
@@ -406,9 +412,15 @@ def compute_targets(
     row = vt.weights.loc[asof]
     momentum_weights = {t: float(w) for t, w in row.items()
                         if abs(float(w)) > 1e-9}
+    if base_notional <= 0:
+        raise SignalError("base_notional must be positive")
+    if residual_notional < 0:
+        raise SignalError("residual_notional must not be negative")
+
     residual_weights: Dict[str, float] = {}
     residual_held: List[str] = []
     residual_sig = None
+    funded = 0.0
     if residual_notional > 0:
         if cfg.resmom.n_hold != 6:
             raise SignalError("the live residual sleeve must have exactly six slots")
@@ -422,41 +434,59 @@ def compute_targets(
                             if abs(float(w)) > 1e-9}
         residual_held = list((residual_sig.holdings_log or {}).get(asof, []))
 
-    if base_notional <= 0:
-        raise SignalError("base_notional must be positive")
-    if residual_notional < 0:
-        raise SignalError("residual_notional must not be negative")
-    if residual_notional > base_notional:
-        raise SignalError("residual_notional cannot exceed the aggregate book")
-    target_dollars: Dict[str, float] = {}
-    for ticker, weight in momentum_weights.items():
-        target_dollars[ticker] = target_dollars.get(ticker, 0.0) + weight * base_notional
-    available_safe = target_dollars.get(safe, 0.0)
-    if residual_notional > available_safe + 1e-6:
-        raise SignalError(
-            f"residual sleeve needs ${residual_notional:,.0f} from {safe}, but the "
-            f"main strategy currently allocates only ${available_safe:,.0f}. "
-            "Refusing to add leverage; reduce QBS_RESMOM_NOTIONAL or wait for a "
-            "larger safe-asset allocation.")
-    target_dollars[safe] = available_safe - residual_notional
-    for ticker, weight in residual_weights.items():
-        target_dollars[ticker] = (target_dollars.get(ticker, 0.0)
-                                  + weight * residual_notional)
+        # The sleeve is paid for out of the main book's BOXX and never by
+        # borrowing. When the main book wants less BOXX than the sleeve's full
+        # size -- about half of all sessions at a 25% vol target -- the sleeve
+        # shrinks to what is there rather than failing the signal, because a
+        # failed signal would stop the main strategy trading as well. The
+        # comparison is unaffected: it scores each sleeve's weights, not the
+        # dollars that happened to be available.
+        available_safe = momentum_weights.get(safe, 0.0) * base_notional
+        funded = min(residual_notional, max(available_safe, 0.0))
+        if funded < residual_notional - 1e-6:
+            log.warning(
+                "residual sleeve wants $%s from %s but the main book holds only "
+                "$%s there today; running the sleeve at $%s ($%s a slot)",
+                f"{residual_notional:,.0f}", safe, f"{available_safe:,.0f}",
+                f"{funded:,.0f}", f"{funded / cfg.resmom.n_hold:,.0f}")
+
+    target_dollars = {t: w * base_notional for t, w in momentum_weights.items()}
+    if funded > 0:
+        target_dollars[safe] = target_dollars.get(safe, 0.0) - funded
+        for ticker, weight in residual_weights.items():
+            target_dollars[ticker] = target_dollars.get(ticker, 0.0) + weight * funded
     weights = {t: dollars / base_notional for t, dollars in target_dollars.items()
                if abs(dollars) > 1e-9}
 
-    def _last_net_return(signal) -> float:
+    # Model returns for the paper trial. "momentum" is the book as traded:
+    # vol-scaled, so often two-thirds BOXX. That is not a fair opponent for six
+    # fully invested residual picks, so "momentum6" scores the six momentum
+    # picks the same way -- equal slots, no vol scaling -- and that is the
+    # like-for-like race. Recent sessions are rescored on every run so a missed
+    # day is filled in and an intraday 15:30 price is replaced by the close.
+    asset_returns = combined.pct_change().fillna(0.0)
+    cost_rate = (cfg.cost_bps + cfg.slippage_bps) / 1e4
+
+    def _net_returns(signal) -> pd.Series:
         held_weights = signal.weights.reindex(combined.index).ffill().shift(
             cfg.execution_lag).fillna(0.0)
-        asset_returns = combined.pct_change().fillna(0.0)
-        gross = (held_weights * asset_returns[held_weights.columns]).sum(axis=1)
+        cols = [c for c in held_weights.columns if c in asset_returns.columns]
+        gross = (held_weights[cols] * asset_returns[cols]).sum(axis=1)
         turnover = held_weights.diff().abs().sum(axis=1)
-        cost_rate = (cfg.cost_bps + cfg.slippage_bps) / 1e4
-        return float(gross.loc[asof] - turnover.loc[asof] * cost_rate)
+        return (gross - turnover * cost_rate).loc[:asof]
 
-    daily_returns = {"momentum": _last_net_return(vt)}
+    def _holdings(signal, day) -> List[str]:
+        return list((signal.holdings_log or {}).get(day, []))
+
+    sleeves = {"momentum": vt, "momentum6": mom}
     if residual_sig is not None:
-        daily_returns["resmom"] = _last_net_return(residual_sig)
+        sleeves["resmom"] = residual_sig
+    daily_returns: Dict[str, Dict[str, Dict]] = {}
+    for key, signal in sleeves.items():
+        series = _net_returns(signal).tail(RETURN_BACKFILL_SESSIONS)
+        daily_returns[key] = {
+            f"{day:%Y-%m-%d}": {"return": float(r), "holdings": _holdings(signal, day)}
+            for day, r in series.items()}
 
     vdiag = vt.diagnostics.loc[asof]
     halted = bool(vt.diagnostics.get("blocked", pd.Series(dtype=float)).get(asof, 0.0))
@@ -539,7 +569,8 @@ def compute_targets(
         strategy_holdings={"momentum": held,
                            **({"resmom": residual_held} if residual_weights else {})},
         strategy_notionals={"momentum": base_notional,
-                            **({"resmom": residual_notional} if residual_weights else {})},
+                            "momentum6": residual_notional or base_notional,
+                            **({"resmom": funded} if residual_weights else {})},
         strategy_daily_returns=daily_returns,
     )
 

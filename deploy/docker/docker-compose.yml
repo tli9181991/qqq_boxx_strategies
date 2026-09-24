@@ -80,7 +80,8 @@ services:
       HOME: /tmp
       QBS_NOTIONAL: "${QBS_NOTIONAL:-100000}"
       # Optional six-slot sleeve funded from BOXX. At 36000 each residual pick
-      # has a $6000 target; total account notional does not increase.
+      # has a $6000 target; total account notional does not increase. The
+      # position cap widens by the sleeve's six slots by itself.
       QBS_RESMOM_NOTIONAL: "${QBS_RESMOM_NOTIONAL:-0}"
       QBS_MAX_POSITIONS: "${QBS_MAX_POSITIONS:-12}"
       QBS_IB_ACCOUNT: "${QBS_IB_ACCOUNT:-}"

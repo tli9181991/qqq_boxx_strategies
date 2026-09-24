@@ -233,21 +233,38 @@ COMPARISON_CSV_COLUMNS = ["asof", "strategy", "daily_return", "notional",
 
 
 def upsert_strategy_comparison_csv(path: str, asof: str, book) -> int:
-    """Record one model return per sleeve and day, replacing intraday reruns."""
-    rows = []
+    """Record one model return per sleeve and session, replacing earlier values.
+
+    Each run rescores the last few sessions, so a missed run leaves no hole and
+    a 15:30 price is replaced by the real close on the next run. Sessions from
+    before the trial started are never written: the first run's `asof` is the
+    trial's first day, whatever history the model could have scored.
+    """
+    rows: List[Dict[str, str]] = []
     if os.path.exists(path):
         with open(path, newline="") as f:
-            rows = [r for r in csv.DictReader(f)
-                    if not (r.get("asof") == asof
-                            and r.get("strategy") in book.strategy_daily_returns)]
-    for strategy, daily_return in book.strategy_daily_returns.items():
-        rows.append({
-            "asof": asof,
-            "strategy": strategy,
-            "daily_return": f"{daily_return:.10f}",
-            "notional": f"{book.strategy_notionals.get(strategy, 0.0):.2f}",
-            "holdings": ",".join(book.strategy_holdings.get(strategy, [])),
-        })
+            rows = list(csv.DictReader(f))
+    started = min([r["asof"] for r in rows] + [asof])
+
+    fresh: Dict[tuple, Dict[str, str]] = {}
+    for strategy, by_day in book.strategy_daily_returns.items():
+        for day, entry in by_day.items():
+            if day < started or day > asof:
+                continue
+            fresh[(day, strategy)] = {
+                "asof": day,
+                "strategy": strategy,
+                "daily_return": f"{entry['return']:.10f}",
+                "notional": f"{book.strategy_notionals.get(strategy, 0.0):.2f}",
+                "holdings": ",".join(entry.get("holdings") or []),
+            }
+    kept = [r for r in rows if (r.get("asof"), r.get("strategy")) not in fresh]
+    for key, row in fresh.items():
+        old = next((r for r in rows if (r.get("asof"), r.get("strategy")) == key), None)
+        if old is not None and key[0] != asof:
+            # A rescored past session keeps the notional it actually ran at.
+            row["notional"] = old.get("notional", row["notional"])
+    rows = kept + list(fresh.values())
     rows.sort(key=lambda r: (r["asof"], r["strategy"]))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
@@ -261,7 +278,7 @@ def upsert_strategy_comparison_csv(path: str, asof: str, book) -> int:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
-    return len(book.strategy_daily_returns)
+    return len(fresh)
 
 
 def strategy_comparison(path: str, days: int = 31) -> List[Dict[str, Any]]:
