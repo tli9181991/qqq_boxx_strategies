@@ -402,8 +402,9 @@ def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
 @st.cache_data(show_spinner="Computing breadth…")
 def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
                   _volumes: Optional[pd.DataFrame] = None,
-                  bar_epoch: str = ""):
-    return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note)
+                  bar_epoch: str = "", _qqq_ohlc: Optional[pd.DataFrame] = None):
+    return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note,
+                         qqq_ohlc=_qqq_ohlc)
 
 
 SENTIMENT_TINT = {"bullish": UP_STRONG, "leaning bullish": UP,
@@ -824,7 +825,12 @@ st.sidebar.caption({"ok": "✅ current", "info": "🕒 1 session behind",
 selections, SCREEN_VOLUME_APPLIED = build_selections(
     uni, px["BOXX"], px["QQQ"], int(n_hold), int(exit_rank), int(n_screen),
     int(n_resid), BAR_EPOCH)
-breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH)
+# QQQ's real High/Low for the ATR column. Closes alone make the true range
+# close-to-close, which understates it and roughly doubles the reading next to
+# a source that uses real bars. None falls back to closes.
+QQQ_OHLC = ohlc_for("QQQ", download_start, bool(online), BAR_EPOCH)
+breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH,
+                        _qqq_ohlc=QQQ_OHLC)
 
 def names_on(key: str, when) -> list:
     """The tickers a strategy held on a date, from the prebuilt selections.
@@ -1600,7 +1606,7 @@ with tab_market:
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
         breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols,
-                                  bar_epoch=BAR_EPOCH)
+                                  bar_epoch=BAR_EPOCH, _qqq_ohlc=QQQ_OHLC)
         # Say which of the two happened. "Fetched just now" and "served from a
         # cache built at some point" look identical on screen otherwise, and
         # the difference is the whole reason for the auto-refresh.
@@ -1660,7 +1666,8 @@ with tab_market:
     # NEGATIVE leaders reading, is just a lie told in punctuation.
     k = st.columns(6)
     ratio = last["up4"] / last["dn4"] if last["dn4"] else np.nan
-    k[0].metric("Up 4% / Down 4%", f"{int(last['up4'])} / {int(last['dn4'])}")
+    k[0].metric("Up 4% / Down 4%",
+                f"{fmt(last['up4'], '{:.0f}')} / {fmt(last['dn4'], '{:.0f}')}")
     k[0].caption(fmt(ratio, "up:down ratio {:.2f}"))
 
     d_fast = (last["pct_above_fast"] - prev["pct_above_fast"]) if prev is not None else np.nan
@@ -1675,7 +1682,9 @@ with tab_market:
     k[3].caption("SPY is not cached in this package")
 
     k[4].metric("QQQ vs 50D EMA", fmt(last["qqq_atr"], "{:+.2f}"))
-    k[4].caption("in units of 14-day ATR")
+    k[4].caption("in units of 14-day ATR"
+                 + ("" if QQQ_OHLC is not None else
+                    " · close-only range, reads high"))
 
     k[5].metric("Leaders (MLI)", fmt(last["mli_pct"], "{:+.2f}%"))
     k[5].caption(f"{int(last['mli_n'])} members · "
@@ -1688,11 +1697,11 @@ with tab_market:
     pulse_n = st.slider("Sessions shown", 10, 120, 20, key="pulse_days")
     pulse = tbl.tail(pulse_n)
     bars = pd.concat([
-        pd.DataFrame({"date": pulse.index, "value": pulse["up4"].astype(int),
+        pd.DataFrame({"date": pulse.index, "value": pulse["up4"],
                       "cls": [PULSE_LABELS[pulse_class(v, "up")] for v in pulse["up4"]]}),
-        pd.DataFrame({"date": pulse.index, "value": -pulse["dn4"].astype(int),
+        pd.DataFrame({"date": pulse.index, "value": -pulse["dn4"],
                       "cls": [PULSE_LABELS[pulse_class(v, "down")] for v in pulse["dn4"]]}),
-    ])
+    ]).dropna(subset=["value"])
     (bars,), pulse_axis = session_axis(bars)
     chart = alt.Chart(bars).mark_bar(
         size=max(2.0, 620 / max(len(pulse), 1))).encode(
@@ -1717,8 +1726,8 @@ with tab_market:
     view = tbl.tail(n_rows).iloc[::-1]
     disp = pd.DataFrame({
         "Date": view.index.strftime("%Y-%m-%d"),
-        "Up 4%": view["up4"].astype(int),
-        "Dn 4%": view["dn4"].astype(int),
+        "Up 4%": view["up4"],
+        "Dn 4%": view["dn4"],
         "% > 20D": view["pct_above_fast"],
         "% > 50D": view["pct_above_slow"],
         "QQQ ATR": view["qqq_atr"],
@@ -1748,10 +1757,23 @@ with tab_market:
 
     styled = (disp.style
               .apply(_style, axis=0)
-              .format({"% > 20D": "{:.1f}", "% > 50D": "{:.1f}", "QQQ ATR": "{:+.2f}",
+              .format({"Up 4%": "{:.0f}", "Dn 4%": "{:.0f}",
+                       "% > 20D": "{:.1f}", "% > 50D": "{:.1f}", "QQQ ATR": "{:+.2f}",
                        "MLI %": "{:+.2f}", "MLI adv%": "{:.1f}"}, na_rep="—"))
     st.dataframe(styled, hide_index=True, width="stretch",
                  height=min(720, 45 + 35 * len(disp)))
+    if breadth.gaps:
+        gap_txt = ", ".join(f"**{d:%Y-%m-%d}** ({n:,} of ~{ref:,} names)"
+                            for d, (n, ref) in sorted(breadth.gaps.items())[-5:])
+        st.warning(md(
+            f"**Left out — most names have no close:** {gap_txt}. Kept in, a "
+            "day like that makes the next day's return undefined for every "
+            "missing name and the 20- and 50-day averages undefined for weeks "
+            "after it, so the table would be read over a few hundred names. "
+            "The row after it shows its 4% counts as **—** because its move "
+            "spans two sessions. The next update re-fetches a gap in the last "
+            "60 sessions; **Refresh now** rebuilds the whole cache. If it "
+            "stays, the provider has no data for that day."), icon="🕳️")
     _bp = BreadthParams()
     _u, _d = _bp.up4_bands, _bp.dn4_bands
     st.caption(

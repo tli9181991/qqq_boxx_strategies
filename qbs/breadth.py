@@ -103,6 +103,9 @@ class BreadthResult:
     has_index: bool = False
     start: Optional[pd.Timestamp] = None
     end: Optional[pd.Timestamp] = None
+    # Sessions left out because most names had no close that day:
+    # {date: (names that had one, names a normal session has)}.
+    gaps: Dict[pd.Timestamp, Tuple[int, int]] = field(default_factory=dict)
 
     @property
     def latest(self) -> pd.Series:
@@ -429,6 +432,7 @@ def daily_breadth(
     volumes: Optional[pd.DataFrame] = None,
     p: Optional[BreadthParams] = None,
     universe_note: str = "",
+    qqq_ohlc: Optional[pd.DataFrame] = None,
 ) -> BreadthResult:
     """One row per session: the whole breadth monitor.
 
@@ -442,18 +446,41 @@ def daily_breadth(
     mli_n                how many leaders there were
     n_stocks             names with a price that day -- the sample behind the row
     spx                  whatever index level the caller passed, or absent
+
+    A session most names have no close for (`qbs.data.thin_rows`) is left
+    OUT and listed in `gaps`. Kept in, it poisons more than its own row: with
+    no close that day, that day's return and the next day's are undefined for
+    every missing name, and every 20- and 50-day average through it is
+    undefined for the next 20 and 50 sessions -- so weeks of rows get read
+    over the few hundred names that happened to be there. Left out, the
+    averages run over the sessions that exist, and the ONE row after the gap,
+    whose return would span two sessions, shows its move counts as missing
+    rather than as a day's.
+
+    `qqq_ohlc` (Open/High/Low/Close) gives the QQQ ATR a real true range.
+    Without it the range is close-to-close, which understates it and so
+    overstates the distance -- see `atr_distance`.
     """
+    from .data import thin_rows
+
     p = p or BreadthParams()
     px = closes.sort_index()
     if px.empty:
         raise ValueError("no prices -- nothing to measure")
+    gaps = thin_rows(px)
+    after_gap = []
+    if gaps:
+        px = px.drop(index=list(gaps))
+        after_gap = sorted({px.index[i] for i in px.index.searchsorted(list(gaps))
+                            if i < len(px)})
 
     rets = px.pct_change()
     priced = px.notna()
 
     out = pd.DataFrame(index=px.index)
-    out["up4"] = (rets >= p.move_pct).sum(axis=1)
-    out["dn4"] = (rets <= -p.move_pct).sum(axis=1)
+    # Float, not int: the row after a dropped session carries NaN here.
+    out["up4"] = (rets >= p.move_pct).sum(axis=1).astype(float)
+    out["dn4"] = (rets <= -p.move_pct).sum(axis=1).astype(float)
 
     fast = px.rolling(p.ma_fast, min_periods=p.ma_fast).mean()
     slow = px.rolling(p.ma_slow, min_periods=p.ma_slow).mean()
@@ -463,6 +490,18 @@ def daily_breadth(
     has_index = False
     for name, series in (("spy_atr", spy), ("qqq_atr", qqq)):
         if series is not None:
+            hi = lo = None
+            if name == "qqq_atr" and qqq_ohlc is not None and {
+                    "High", "Low", "Close"} <= set(qqq_ohlc.columns):
+                # On the OHLC frame's own calendar, then aligned: the EMA and
+                # the ATR are properties of the index's sessions, not of
+                # whichever days the stock universe happens to have.
+                bars = qqq_ohlc.sort_index()
+                d = atr_distance(bars["Close"], bars["High"], bars["Low"],
+                                 ema_span=p.ema_span, atr_window=p.atr_window)
+                out[name] = d.reindex(px.index)
+                has_index = True
+                continue
             out[name] = atr_distance(series.reindex(px.index).ffill(),
                                      ema_span=p.ema_span,
                                      atr_window=p.atr_window)
@@ -477,6 +516,10 @@ def daily_breadth(
     out["mli_up_pct"] = 100.0 * (lead_ret > 0).sum(axis=1) / out["mli_n"].replace(0, np.nan)
 
     out["n_stocks"] = priced.sum(axis=1)
+    # A return across a dropped session is a two-day move; counting it as a
+    # day's would put a double-sized session in the 4% columns.
+    if after_gap:
+        out.loc[after_gap, ["up4", "dn4", "mli_pct", "mli_up_pct"]] = np.nan
     if spx is not None:
         out["spx"] = spx.reindex(px.index).ffill()
 
@@ -489,6 +532,7 @@ def daily_breadth(
         has_volume=volumes is not None, has_index=has_index,
         start=out.index.min() if len(out) else None,
         end=out.index.max() if len(out) else None,
+        gaps=gaps,
     )
 
 
@@ -499,7 +543,7 @@ def daily_breadth(
 def pulse_class(count: int, direction: str, p: Optional[BreadthParams] = None) -> str:
     """`up_strong` / `up` / `down` / `down_strong` for a 4% move count."""
     p = p or BreadthParams()
-    strong = abs(int(count)) >= p.pulse_strong
+    strong = pd.notna(count) and abs(int(count)) >= p.pulse_strong
     if direction == "up":
         return "up_strong" if strong else "up"
     return "down_strong" if strong else "down"
