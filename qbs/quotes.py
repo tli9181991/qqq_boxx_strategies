@@ -37,10 +37,13 @@ yfinance serves split- and dividend-adjusted closes; a screener serves the raw
 last price. Mixing the two would normally put a step in the series at every
 distribution. It is safe HERE because of two facts together: the adjustment
 factor for the most recent bar is 1.0 -- adjustments are applied backwards, to
-history, never to today -- and this package re-downloads the whole window on
-every refresh, so the moment a distribution makes yesterday's raw print wrong,
-yesterday is no longer the front bar and has been replaced by an adjusted one.
-Neither fact alone is enough, which is why this paragraph exists.
+history, never to today -- and a filled cell never outlives the next download.
+The dashboard saves filled cells to the cache MARKED PROVISIONAL
+(`qbs.incremental.persist_fill`), so the next load needs no network; the next
+download window always starts before the oldest provisional cell, replaces it
+with yfinance's adjusted value, and leaves it out of the re-basing check it
+runs on the overlap. Neither fact alone is enough, which is why this paragraph
+exists.
 """
 
 from __future__ import annotations
@@ -166,7 +169,7 @@ def fill_last_bar(
     """Top up the newest session from a screener snapshot.
 
     Returns `(closes, volumes, report)`. `report` carries `session`, `filled`,
-    `already`, `absent` and `skipped` -- everything a caller needs to say what
+    `already`, `absent`, `skipped` and `tickers` (the names filled) -- everything a caller needs to say what
     happened on screen, because this mixes two providers in one series and
     that must never be invisible.
 
@@ -176,7 +179,7 @@ def fill_last_bar(
     intraday value in it is wrong in a way that nothing downstream can detect.
     """
     report = {"session": None, "filled": 0, "already": 0, "absent": 0,
-              "skipped": None}
+              "skipped": None, "tickers": []}
     if closes is None or closes.empty or quotes is None or quotes.empty:
         report["skipped"] = "nothing to fill from"
         return closes, volumes, report
@@ -214,6 +217,7 @@ def fill_last_bar(
                     and pd.notna(quotes.at[t, "volume"]):
                 volumes.loc[session, t] = float(quotes.at[t, "volume"])
             report["filled"] += 1
+            report["tickers"].append(t)
         else:
             report["absent"] += 1
     return closes, volumes, report

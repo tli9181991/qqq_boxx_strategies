@@ -1057,7 +1057,23 @@ Two tabs:
 - **Offline** — cache only, never touches the network. Build the cache first with
   `python run_backtest.py`.
 
-**Refresh now** forces a re-download even when the cache looks current.
+**Refresh now** forces a full re-download even when the cache looks current.
+
+**A stale cache is updated, not replaced.** Every other download — the picks universe,
+the core ETFs, watchlist outsiders and the market tab's US universe — fetches only a
+short recent window that overlaps the cache by five confirmed sessions, and appends it.
+The overlap is checked name by name: yfinance adjusts closes backwards for splits and
+dividends, so a name whose overlap disagrees has been re-based, and that name alone is
+re-downloaded in full (as is any name the cache does not hold). A plain append would
+turn a 10:1 split into a −90% day. See `qbs/incremental.py`.
+
+**The screener's close is saved, marked provisional.** When yfinance has not published
+the last session yet, the closes the Finviz/TradingView request already returned fill
+the gap (`qbs/quotes.py`) and are written into the cache, with each filled cell listed in
+a `*.provisional.csv` sidecar. The next load finds the session on disk and needs no
+download. The next download that does run starts before the oldest provisional cell,
+leaves those cells out of the overlap check (a raw print is not an adjusted one), and
+replaces them with yfinance's values. A full download clears every mark.
 
 Every tab carries a freshness banner: how many published sessions are missing from the
 data, and what to do about it. The remedy is context-aware — it will not tell you to
@@ -1137,7 +1153,7 @@ into the universe already clears it on a normal day.
 
 **It refreshes itself, once per published bar.** On launch the app checks whether an
 automatic fetch has run since the last close; if not, it pulls the screener list and
-re-downloads any price frame that is missing a published session. The status line
+updates any price frame that is missing a published session. The status line
 under the toggle says which happened — *fetched on this run*, or *already fetched
 since the Sep 21 close (at 16:30 ET) — next automatic attempt after the Sep 22 close*.
 

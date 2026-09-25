@@ -182,6 +182,59 @@ def membership_mask(
 # Prices for a wide universe
 # --------------------------------------------------------------------------
 
+def _download_universe(tickers: List[str], start: str, end: Optional[str],
+                       batch_size: int = 40):
+    """`(closes, volumes, failed)` for `tickers` from `start`, batched.
+
+    Volume arrives in the same response, so caching it costs disk and no
+    network. The ranking strategies ignore it; research that needs a
+    liquidity or participation test would otherwise have to re-download the
+    whole universe to get a column already in hand.
+    """
+    import yfinance as yf
+
+    frames, vframes, failed = [], [], []
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        raw = yf.download(batch, start=start, end=end, auto_adjust=True,
+                          progress=False, actions=False, group_by="column",
+                          threads=True)
+        if raw is None or raw.empty:
+            failed.extend(batch)
+            continue
+        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+        if isinstance(close, pd.Series):
+            close = close.to_frame(batch[0])
+        if list(close.columns) == ["Close"]:
+            close = close.rename(columns={"Close": batch[0]})
+        frames.append(close)
+        if "Volume" in (raw.columns.get_level_values(0)
+                        if isinstance(raw.columns, pd.MultiIndex) else raw.columns):
+            v = raw["Volume"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Volume"]]
+            if isinstance(v, pd.Series):
+                v = v.to_frame(batch[0])
+            if list(v.columns) == ["Volume"]:
+                v = v.rename(columns={"Volume": batch[0]})
+            vframes.append(v)
+        failed.extend([t for t in batch if t not in close.columns
+                       or close[t].notna().sum() == 0])
+
+    def _frame(parts):
+        if not parts:
+            return None
+        df = pd.concat(parts, axis=1).sort_index()
+        df = df.loc[:, ~df.columns.duplicated()]
+        df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+        df.index.name = "Date"
+        return df
+
+    px = _frame(frames)
+    if px is not None:
+        px = px.drop(columns=[c for c in px.columns if px[c].notna().sum() == 0],
+                     errors="ignore")
+    return px, _frame(vframes), failed
+
+
 def load_universe_prices(
     tickers: Iterable[str],
     start: str,
@@ -191,6 +244,7 @@ def load_universe_prices(
     batch_size: int = 40,
     min_coverage: float = 0.6,
     verbose: bool = True,
+    incremental: bool = False,
 ) -> pd.DataFrame:
     """Download adjusted closes for many tickers, cached as one parquet/CSV.
 
@@ -198,7 +252,15 @@ def load_universe_prices(
     one request. Tickers that come back empty (delisted, renamed, or simply
     unavailable) are reported and dropped rather than silently becoming NaN
     columns that the ranker would treat as missing data.
+
+    `incremental=True` (with `refresh=False`) turns a cache hit into an
+    UPDATE: a short recent window is downloaded and folded in, and only names
+    whose history the provider re-based -- or that the cache does not hold --
+    are downloaded in full. See `qbs.incremental` for why a plain append is
+    not safe. `refresh=True` is always a full download.
     """
+    from .incremental import clear_marks, read_marks, refresh_incremental, write_marks
+
     tickers = sorted(set(tickers))
     os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, "universe_prices.csv")
@@ -207,13 +269,37 @@ def load_universe_prices(
     if os.path.exists(cache) and not refresh:
         px = pd.read_csv(cache, parse_dates=["Date"], index_col="Date")
         have = [t for t in tickers if t in px.columns]
-        if len(have) >= min_coverage * len(tickers):
+        covered = len(have) >= min_coverage * len(tickers)
+        if covered and not incremental:
             if verbose:
                 print(f"[universe] cache hit: {len(have)}/{len(tickers)} tickers, "
                       f"{px.index.min():%Y-%m-%d} to {px.index.max():%Y-%m-%d}")
             return px[have].sort_index()
+        # An incremental update needs a cache that reaches back to `start`;
+        # one built from a later start would never be filled in behind.
+        if (covered and end is None and not px.empty
+                and px.index.min() <= pd.Timestamp(start) + pd.Timedelta(days=10)):
+            from .data import load_quarantine, record_failures
 
-    import yfinance as yf
+            banned = load_quarantine(cache_dir)
+            wanted = [t for t in tickers if t not in banned]
+            vol = (pd.read_csv(vol_cache, parse_dates=["Date"], index_col="Date")
+                   if os.path.exists(vol_cache) else None)
+            px, vol, marks, info = refresh_incremental(
+                px, vol, read_marks(cache), wanted, start,
+                lambda ts, since: _download_universe(ts, since, None, batch_size))
+            if verbose:
+                print(f"[universe] incremental since {info['since']}: "
+                      f"{info['recent']} updated, {info['full']} re-downloaded "
+                      f"in full" + (f" (re-based: {', '.join(info['rebased'])})"
+                                    if info["rebased"] else ""))
+            if info["failed"]:
+                record_failures(cache_dir, info["failed"])
+            px.to_csv(cache)
+            if vol is not None:
+                vol.reindex(columns=px.columns).to_csv(vol_cache)
+            write_marks(cache, marks)
+            return px[[t for t in tickers if t in px.columns]].sort_index()
 
     from .data import (QUARANTINE_DAYS, load_quarantine,
                        record_failures)
@@ -230,40 +316,9 @@ def load_universe_prices(
                   f"{', '.join(skipped[:10])}"
                   + (" ..." if len(skipped) > 10 else ""))
 
-    frames, vframes, failed = [], [], []
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        raw = yf.download(batch, start=start, end=end, auto_adjust=True,
-                          progress=False, actions=False, group_by="column",
-                          threads=True)
-        if raw is None or raw.empty:
-            failed.extend(batch)
-            continue
-        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
-        if isinstance(close, pd.Series):
-            close = close.to_frame(batch[0])
-        frames.append(close)
-        # Volume arrives in the same response, so caching it costs disk and no
-        # network. The ranking strategies ignore it; research that needs a
-        # liquidity or participation test would otherwise have to re-download
-        # the whole universe to get a column already in hand.
-        if "Volume" in (raw.columns.get_level_values(0)
-                        if isinstance(raw.columns, pd.MultiIndex) else raw.columns):
-            v = raw["Volume"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Volume"]]
-            if isinstance(v, pd.Series):
-                v = v.to_frame(batch[0])
-            vframes.append(v)
-        failed.extend([t for t in batch if t not in close.columns
-                       or close[t].notna().sum() == 0])
-
-    if not frames:
+    px, vol, failed = _download_universe(tickers, start, end, batch_size)
+    if px is None:
         raise RuntimeError("no price data returned for any ticker in the universe")
-
-    px = pd.concat(frames, axis=1).sort_index()
-    px = px.loc[:, ~px.columns.duplicated()]
-    px.index = pd.to_datetime(px.index).tz_localize(None).normalize()
-    px.index.name = "Date"
-    px = px.drop(columns=[c for c in px.columns if px[c].notna().sum() == 0], errors="ignore")
 
     if verbose:
         print(f"[universe] {px.shape[1]} tickers, {len(px)} rows, "
@@ -276,11 +331,9 @@ def load_universe_prices(
         record_failures(cache_dir, failed)
 
     px.to_csv(cache)
-    if vframes:
-        vol = pd.concat(vframes, axis=1).sort_index()
-        vol = vol.loc[:, ~vol.columns.duplicated()]
-        vol.index = pd.to_datetime(vol.index).tz_localize(None).normalize()
-        vol.index.name = "Date"
+    # A full download is yfinance from end to end: no screener cell survives it.
+    clear_marks(cache)
+    if vol is not None:
         vol.reindex(columns=px.columns).to_csv(vol_cache)
     return px
 

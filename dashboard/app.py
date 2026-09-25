@@ -50,7 +50,7 @@ from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams, ResidualMomentumParams)
 from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
                       load_prices, sessions_behind)
-from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
+from qbs.finviz import (BARS_DIR, UniverseFilters, due_for_fetch, fetch_epoch,
                         load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
                         latest_quotes, needs_fill)
@@ -61,7 +61,8 @@ from qbs.candles import HammerRules, hammer_frame, volume_stats
 from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
                         watchlist_rows)
 from qbs.strategies import cross_sectional_momentum, residual_momentum
-from qbs.universe import load_universe, load_universe_prices
+from qbs.incremental import persist_fill
+from qbs.universe import UNIVERSE_DIR, load_universe, load_universe_prices
 
 st.set_page_config(page_title="Strategy picks / Market overview", layout="wide",
                    initial_sidebar_state="expanded")
@@ -125,7 +126,14 @@ PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
 # Data
 # --------------------------------------------------------------------------
 
-def _top_up_front_bar(closes, volumes, online: bool):
+# The on-disk caches a screener top-up is saved into: (closes, volumes).
+PICKS_CACHE = (os.path.join(UNIVERSE_DIR, "universe_prices.csv"),
+               os.path.join(UNIVERSE_DIR, "universe_volumes.csv"))
+MARKET_CACHE = (os.path.join(BARS_DIR, "us_closes.csv"),
+                os.path.join(BARS_DIR, "us_volumes.csv"))
+
+
+def _top_up_front_bar(closes, volumes, online: bool, persist=None):
     """The newest close from the screener, when yfinance has not published it.
 
     Returns `(closes, volumes, note)`. yfinance stays the authority for every
@@ -135,6 +143,11 @@ def _top_up_front_bar(closes, volumes, online: bool):
 
     Asked only when a bar is actually short, so a normal day costs no screener
     request at all.
+
+    `persist` is a `(closes_csv, volumes_csv)` pair: the filled cells are
+    written there, marked provisional, so the next load finds the session on
+    disk and needs no download at all. The next download that does run
+    replaces them with yfinance's values -- see `qbs.incremental`.
     """
     if not online or fill_disabled() or not needs_fill(closes):
         return closes, volumes, None
@@ -142,6 +155,12 @@ def _top_up_front_bar(closes, volumes, online: bool):
     if quotes is None:
         return closes, volumes, f"could not top up the newest bar — {err}"
     closes, volumes, report = fill_last_bar(closes, volumes, quotes)
+    if persist and report.get("tickers"):
+        names, session = report["tickers"], report["session"]
+        vol = (quotes["volume"].reindex(names)
+               if "volume" in quotes.columns else None)
+        persist_fill(persist[0], session, closes.loc[session, names],
+                     persist[1], vol)
     return closes, volumes, fill_note(report)
 
 
@@ -191,14 +210,26 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
             raise
         status["error"] = f"no usable cache ({exc})"
 
-    behind = (sessions_behind(px.index.max()) if px is not None else 99)
-    if online and (force or behind >= 1 or uni is None):
+    # Behind is asked of the UNIVERSE's last whole bar, which counts a
+    # screener top-up saved on an earlier load: once today's closes are on
+    # disk, a reload needs no network. The ETFs are never topped up, so a
+    # one-session lag there is carried forward below (and said so) rather
+    # than treated as a reason to download.
+    behind_u = (sessions_behind(drop_partial_bars(uni)[0].index.max())
+                if uni is not None and not uni.empty else 99)
+    behind_px = sessions_behind(px.index.max()) if px is not None else 99
+    if online and (force or uni is None or behind_u >= 1 or behind_px >= 2):
         try:
+            # "Refresh now" is a full download; anything else is an update
+            # that fetches a recent window and re-downloads only the names
+            # the provider re-based (`qbs.incremental`).
             tickers = load_universe(fetch=True, warn=False)
             uni = load_universe_prices(tickers, start=download_start,
-                                       refresh=True, verbose=False)
+                                       refresh=bool(force), incremental=True,
+                                       verbose=False)
             px = load_prices(["QQQ", "VEU", "BOXX"], start=download_start,
-                             refresh=True, offline=False)
+                             refresh=bool(force), incremental=True,
+                             offline=False)
             status["downloaded"] = True
             status["error"] = None
         except Exception as exc:  # noqa: BLE001
@@ -216,7 +247,8 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
     # The bar yfinance dropped is the one the screener already has. Done
     # after the torn one is gone, so the fill lands on a clean frame rather
     # than beside a dozen stragglers.
-    uni, _, status["filled"] = _top_up_front_bar(uni, None, online)
+    uni, _, status["filled"] = _top_up_front_bar(uni, None, online,
+                                                 persist=PICKS_CACHE)
     if uni.index.max() < px.index.max():
         px = px.loc[:uni.index.max()]
     elif uni.index.max() > px.index.max():
@@ -321,7 +353,10 @@ def load_watch_prices(tickers: tuple, download_start: str, online: bool,
             err = f"{type(exc).__name__}: {exc}"
         if online and (s is None or s.index.max() < last):
             try:
-                s = load_prices([t], start=download_start, refresh=True,
+                # An update when there is a cache to update, a full
+                # download when there is not.
+                s = load_prices([t], start=download_start,
+                                refresh=s is None, incremental=True,
                                 offline=False)[t]
                 err = None
             except Exception as exc:  # noqa: BLE001
@@ -434,7 +469,7 @@ def load_us_market(download_start: str, online: bool, force: bool,
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
         tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False, stale_after=1 if auto else None)
+        verbose=False, stale_after=1 if auto else None, incremental=True)
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
@@ -445,7 +480,8 @@ def load_us_market(download_start: str, online: bool, force: bool,
     # function's own staleness check, or a torn bar makes the cache look
     # current and the download that would replace it never runs. Its reason
     # arrives in `bars_err`.
-    closes, volumes, fill = _top_up_front_bar(closes, volumes, online)
+    closes, volumes, fill = _top_up_front_bar(closes, volumes, online,
+                                              persist=MARKET_CACHE)
     warn = "; ".join(x for x in (uni_err, bars_err, fill) if x) or None
     # The source is named in the note because two providers apply the same
     # rules to different listings databases and will not agree on the last
