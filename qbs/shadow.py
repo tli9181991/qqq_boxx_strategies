@@ -27,8 +27,8 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from .config import MomentumParams
-from .strategies import cross_sectional_momentum
+from .config import MomentumParams, ResidualMomentumParams
+from .strategies import cross_sectional_momentum, residual_momentum_score
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +127,62 @@ def parse_watchlist(raw: Optional[str]) -> List[str]:
         t.strip().upper() for t in raw.replace(",", " ").split() if t.strip()))
 
 
+def _place(universe: pd.DataFrame, safe_prices: pd.Series, watch: pd.DataFrame,
+           p: MomentumParams, score,
+           asof: Optional[pd.Timestamp]):
+    """Rank the constituents plus the watched outsiders once, then split them.
+
+    Returns `(base, placed, outsiders)`: `base` is the constituents' own
+    ranking as `[(symbol, score), ...]` best first, with the outsiders taken
+    back out; `placed` is every ranked name's score, outsiders included. None
+    when nothing could be scored.
+
+    `score` swaps what the ranking sorts on -- a frame, or a function of the
+    joined frame; None is the book's 6-1 -- through
+    the same `cross_sectional_momentum` loop the book uses -- so the absolute
+    filter and the history rule are the live ones for every score.
+
+    Every rank a caller derives is measured against `base`, so adding a name
+    to the watchlist cannot change what any other row reports.
+    """
+    if watch.empty:
+        return None
+    outsiders = [t for t in watch.columns if t not in universe.columns]
+    try:
+        frame = universe.join(watch[outsiders], how="left") if outsiders else universe
+        if callable(score):
+            score = score(frame)
+        sig = cross_sectional_momentum(frame, safe_prices, p, score=score,
+                                       record_ranks=frame.shape[1])
+        dt = asof or sig.weights.index[-1]
+        ranked = (sig.rank_log or {}).get(dt, [])
+    except Exception as exc:              # noqa: BLE001 -- a log must not raise
+        log.warning("watchlist could not be scored (%s: %s)", type(exc).__name__, exc)
+        return None
+    outsider_set = set(outsiders)
+    base = [(t, sc) for t, _, sc in ranked if t not in outsider_set]
+    placed = {t: sc for t, _, sc in ranked}
+    return base, placed, outsider_set
+
+
+def _rank_in(base: List[tuple], symbol: str, score: float) -> float:
+    """Where `score` places in `base`; NaN for a name that was not ranked.
+
+    Absent from the ranking means filtered out, not placed last: too little
+    history, or it lost to the safe asset over the same window. Reporting that
+    as "rank 99" would read as a weak name rather than an excluded one.
+
+    Its own score is in `base` when it is a constituent and absent when it is
+    not, so counting what strictly outranks it gives the standing rank in the
+    first case and the interpolated one in the second, from the same
+    expression.
+    """
+    if score != score:
+        return float("nan")
+    return float(1 + sum(1 for other, sc in base
+                         if other != symbol and sc > score))
+
+
 def watchlist_rows(
     universe: pd.DataFrame,
     safe_prices: pd.Series,
@@ -161,26 +217,10 @@ def watchlist_rows(
     claim, and the reason this is a log rather than a signal.
     """
     p = params or MomentumParams()
-    names = list(watch.columns)
-    if not names:
+    placed_rows = _place(universe, safe_prices, watch, p, score=None, asof=asof)
+    if placed_rows is None:
         return []
-    outsiders = [t for t in names if t not in universe.columns]
-
-    try:
-        frame = universe.join(watch[outsiders], how="left") if outsiders else universe
-        sig = cross_sectional_momentum(frame, safe_prices, p,
-                                       record_ranks=frame.shape[1])
-        dt = asof or sig.weights.index[-1]
-        ranked = (sig.rank_log or {}).get(dt, [])
-    except Exception as exc:              # noqa: BLE001 -- a log must not raise
-        log.warning("watchlist could not be scored (%s: %s)", type(exc).__name__, exc)
-        return []
-
-    # The constituents' own ranking, in order, with the outsiders taken back
-    # out. Every rank and cutoff below is measured against this, so adding a
-    # name to the watchlist cannot change what any other row reports.
-    outsider_set = set(outsiders)
-    base = [(t, sc) for t, _, sc in ranked if t not in outsider_set]
+    base, placed, outsider_set = placed_rows
     base_scores = [sc for _, sc in base]
 
     # A cutoff is the score of the name in that slot, so it exists only when
@@ -189,23 +229,10 @@ def watchlist_rows(
     book_cut = base_scores[p.n_hold - 1] if len(base_scores) >= p.n_hold else float("nan")
     band_cut = base_scores[p.exit_rank - 1] if len(base_scores) >= p.exit_rank else float("nan")
 
-    placed = {t: sc for t, _, sc in ranked}
     rows: List[Dict] = []
-    for t in names:
+    for t in watch.columns:
         score = placed.get(t, float("nan"))
-        if score != score:
-            # Absent from the ranking means filtered out, not placed last: too
-            # little history, or it lost to the safe asset over the same
-            # window. Reporting that as "rank 99" would read as a weak name
-            # rather than an excluded one.
-            rank = float("nan")
-        else:
-            # Its own score is in `base` when it is a constituent and absent
-            # when it is not, so counting what strictly outranks it gives the
-            # standing rank in the first case and the interpolated one in the
-            # second, from the same expression.
-            rank = float(1 + sum(1 for other, sc in base
-                                 if other != t and sc > score))
+        rank = _rank_in(base, t, score)
         rows.append(dict(
             symbol=t, rank=rank, score=score,
             book_cutoff=book_cut, band_cutoff=band_cut,
@@ -213,3 +240,43 @@ def watchlist_rows(
             beats_book=bool(rank == rank and rank <= p.n_hold),
         ))
     return rows
+
+
+def watchlist_residual_ranks(
+    universe: pd.DataFrame,
+    safe_prices: pd.Series,
+    market: pd.Series,
+    watch: pd.DataFrame,
+    params: Optional[ResidualMomentumParams] = None,
+    asof: Optional[pd.Timestamp] = None,
+) -> Dict[str, float]:
+    """Each watched name's place in the RESIDUAL momentum book's ranking.
+
+    The same placement `watchlist_rows` makes, on the score the residual book
+    sorts on (`residual_momentum_score`) and with its own 12-1 window for the
+    absolute filter -- i.e. the ranking `residual_momentum` acts on. A
+    constituent reports its standing rank there; an outsider is interpolated
+    into it without joining it.
+
+    The residual score of one name depends only on that name and the market,
+    so joining an outsider cannot move a constituent's score, and the rank is
+    counted against the constituents alone as before.
+
+    Returns `{symbol: rank}`, NaN for a name the ranker filtered out, and an
+    empty dict if nothing could be scored -- a log must not raise.
+    """
+    rp = params or ResidualMomentumParams()
+    mp = MomentumParams(
+        lookback_months=rp.lookback_months, skip_months=rp.skip_months,
+        n_hold=rp.n_hold, exit_rank=rp.exit_rank, rebalance=rp.rebalance,
+        absolute_filter=rp.absolute_filter, safe_asset=rp.safe_asset,
+        min_history=rp.min_history)
+    placed_rows = _place(
+        universe, safe_prices, watch, mp,
+        score=lambda frame: residual_momentum_score(frame, market, rp),
+        asof=asof)
+    if placed_rows is None:
+        return {}
+    base, placed, _ = placed_rows
+    return {t: _rank_in(base, t, placed.get(t, float("nan")))
+            for t in watch.columns}

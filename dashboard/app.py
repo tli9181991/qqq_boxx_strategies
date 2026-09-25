@@ -57,7 +57,9 @@ from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
-from qbs.shadow import parse_watchlist, watchlist_rows
+from qbs.candles import HammerRules, hammer_frame, volume_stats
+from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
+                        watchlist_rows)
 from qbs.strategies import cross_sectional_momentum, residual_momentum
 from qbs.universe import load_universe, load_universe_prices
 
@@ -333,17 +335,31 @@ def load_watch_prices(tickers: tuple, download_start: str, online: bool,
 
 
 @st.cache_data(show_spinner="Ranking the watchlist…")
-def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _watch: pd.DataFrame,
-               names: str, n_hold: int, exit_rank: int, asof: pd.Timestamp):
-    """`watchlist_rows` behind a cache.
+def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
+               _watch: pd.DataFrame, names: str, n_hold: int, exit_rank: int,
+               n_resid: int, asof: pd.Timestamp):
+    """`watchlist_rows` behind a cache, with the residual book's rank added.
 
     `names` is in the signature only to be hashed -- the frames are passed
     with a leading underscore, so without it the cache key would not change
     when the watchlist does and editing the box would show the old ranking.
+
+    `resid_rank` is the same name placed in the residual momentum book's
+    ranking (`_market` is its factor, QQQ, as in `build_selections`). A
+    separate ranking, not a re-sort of this one: the two books disagree on
+    exactly the names whose strength is mostly market beta.
     """
-    return watchlist_rows(_uni, _safe, _watch,
+    rows = watchlist_rows(_uni, _safe, _watch,
                           MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
                           asof=asof)
+    resid = watchlist_residual_ranks(
+        _uni, _safe, _market, _watch,
+        ResidualMomentumParams(n_hold=n_resid,
+                               exit_rank=n_resid + RESID_BAND),
+        asof=asof)
+    for r in rows:
+        r["resid_rank"] = resid.get(r["symbol"], float("nan"))
+    return rows
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -797,6 +813,10 @@ def rank_table(rows, n_hold: int, exit_rank: int,
         cols[label] = [by_symbol.get(t, "—") for t in wf["symbol"]]
     cols["Ticker"] = list(wf["symbol"])
     cols["Rank"] = [fmt(r, "{:.0f}") for r in wf["rank"]]
+    if "resid_rank" in wf:
+        # The residual book's ranking, placed the same way: a constituent's
+        # standing rank there, an outsider interpolated into it.
+        cols["Resid. rank"] = [fmt(r, "{:.0f}") for r in wf["resid_rank"]]
     cols["Placed"] = ["in index" if c else "interpolated"
                       for c in wf["constituent"]]
     cols["Score"] = [fmt(v, "{:+.3f}") for v in wf["score"]]
@@ -814,6 +834,80 @@ def rank_table(rows, n_hold: int, exit_rank: int,
         lambda _col: [f"background-color: {UP}" if b else "" for b in beats],
         subset=["Rank"])
     return styler, show, wf
+
+
+def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
+                 window: int, rules: HammerRules):
+    """One row per name: volume against its average, and the last 3 candles.
+
+    Returns `(frame, hammer_cells, missing)`. `hammer_cells` is a
+    `{column: [verdict per row]}` map the caller tints from, so the colour
+    follows the rule rather than a re-parse of the cell text; `missing` lists
+    the names with no OHLC at all.
+
+    Read from the per-name OHLC cache (`ohlc_for`), cut at `asof` so moving
+    the date slider shows what was knowable on that date. Volume falls back to
+    the universe volume cache for a name with no OHLC -- the hammer columns
+    cannot, since a candle cannot be drawn from closes.
+    """
+    from qbs.universe import load_universe_volumes
+
+    uvol = load_universe_volumes(list(names))
+    rows, missing = [], []
+    day_cols = ["Hammer D0", "Hammer D-1", "Hammer D-2"]
+    verdicts: Dict[str, list] = {c: [] for c in day_cols}
+    for t in names:
+        ohlc = ohlc_for(t, download_start, bool(online), BAR_EPOCH)
+        bars = None
+        if ohlc is not None and not ohlc.empty:
+            bars = ohlc.loc[:asof]
+            if not {"Open", "High", "Low", "Close"} <= set(bars.columns) or bars.empty:
+                bars = None
+        if bars is not None and "Volume" in bars.columns:
+            vs = volume_stats(bars["Volume"], bars["Close"], window)
+            bar_date = bars.index[-1]
+        elif uvol is not None and t in uvol.columns:
+            v = uvol[t].loc[:asof].dropna()
+            close = uni[t] if t in uni.columns else None
+            vs = volume_stats(v, close, window)
+            bar_date = v.index[-1] if len(v) else None
+        else:
+            vs, bar_date = volume_stats(pd.Series(dtype=float)), None
+
+        row = {"Ticker": t, "Held by": held_by.get(t, "—"),
+               "Bar": f"{bar_date:%m-%d}" if bar_date is not None else "—",
+               "Last vol": vs["last"], f"Avg vol ({window}d)": vs["avg"],
+               "Vol ratio": vs["ratio"],
+               f"Avg $ vol ({window}d)": vs["avg_value"]}
+        if bars is None:
+            missing.append(t)
+            for c in day_cols:
+                row[c] = "—"
+                verdicts[c].append(None)
+            row["Hammers (3d)"] = "—"
+        else:
+            hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
+            n_ham = 0
+            for i, c in enumerate(day_cols):
+                if i >= len(hf):
+                    row[c] = "—"
+                    verdicts[c].append(None)
+                    continue
+                b = hf.iloc[i]
+                share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
+                if b["hammer"]:
+                    row[c], v = f"🔨 {share}", "hammer"
+                    n_ham += 1
+                elif b["hanging_man"]:
+                    row[c], v = f"⚠️ {share}", "hanging"
+                elif b["shape"]:
+                    row[c], v = f"◐ {share}", "shape"
+                else:
+                    row[c], v = share, None
+                verdicts[c].append(v)
+            row["Hammers (3d)"] = n_ham
+        rows.append(row)
+    return pd.DataFrame(rows), verdicts, missing
 
 
 # Loaded once, above the tabs, because two of them need it: the picks tab
@@ -1281,6 +1375,69 @@ with tab_picks:
             + (", ".join(sorted(all3)) if all3 else "no overlap")
             + f" ({len(all3)})"))
 
+    # ---- volume and hammer candles for the names on the page -----------
+    st.divider()
+    st.markdown("#### Volume & hammer candles")
+    held_by: Dict[str, str] = {}
+    for key in books:
+        for t in sorted(picks[key]):
+            held_by[t] = (held_by[t] + ", " if t in held_by else "") + SHORT[key]
+    for t in WATCHLIST:
+        held_by.setdefault(t, "watchlist")
+    cand_names = list(held_by)
+    if not cand_names:
+        st.caption("No held or watched names on this date.")
+    else:
+        vwin = st.number_input(
+            "Average volume window (sessions)", 5, 120, 20, step=5,
+            key="candle_vol_window",
+            help="Sessions averaged for the baseline. The last session is "
+                 "excluded from its own baseline, so a spike is measured "
+                 "against days it did not help set.")
+        HR = HammerRules()
+        ctab, verdicts, no_ohlc = candle_table(
+            cand_names, held_by, asof, int(vwin), HR)
+        vol_cols = [c for c in ctab.columns if c.startswith(("Last vol", "Avg vol"))]
+        val_col = next(c for c in ctab.columns if c.startswith("Avg $ vol"))
+        HAMMER_TINT = {"hammer": f"background-color: {UP}",
+                       "hanging": f"background-color: {DN}",
+                       "shape": ""}
+        cstyle = (ctab.style
+                  .format({**{c: lambda v: fmt(v, "{:,.0f}") for c in vol_cols},
+                           "Vol ratio": lambda v: fmt(v, "{:.2f}×"),
+                           val_col: lambda v: fmt(
+                               v / 1e6 if v == v else v, "${:,.1f}M")})
+                  .background_gradient(subset=["Vol ratio"], cmap="Blues",
+                                       vmin=0.5, vmax=2.5))
+        for c, vs in verdicts.items():
+            cstyle = cstyle.apply(
+                lambda _col, vs=vs: [HAMMER_TINT.get(v, "") if v else ""
+                                     for v in vs], subset=[c])
+        st.dataframe(cstyle, hide_index=True, width="stretch",
+                     height=min(620, 38 + 35 * len(ctab)))
+        st.caption(md(
+            f"Last session's volume against the average of the **{int(vwin)} "
+            "sessions before it** (the last one excluded), and the ratio of the "
+            "two; *Avg $ vol* is close × shares over the same window. "
+            "*Bar* is the date of the last candle read, which can trail the "
+            "slider when a name's OHLC is behind the ranking cache. "
+            "**Hammer D0 / D-1 / D-2** are the last three candles, newest "
+            "first, each showing the lower shadow as a share of the day's "
+            "range. A candle is a hammer **shape** when: body ≤ "
+            f"{HR.max_body:.0%} of the range · lower shadow ≥ "
+            f"{HR.min_lower_to_body:g}× the body **and** ≥ {HR.min_lower:.0%} "
+            f"of the range · upper shadow ≤ {HR.max_upper:.0%} of the range · "
+            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR "
+            "(a tiny range says nothing). 🔨 is that shape **after a "
+            f"{HR.trend_days}-session decline** — the reversal pattern. ⚠️ is "
+            "the same shape after a rise, a *hanging man*, which reads the "
+            "other way. ◐ is the shape with a flat prior trend. "
+            "Descriptive only — nothing here changes a ranking or a holding."
+            + (f" No OHLC for {', '.join(no_ohlc)}"
+               + ("" if online else " — switch **Source** to Online to fetch it")
+               + "; volume there, if shown, is from the universe cache."
+               if no_ohlc else "")))
+
     # ---- watchlist: where a name places, without the book buying it -----
     st.divider()
     st.markdown("#### Watchlist rank")
@@ -1305,9 +1462,9 @@ with tab_picks:
                 f"**{t}** ({e})" for t, e in WATCH_ERR.items())
                 + ". " + remedy), icon="⚠️")
 
-        rows = (watch_rows(uni, px["BOXX"], WATCH_FRAME,
+        rows = (watch_rows(uni, px["BOXX"], px["QQQ"], WATCH_FRAME,
                            ",".join(WATCHLIST), int(n_hold), int(exit_rank),
-                           asof)
+                           int(n_resid), asof)
                 if not WATCH_FRAME.empty else [])
         if not rows:
             st.info("Nothing on the watchlist could be ranked on this date.")
@@ -1330,7 +1487,12 @@ with tab_picks:
                 f"Ranked on {asof:%Y-%m-%d} against the {uni.shape[1]} "
                 "constituents alone, so two watched names never shift each "
                 "other's row, and nothing here changes a holding. A "
-                "constituent shows the rank it already has."
+                "constituent shows the rank it already has. *Rank* is the "
+                "momentum book's ranking; *Resid. rank* places the same name, "
+                "the same way, in the **residual momentum** book's ranking "
+                "(12-1 momentum net of its beta to QQQ) — a name far better "
+                "on *Rank* than on *Resid. rank* owes its strength mostly to "
+                "the market."
                 + outsider_note
                 + " A blank rank means the name was filtered out (too little "
                 "history, or it lost to BOXX over the same window), not that "
@@ -1673,9 +1835,9 @@ with tab_market:
             lead_names = [t for t in lead_rows["symbol"] if t in m_uni.columns]
             lead_frame = pd.DataFrame({
                 t: m_uni[t].reindex(uni.index).ffill() for t in lead_names})
-            rows_l = (watch_rows(uni, px["BOXX"], lead_frame,
+            rows_l = (watch_rows(uni, px["BOXX"], px["QQQ"], lead_frame,
                                  ",".join(lead_names), int(n_hold),
-                                 int(exit_rank), rank_asof)
+                                 int(exit_rank), int(n_resid), rank_asof)
                       if lead_names and rank_asof is not None else [])
             if not rows_l:
                 st.info("These names could not be placed in the book's "

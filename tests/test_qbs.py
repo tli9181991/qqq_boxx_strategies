@@ -4236,3 +4236,55 @@ def test_the_picks_tab_and_the_selection_builder_agree_on_the_books():
     assert set(built) == set(labelled) == set(columns), (
         f"built {built}, labelled {labelled}, rendered {columns}")
     assert "resmom" in built, "the residual book is not wired in"
+
+
+# --------------------------------------------------------------------------
+# Candles: hammer rules and volume stats
+# --------------------------------------------------------------------------
+
+def _candle_bars(rows):
+    idx = pd.bdate_range("2026-01-01", periods=len(rows))
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=idx)
+
+
+def _with_history(last, drift):
+    """20 ordinary 2-point-range sessions trending by `drift`, then `last`."""
+    rows, c = [], 100.0
+    for _ in range(20):
+        o, c = c, c + drift
+        rows.append([o, max(o, c) + 0.5, min(o, c) - 0.5, c])
+    return _candle_bars(rows + [last(c)])
+
+
+def test_hammer_after_a_decline_is_a_hammer():
+    from qbs.candles import hammer_frame
+    # Range 4, body 0.4 at the top, lower shadow 3.4, upper 0.2.
+    f = hammer_frame(_with_history(lambda c: [c - 0.2, c + 0.2, c - 3.8, c], -0.5))
+    last = f.iloc[-1]
+    assert last["shape"] and last["hammer"] and not last["hanging_man"]
+
+
+def test_same_shape_after_a_rise_is_a_hanging_man():
+    from qbs.candles import hammer_frame
+    f = hammer_frame(_with_history(lambda c: [c - 0.2, c + 0.2, c - 3.8, c], 0.5))
+    last = f.iloc[-1]
+    assert last["shape"] and last["hanging_man"] and not last["hammer"]
+
+
+def test_long_upper_shadow_or_tiny_range_is_not_a_hammer():
+    from qbs.candles import hammer_frame
+    # Upper shadow as long as the lower one: a spinning top.
+    top = hammer_frame(_with_history(lambda c: [c, c + 2.0, c - 2.0, c + 0.1], -0.5))
+    assert not top.iloc[-1]["shape"]
+    # Perfect geometry on a range a tenth of the usual: says nothing.
+    tiny = hammer_frame(_with_history(lambda c: [c - 0.01, c + 0.01, c - 0.19, c], -0.5))
+    assert tiny.iloc[-1]["lower"] > 0.8 and not tiny.iloc[-1]["shape"]
+
+
+def test_volume_baseline_excludes_the_last_session():
+    from qbs.candles import volume_stats
+    idx = pd.bdate_range("2026-01-01", periods=21)
+    v = pd.Series([100.0] * 20 + [300.0], index=idx)
+    s = volume_stats(v, pd.Series(10.0, index=idx), window=20)
+    assert s["last"] == 300 and s["avg"] == 100 and s["ratio"] == 3.0
+    assert s["avg_value"] == 1000.0 and s["n"] == 20
