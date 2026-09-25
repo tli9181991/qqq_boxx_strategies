@@ -2443,9 +2443,11 @@ def test_breadth_over_a_torn_bar_reports_zero_movers():
     torn.loc[nxt, list(px.columns[:12])] = px.iloc[-1][:12] * 1.012
     qqq2 = pd.concat([qqq, pd.Series({nxt: qqq.iloc[-1] * 1.012})])
 
-    bad = daily_breadth(torn, qqq=qqq2).table.tail(1).iloc[0]
-    assert bad["n_stocks"] == 12
-    assert bad["up4"] == 0 and bad["dn4"] == 0, "the symptom, reproduced"
+    # Breadth now finds that row itself (`thin_rows`) and leaves it out, so
+    # the symptom -- 0 and 0 movers on a day the market rose -- cannot reach
+    # the table even when a caller forgets to trim.
+    res = daily_breadth(torn, qqq=qqq2)
+    assert nxt in res.gaps and res.table.index[-1] == px.index[-1]
 
     # With the row dropped first, the table simply ends at the last real one.
     clean, _, _ = drop_partial_bars(torn)
@@ -4460,3 +4462,60 @@ def test_fill_note_names_a_handful_of_filled_tickers():
     assert "(AAA, BBB, CCC)" in fill_note(rep, "finviz")
     rep.update(filled=40, tickers=[f"T{i}" for i in range(40)])
     assert "T0" not in fill_note(rep, "finviz")
+
+
+# --------------------------------------------------------------------------
+# Thin sessions in the middle of a history
+# --------------------------------------------------------------------------
+
+def _wide_days(n_days=120, n_names=600, seed=0):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end="2026-09-24", periods=n_days)
+    return pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.03, (n_days, n_names)), axis=0)),
+                        index=idx, columns=[f"T{i}" for i in range(n_names)])
+
+
+def test_thin_rows_finds_a_gap_in_the_middle():
+    from qbs.data import thin_rows
+    px = _wide_days()
+    px.iloc[-3, 50:] = np.nan
+    gaps = thin_rows(px)
+    assert list(gaps) == [px.index[-3]] and gaps[px.index[-3]][0] == 50
+
+
+def test_breadth_skips_a_gap_instead_of_reading_the_survivors():
+    """A session most names lack must not shrink weeks of rows to its survivors."""
+    from qbs.breadth import daily_breadth
+    px = _wide_days()
+    whole = daily_breadth(px).table
+    holed = px.copy()
+    holed.iloc[-3, 50:] = np.nan
+    res = daily_breadth(holed)
+    t = res.table
+    assert px.index[-3] in res.gaps and px.index[-3] not in t.index
+    # The row after the gap would be a two-session move: no 4% counts.
+    assert np.isnan(t.loc[px.index[-2], "up4"])
+    # The averages still run over every name, not the 50 that had the gap day.
+    assert abs(t.loc[px.index[-1], "pct_above_fast"]
+               - whole.loc[px.index[-1], "pct_above_fast"]) < 3
+    assert t.loc[px.index[-1], "up4"] == whole.loc[px.index[-1], "up4"]
+
+
+def test_qqq_atr_uses_real_high_low_when_given():
+    from qbs.breadth import daily_breadth
+    px = _wide_days(n_names=40)
+    q = px.mean(axis=1)
+    ohlc = pd.DataFrame({"Open": q, "High": q * 1.02, "Low": q * 0.98, "Close": q})
+    close_only = daily_breadth(px, qqq=q).table["qqq_atr"].abs().mean()
+    real = daily_breadth(px, qqq=q, qqq_ohlc=ohlc).table["qqq_atr"].abs().mean()
+    assert real < close_only, "a real range is wider, so the distance is smaller"
+
+
+def test_the_update_window_reaches_back_to_a_recent_gap():
+    from qbs.data import thin_rows
+    from qbs.incremental import window_start
+    px = _wide_days(n_names=100)
+    gap = px.index[-10]
+    px.loc[gap, px.columns[20:]] = np.nan
+    assert gap in thin_rows(px)
+    assert window_start(px, ()) < gap

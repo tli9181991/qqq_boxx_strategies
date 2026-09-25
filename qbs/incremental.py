@@ -39,7 +39,7 @@ A full download rewrites the cache and clears every mark.
 from __future__ import annotations
 
 import os
-from typing import Callable, Iterable, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -89,16 +89,28 @@ def clear_marks(cache_path: str) -> None:
     write_marks(cache_path, [])
 
 
+# How far back a thin session (most names missing) is still re-fetched. Older
+# than this it is history the provider evidently does not have.
+GAP_REPAIR_SESSIONS = 60
+
+
 def window_start(cached: pd.DataFrame, marks: Iterable[Mark],
                  overlap: int = OVERLAP_SESSIONS) -> pd.Timestamp:
     """Where a recent download must start to re-check the cache's front edge.
 
-    Anchored on the OLDEST provisional cell when there is one, so every
-    screener print is re-fetched until yfinance has replaced it, and otherwise
-    on the newest row. `overlap` business days before that anchor are the
-    confirmed sessions the re-basing check compares.
+    Anchored on the OLDEST of: a provisional cell, so every screener print is
+    re-fetched until yfinance has replaced it; a thin session in the last
+    `GAP_REPAIR_SESSIONS` rows, so a session a download returned for only a
+    few hundred names is fetched again rather than kept for good; and
+    otherwise the newest row. `overlap` business days before that anchor are
+    the confirmed sessions the re-basing check compares.
     """
+    from .data import thin_rows
+
     dates = [d for d, _ in marks]
+    dates += list(thin_rows(cached.tail(GAP_REPAIR_SESSIONS + 20)))
+    dates = [d for d in dates
+             if d >= cached.index[-min(len(cached), GAP_REPAIR_SESSIONS)]]
     anchor = min(dates) if dates else cached.index.max()
     return (pd.Timestamp(anchor) - pd.offsets.BDay(overlap)).normalize()
 
@@ -242,8 +254,14 @@ def refresh_incremental(
             marks_left = {(d, t) for d, t in marks_left if t not in got}
         else:
             failed = list(full)
+    from .data import thin_rows
+
+    # A thin session still thin after the update is one the provider does not
+    # have either. Reported so the caller can say which day is missing.
+    holes = {d: v for d, v in thin_rows(closes).items()
+             if d >= pd.Timestamp(since)}
     info = dict(recent=len(held) - len(rebased), full=len(full) - len(failed),
-                rebased=rebased, failed=failed, since=since)
+                rebased=rebased, failed=failed, since=since, holes=holes)
     return closes, volumes, marks_left, info
 
 
@@ -290,3 +308,43 @@ def persist_fill(cache_path: str, session: pd.Timestamp, closes: pd.Series,
         return len(written)
     except Exception:  # noqa: BLE001
         return 0
+
+
+def cache_report(cache_path: str, rows: int = 15) -> str:
+    """How many names each recent session has, the thin ones flagged.
+
+    `python -m qbs.incremental data/universe/us_closes.csv` -- the quickest
+    way to see whether a breadth reading is built on a whole session or on the
+    few hundred names a download happened to return for it.
+    """
+    from .data import thin_rows
+
+    frame = pd.read_csv(cache_path, parse_dates=["Date"], index_col="Date")
+    thin = thin_rows(frame)
+    marks = read_marks(cache_path)
+    per_day: Dict[pd.Timestamp, int] = {}
+    for d, _ in marks:
+        per_day[d] = per_day.get(d, 0) + 1
+    lines = [f"{cache_path}: {frame.shape[1]} tickers, "
+             f"{frame.index.min():%Y-%m-%d} .. {frame.index.max():%Y-%m-%d}"]
+    for d, n in frame.notna().sum(axis=1).tail(rows).items():
+        flag = ""
+        if d in thin:
+            flag = f"  <-- THIN: {thin[d][0]} of ~{thin[d][1]} names"
+        if per_day.get(d):
+            flag += f"  ({per_day[d]} provisional, from the screener)"
+        lines.append(f"  {d:%Y-%m-%d}  {n:5d}{flag}")
+    older = [d for d in thin if d < frame.index[-rows]] if len(frame) > rows else []
+    if older:
+        lines.append("older thin sessions: "
+                     + ", ".join(f"{d:%Y-%m-%d}" for d in older))
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    import sys
+
+    for p in sys.argv[1:] or [os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "universe", "us_closes.csv")]:
+        print(cache_report(p))

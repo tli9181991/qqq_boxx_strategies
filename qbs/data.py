@@ -14,7 +14,7 @@ pipeline can be exercised (and unit-tested) with no data feed at all.
 from __future__ import annotations
 
 import os
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -291,6 +291,34 @@ def clear_quarantine(cache_dir: str) -> None:
         os.remove(_quarantine_path(cache_dir))
     except OSError:
         pass
+
+
+def thin_rows(frame: pd.DataFrame, min_coverage: float = 0.5,
+              lookback: int = 20) -> Dict[pd.Timestamp, Tuple[int, int]]:
+    """Sessions ANYWHERE in `frame` that most names are missing.
+
+    `drop_partial_bars` handles the trailing case. This one finds the same
+    cliff in the MIDDLE of a history -- a session a download returned for a
+    few hundred names out of two and a half thousand and that later sessions
+    were then appended after. Nothing trims it, because it is no longer the
+    last row, and it is worse than a torn front bar: with no close that day,
+    that day's return and the next day's are both undefined for every missing
+    name, and every 20- and 50-day average through it is undefined for the
+    next 20 and 50 sessions. Breadth read over the survivors reports a few
+    hundred names as the market for weeks.
+
+    Returns `{date: (names_that_carried_it, names_a_normal_bar_has)}`,
+    measured against the median of the `lookback` rows around it (either
+    side), so a universe that grew over the years is not mistaken for one.
+    """
+    out: Dict[pd.Timestamp, Tuple[int, int]] = {}
+    if frame is None or frame.empty or len(frame) < 3:
+        return out
+    covered = frame.notna().sum(axis=1)
+    ref = covered.rolling(2 * lookback + 1, center=True, min_periods=3).median()
+    for day in covered.index[(covered < min_coverage * ref).to_numpy()]:
+        out[day] = (int(covered.loc[day]), int(ref.loc[day]))
+    return out
 
 
 def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
