@@ -229,7 +229,11 @@ def fill_note(report: Dict, source: Optional[str] = None) -> Optional[str]:
         return None
     name = resolve_source(source)
     total = report["filled"] + report["already"] + report["absent"]
-    return (f"{report['session']:%Y-%m-%d} topped up from **{name}** — "
-            f"{report['filled']} of {total} closes came from the screener "
-            f"because yfinance had not published them yet"
+    # A handful is worth naming: "3 of 2615" invites the question "which?",
+    # and the answer is usually a few thin names yfinance is slow on.
+    names = report.get("tickers") or []
+    which = f" ({', '.join(names)})" if 0 < len(names) <= 10 else ""
+    return (f"US session {report['session']:%Y-%m-%d} topped up from "
+            f"**{name}** — {report['filled']} of {total} closes{which} came "
+            f"from the screener because yfinance had not published them yet"
             + (f", {report['absent']} still missing" if report["absent"] else ""))

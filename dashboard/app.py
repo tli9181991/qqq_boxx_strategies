@@ -48,10 +48,12 @@ from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams, ResidualMomentumParams)
-from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
-                      load_prices, sessions_behind)
+from qbs.data import (MARKET_TZ, drop_partial_bars, freshness_note,
+                      load_daily_ohlc, load_prices, session_close,
+                      sessions_behind)
 from qbs.finviz import (BARS_DIR, UniverseFilters, due_for_fetch, fetch_epoch,
-                        load_universe_bars, record_fetch_attempt, sector_map)
+                        fetch_schedule, load_universe_bars,
+                        record_fetch_attempt, sector_map)
 from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
                         latest_quotes, needs_fill)
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
@@ -464,7 +466,7 @@ def load_us_market(download_start: str, online: bool, force: bool,
                                            verbose=False)
     if uni is None or uni.empty:
         return None, None, {}, f"{filters.label} · via {src}", (
-            uni_err or "unknown failure"), False
+            uni_err or "unknown failure"), False, None
 
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
@@ -473,7 +475,7 @@ def load_us_market(download_start: str, online: bool, force: bool,
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
-            f"{bars_err}"), False
+            f"{bars_err}"), False, None
 
     # A bar the provider had not finished publishing is dropped inside
     # `load_universe_bars` now, not here -- it has to happen before that
@@ -482,13 +484,17 @@ def load_us_market(download_start: str, online: bool, force: bool,
     # arrives in `bars_err`.
     closes, volumes, fill = _top_up_front_bar(closes, volumes, online,
                                               persist=MARKET_CACHE)
-    warn = "; ".join(x for x in (uni_err, bars_err, fill) if x) or None
+    # The top-up is NOT a warning: it is the fill working as designed, and
+    # lumping it in here put a "Partial US universe" banner over a universe
+    # that was complete. It goes back separately so the tab can say it the
+    # way the picks tab does.
+    warn = "; ".join(x for x in (uni_err, bars_err) if x) or None
     # The source is named in the note because two providers apply the same
     # rules to different listings databases and will not agree on the last
     # hundred names. A breadth count that steps when the source changed, on a
     # screen that does not say the source changed, reads as a market event.
     note = f"{filters.label} · via {src} · {why}"
-    return closes, volumes, sector_map(uni), note, warn, auto
+    return closes, volumes, sector_map(uni), note, warn, auto, fill
 
 
 EMA_SPANS = (10, 20, 50, 200)
@@ -616,6 +622,20 @@ def session_axis(*frames, date_col: str = "date", n_ticks: int = 6):
 
 def fmt(v, spec="{:.1f}", dash="—"):
     return dash if v is None or (isinstance(v, float) and pd.isna(v)) else spec.format(v)
+
+
+def session_text(session) -> str:
+    """A bar date, and when that US session closed in the reader's zone.
+
+    The zone is the fetch schedule's (`QBS_FETCH_TZ`), the one the reader
+    already set to their own. Bar dates are New York dates: read in Asia the
+    morning after, the newest bar carries YESTERDAY's date and is current.
+    """
+    tz = fetch_schedule()[2]
+    close = session_close(session, tz)
+    here = (f"{close:%m-%d %H:%M} {tz}" if tz != MARKET_TZ
+            else f"{close:%H:%M} ET")
+    return f"{pd.Timestamp(session):%Y-%m-%d} (US session, closed {here})"
 
 
 def md(text: str) -> str:
@@ -1306,7 +1326,7 @@ with tab_picks:
     freshness_banner()
     st.subheader("Daily picks")
     st.caption(f"{len(STRATEGY_LABELS)} selection strategies · universe {UNIVERSE_NOTE} · "
-               f"data through {LAST_BAR:%Y-%m-%d} ({SRC})")
+               f"data through {session_text(LAST_BAR)} · {SRC}")
 
     dates = [d for d in selections["momentum"].index
              if d >= pd.Timestamp(cfg.backtest_start)]
@@ -1568,10 +1588,10 @@ with tab_market:
 
     mkt_closes = mkt_vols = None
     mkt_sectors: Dict[str, str] = {}
-    mkt_note, mkt_err, mkt_fetched = "", None, False
+    mkt_note, mkt_err, mkt_fetched, mkt_fill = "", None, False, None
     if use_us:
         (mkt_closes, mkt_vols, mkt_sectors, mkt_note, mkt_err,
-         mkt_fetched) = load_us_market(
+         mkt_fetched, mkt_fill) = load_us_market(
             download_start, bool(online), bool(force), BAR_EPOCH,
             st.session_state["refresh_token"])
 
@@ -1590,8 +1610,10 @@ with tab_market:
         _, why_not = due_for_fetch()
         st.caption(
             f"🌐 {m_uni.shape[1]:,} names · last bar "
-            f"{m_uni.index.max():%Y-%m-%d} ({age}) · "
+            f"{session_text(m_uni.index.max())} ({age}) · "
             + ("**fetched on this run**" if mkt_fetched else why_not))
+        if mkt_fill:
+            st.info(md("🔗 " + mkt_fill), icon="🧩")
         if mkt_err:                      # loaded, but not cleanly
             st.warning(f"**Partial US universe.** {mkt_err}", icon="⚠️")
     else:
