@@ -4443,3 +4443,20 @@ def test_market_bars_update_incrementally(tmp_path, monkeypatch):
     assert calls[1] == (("CCC",), start), "only the new name in full"
     pd.testing.assert_frame_equal(c[["AAA", "BBB", "CCC"]], truth,
                                   check_freq=False, check_names=False)
+
+
+def test_a_session_closes_the_next_morning_in_asia():
+    """The 09-24 bar is current on the morning of 09-25 in Hong Kong."""
+    from qbs.data import session_close
+    assert str(session_close("2026-09-24", "Asia/Hong_Kong")) == "2026-09-25 04:00:00+08:00"
+    # New York is on standard time in January, so the close is an hour later.
+    assert str(session_close("2026-01-15", "Asia/Hong_Kong")) == "2026-01-16 05:00:00+08:00"
+
+
+def test_fill_note_names_a_handful_of_filled_tickers():
+    from qbs.quotes import fill_note
+    rep = {"session": pd.Timestamp("2026-09-24"), "filled": 3, "already": 2612,
+           "absent": 0, "tickers": ["AAA", "BBB", "CCC"]}
+    assert "(AAA, BBB, CCC)" in fill_note(rep, "finviz")
+    rep.update(filled=40, tickers=[f"T{i}" for i in range(40)])
+    assert "T0" not in fill_note(rep, "finviz")

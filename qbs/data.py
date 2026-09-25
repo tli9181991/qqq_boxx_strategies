@@ -159,6 +159,21 @@ def load_daily_ohlc(
 MARKET_TZ = "America/New_York"
 MARKET_CLOSE = (16, 0)            # 16:00 ET, the regular-session close
 
+
+def session_close(session, tz: Optional[str] = None) -> pd.Timestamp:
+    """When the US session dated `session` closed, in `tz` (default ET).
+
+    A bar's date is the EXCHANGE's date, wherever the reader is. The 09-24
+    session closes at 16:00 New York time, which is already 09-25 04:00 in
+    Hong Kong -- so "the last bar is 09-24" read on the morning of 09-25 in
+    Asia is current, not a day behind. Saying when that close happened in
+    the reader's own zone is what stops the date looking wrong.
+    """
+    hh, mm = MARKET_CLOSE
+    close = (pd.Timestamp(session).normalize()
+             + pd.Timedelta(hours=hh, minutes=mm)).tz_localize(MARKET_TZ)
+    return close.tz_convert(tz) if tz else close
+
 # How long after the close before the day's bar counts as collectable.
 #
 # The bell is when the session ends, not when a provider has finished
