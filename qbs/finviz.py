@@ -58,6 +58,7 @@ from .data import (MARKET_CLOSE, MARKET_TZ, QUARANTINE_DAYS,
                    normalise_symbols, record_failures,
                    last_market_close, next_market_close,
                    sessions_behind)
+from .incremental import clear_marks, read_marks, refresh_incremental, write_marks
 
 CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -472,6 +473,7 @@ def load_universe_bars(
     batch_size: int = 100,
     verbose: bool = True,
     stale_after: Optional[int] = None,
+    incremental: bool = False,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
     """`(closes, volumes, error)` for a wide universe, cached as two CSVs.
 
@@ -491,6 +493,11 @@ def load_universe_bars(
     still carries `n_stocks` so the reading stays honest. Losing all of them
     returns the reason, so the UI can say what went wrong instead of only
     that something did.
+
+    `incremental=True` makes a stale cache an UPDATE instead of a 2,400-name
+    re-download: a recent window for the names it holds, full history only
+    for names it does not hold or whose history the provider re-based.
+    `refresh=True` is always a full download.
     """
     os.makedirs(cache_dir, exist_ok=True)
     c_path = os.path.join(cache_dir, f"{prefix}_closes.csv")
@@ -550,7 +557,8 @@ def load_universe_bars(
                 return c, v, _torn_note(torn, coverage)
             if verbose:
                 print(f"[finviz] price cache is {behind} session(s) behind "
-                      f"(limit {stale_after}) — re-downloading")
+                      f"(limit {stale_after}) — "
+                      + ("updating" if incremental else "re-downloading"))
 
     tickers = sorted({t for t in tickers if t})
     # Symbols the provider refused recently are not asked again until the
@@ -565,7 +573,6 @@ def load_universe_bars(
             print(f"[finviz] skipping {len(skipped)} quarantined ticker(s): "
                   f"{', '.join(skipped[:10])}"
                   + (" ..." if len(skipped) > 10 else ""))
-    closes, volumes, failed = [], [], []
     last_error = "unknown"
     try:
         import yfinance as yf
@@ -575,52 +582,84 @@ def load_universe_bars(
         c, v = _read()
         return c, v, f"yfinance is not installed ({exc})"
 
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
+    def _fetch(names: List[str], since: str):
+        """`(closes, volumes, failed)` for `names` from `since`, batched."""
+        nonlocal last_error
+        closes, volumes, failed = [], [], []
+        for i in range(0, len(names), batch_size):
+            batch = names[i:i + batch_size]
+            try:
+                raw = yf.download(batch, start=since, end=end, auto_adjust=True,
+                                  progress=False, actions=False, group_by="column",
+                                  threads=True)
+                if raw is None or raw.empty:
+                    raise RuntimeError("empty response")
+                if isinstance(raw.columns, pd.MultiIndex):
+                    c = raw["Close"]
+                    v = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else None
+                else:
+                    c = raw[["Close"]].rename(columns={"Close": batch[0]})
+                    v = raw[["Volume"]].rename(columns={"Volume": batch[0]}) if "Volume" in raw else None
+                closes.append(c)
+                if v is not None:
+                    volumes.append(v)
+            except Exception as exc:  # noqa: BLE001
+                failed.extend(batch)
+                last_error = f"{type(exc).__name__}: {exc}"
+                if verbose:
+                    print(f"[finviz] batch {i // batch_size + 1} failed ({exc})")
+            if verbose and (i // batch_size) % 5 == 0:
+                print(f"[finviz] {min(i + batch_size, len(names))}/{len(names)} tickers")
+        if not closes:
+            return None, None, failed
+
+        cdf = pd.concat(closes, axis=1).sort_index()
+        cdf = cdf.loc[:, ~cdf.columns.duplicated()]
+        cdf.index = pd.to_datetime(cdf.index).tz_localize(None).normalize()
+        cdf.index.name = "Date"
+        cdf = cdf.drop(columns=[c for c in cdf.columns if cdf[c].notna().sum() == 0],
+                       errors="ignore")
+        vdf = None
+        if volumes:
+            vdf = pd.concat(volumes, axis=1).sort_index()
+            vdf = vdf.loc[:, ~vdf.columns.duplicated()]
+            vdf.index = pd.to_datetime(vdf.index).tz_localize(None).normalize()
+            vdf.index.name = "Date"
+            vdf = vdf.reindex(columns=cdf.columns)
+        return cdf, vdf, failed
+
+    # A stale cache is UPDATED rather than replaced: a recent window for the
+    # names it holds, full history only for new or re-based names. See
+    # `qbs.incremental` for why a plain append would not be safe.
+    raw_c, raw_v = _read() if (incremental and not refresh and end is None) else (None, None)
+    if (raw_c is not None and not raw_c.empty
+            and raw_c.index.min() <= pd.Timestamp(start) + pd.Timedelta(days=10)):
         try:
-            raw = yf.download(batch, start=start, end=end, auto_adjust=True,
-                              progress=False, actions=False, group_by="column",
-                              threads=True)
-            if raw is None or raw.empty:
-                raise RuntimeError("empty response")
-            if isinstance(raw.columns, pd.MultiIndex):
-                c = raw["Close"]
-                v = raw["Volume"] if "Volume" in raw.columns.get_level_values(0) else None
-            else:
-                c = raw[["Close"]].rename(columns={"Close": batch[0]})
-                v = raw[["Volume"]].rename(columns={"Volume": batch[0]}) if "Volume" in raw else None
-            closes.append(c)
-            if v is not None:
-                volumes.append(v)
-        except Exception as exc:  # noqa: BLE001
-            failed.extend(batch)
-            last_error = f"{type(exc).__name__}: {exc}"
-            if verbose:
-                print(f"[finviz] batch {i // batch_size + 1} failed ({exc})")
-        if verbose and (i // batch_size) % 5 == 0:
-            print(f"[finviz] {min(i + batch_size, len(tickers))}/{len(tickers)} tickers")
-
-    if not closes:
+            cdf, vdf, marks, info = refresh_incremental(
+                raw_c, raw_v, read_marks(c_path), tickers, start, _fetch)
+        except RuntimeError as exc:
+            c, v = _whole(raw_c, raw_v)
+            return c, v, (f"could not update the price cache ({exc}; last "
+                          f"reason: {last_error}) — showing what is on disk")
         if verbose:
-            print("[finviz] no price data for any ticker")
-        c, v = _read()
-        return c, v, (f"no price data returned for any of {len(tickers)} tickers "
-                      f"(every batch failed; last reason: {last_error})")
-
-    cdf = pd.concat(closes, axis=1).sort_index()
-    cdf = cdf.loc[:, ~cdf.columns.duplicated()]
-    cdf.index = pd.to_datetime(cdf.index).tz_localize(None).normalize()
-    cdf.index.name = "Date"
-    cdf = cdf.drop(columns=[c for c in cdf.columns if cdf[c].notna().sum() == 0],
-                   errors="ignore")
-
-    vdf = None
-    if volumes:
-        vdf = pd.concat(volumes, axis=1).sort_index()
-        vdf = vdf.loc[:, ~vdf.columns.duplicated()]
-        vdf.index = pd.to_datetime(vdf.index).tz_localize(None).normalize()
-        vdf.index.name = "Date"
-        vdf = vdf.reindex(columns=cdf.columns)
+            print(f"[finviz] incremental since {info['since']}: "
+                  f"{info['recent']} updated, {info['full']} in full")
+        failed = info["failed"]
+        # Only the names asked for, as a full download would return: a name
+        # that has left the screen must not keep counting in breadth.
+        keep = [t for t in tickers if t in cdf.columns]
+        cdf = cdf[keep]
+        vdf = vdf.reindex(columns=keep) if vdf is not None else None
+        write_marks(c_path, {m for m in marks if m[1] in set(keep)})
+    else:
+        cdf, vdf, failed = _fetch(tickers, start)
+        if cdf is None:
+            if verbose:
+                print("[finviz] no price data for any ticker")
+            c, v = _read()
+            return c, v, (f"no price data returned for any of {len(tickers)} tickers "
+                          f"(every batch failed; last reason: {last_error})")
+        clear_marks(c_path)
 
     # The cache keeps what arrived; the caller gets what is whole. Writing
     # the trimmed frame would throw away the dozen names that DID report,

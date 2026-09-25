@@ -50,16 +50,19 @@ from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams, ResidualMomentumParams)
 from qbs.data import (drop_partial_bars, freshness_note, load_daily_ohlc,
                       load_prices, sessions_behind)
-from qbs.finviz import (UniverseFilters, due_for_fetch, fetch_epoch,
+from qbs.finviz import (BARS_DIR, UniverseFilters, due_for_fetch, fetch_epoch,
                         load_universe_bars, record_fetch_attempt, sector_map)
 from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
                         latest_quotes, needs_fill)
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
-from qbs.shadow import parse_watchlist, watchlist_rows
+from qbs.candles import HammerRules, hammer_frame, volume_stats
+from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
+                        watchlist_rows)
 from qbs.strategies import cross_sectional_momentum, residual_momentum
-from qbs.universe import load_universe, load_universe_prices
+from qbs.incremental import persist_fill
+from qbs.universe import UNIVERSE_DIR, load_universe, load_universe_prices
 
 st.set_page_config(page_title="Strategy picks / Market overview", layout="wide",
                    initial_sidebar_state="expanded")
@@ -123,7 +126,14 @@ PULSE_LABELS = {"up_strong": f"Up 4% ≥ {BreadthParams().pulse_strong}",
 # Data
 # --------------------------------------------------------------------------
 
-def _top_up_front_bar(closes, volumes, online: bool):
+# The on-disk caches a screener top-up is saved into: (closes, volumes).
+PICKS_CACHE = (os.path.join(UNIVERSE_DIR, "universe_prices.csv"),
+               os.path.join(UNIVERSE_DIR, "universe_volumes.csv"))
+MARKET_CACHE = (os.path.join(BARS_DIR, "us_closes.csv"),
+                os.path.join(BARS_DIR, "us_volumes.csv"))
+
+
+def _top_up_front_bar(closes, volumes, online: bool, persist=None):
     """The newest close from the screener, when yfinance has not published it.
 
     Returns `(closes, volumes, note)`. yfinance stays the authority for every
@@ -133,6 +143,11 @@ def _top_up_front_bar(closes, volumes, online: bool):
 
     Asked only when a bar is actually short, so a normal day costs no screener
     request at all.
+
+    `persist` is a `(closes_csv, volumes_csv)` pair: the filled cells are
+    written there, marked provisional, so the next load finds the session on
+    disk and needs no download at all. The next download that does run
+    replaces them with yfinance's values -- see `qbs.incremental`.
     """
     if not online or fill_disabled() or not needs_fill(closes):
         return closes, volumes, None
@@ -140,6 +155,12 @@ def _top_up_front_bar(closes, volumes, online: bool):
     if quotes is None:
         return closes, volumes, f"could not top up the newest bar — {err}"
     closes, volumes, report = fill_last_bar(closes, volumes, quotes)
+    if persist and report.get("tickers"):
+        names, session = report["tickers"], report["session"]
+        vol = (quotes["volume"].reindex(names)
+               if "volume" in quotes.columns else None)
+        persist_fill(persist[0], session, closes.loc[session, names],
+                     persist[1], vol)
     return closes, volumes, fill_note(report)
 
 
@@ -189,14 +210,26 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
             raise
         status["error"] = f"no usable cache ({exc})"
 
-    behind = (sessions_behind(px.index.max()) if px is not None else 99)
-    if online and (force or behind >= 1 or uni is None):
+    # Behind is asked of the UNIVERSE's last whole bar, which counts a
+    # screener top-up saved on an earlier load: once today's closes are on
+    # disk, a reload needs no network. The ETFs are never topped up, so a
+    # one-session lag there is carried forward below (and said so) rather
+    # than treated as a reason to download.
+    behind_u = (sessions_behind(drop_partial_bars(uni)[0].index.max())
+                if uni is not None and not uni.empty else 99)
+    behind_px = sessions_behind(px.index.max()) if px is not None else 99
+    if online and (force or uni is None or behind_u >= 1 or behind_px >= 2):
         try:
+            # "Refresh now" is a full download; anything else is an update
+            # that fetches a recent window and re-downloads only the names
+            # the provider re-based (`qbs.incremental`).
             tickers = load_universe(fetch=True, warn=False)
             uni = load_universe_prices(tickers, start=download_start,
-                                       refresh=True, verbose=False)
+                                       refresh=bool(force), incremental=True,
+                                       verbose=False)
             px = load_prices(["QQQ", "VEU", "BOXX"], start=download_start,
-                             refresh=True, offline=False)
+                             refresh=bool(force), incremental=True,
+                             offline=False)
             status["downloaded"] = True
             status["error"] = None
         except Exception as exc:  # noqa: BLE001
@@ -214,7 +247,8 @@ def load_data(download_start: str, online: bool, force: bool, bar_epoch: str,
     # The bar yfinance dropped is the one the screener already has. Done
     # after the torn one is gone, so the fill lands on a clean frame rather
     # than beside a dozen stragglers.
-    uni, _, status["filled"] = _top_up_front_bar(uni, None, online)
+    uni, _, status["filled"] = _top_up_front_bar(uni, None, online,
+                                                 persist=PICKS_CACHE)
     if uni.index.max() < px.index.max():
         px = px.loc[:uni.index.max()]
     elif uni.index.max() > px.index.max():
@@ -319,7 +353,10 @@ def load_watch_prices(tickers: tuple, download_start: str, online: bool,
             err = f"{type(exc).__name__}: {exc}"
         if online and (s is None or s.index.max() < last):
             try:
-                s = load_prices([t], start=download_start, refresh=True,
+                # An update when there is a cache to update, a full
+                # download when there is not.
+                s = load_prices([t], start=download_start,
+                                refresh=s is None, incremental=True,
                                 offline=False)[t]
                 err = None
             except Exception as exc:  # noqa: BLE001
@@ -333,17 +370,31 @@ def load_watch_prices(tickers: tuple, download_start: str, online: bool,
 
 
 @st.cache_data(show_spinner="Ranking the watchlist…")
-def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _watch: pd.DataFrame,
-               names: str, n_hold: int, exit_rank: int, asof: pd.Timestamp):
-    """`watchlist_rows` behind a cache.
+def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
+               _watch: pd.DataFrame, names: str, n_hold: int, exit_rank: int,
+               n_resid: int, asof: pd.Timestamp):
+    """`watchlist_rows` behind a cache, with the residual book's rank added.
 
     `names` is in the signature only to be hashed -- the frames are passed
     with a leading underscore, so without it the cache key would not change
     when the watchlist does and editing the box would show the old ranking.
+
+    `resid_rank` is the same name placed in the residual momentum book's
+    ranking (`_market` is its factor, QQQ, as in `build_selections`). A
+    separate ranking, not a re-sort of this one: the two books disagree on
+    exactly the names whose strength is mostly market beta.
     """
-    return watchlist_rows(_uni, _safe, _watch,
+    rows = watchlist_rows(_uni, _safe, _watch,
                           MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
                           asof=asof)
+    resid = watchlist_residual_ranks(
+        _uni, _safe, _market, _watch,
+        ResidualMomentumParams(n_hold=n_resid,
+                               exit_rank=n_resid + RESID_BAND),
+        asof=asof)
+    for r in rows:
+        r["resid_rank"] = resid.get(r["symbol"], float("nan"))
+    return rows
 
 
 @st.cache_data(show_spinner="Computing breadth…")
@@ -418,7 +469,7 @@ def load_us_market(download_start: str, online: bool, force: bool,
     tickers = uni["Ticker"].tolist()
     closes, volumes, bars_err = load_universe_bars(
         tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False, stale_after=1 if auto else None)
+        verbose=False, stale_after=1 if auto else None, incremental=True)
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
@@ -429,7 +480,8 @@ def load_us_market(download_start: str, online: bool, force: bool,
     # function's own staleness check, or a torn bar makes the cache look
     # current and the download that would replace it never runs. Its reason
     # arrives in `bars_err`.
-    closes, volumes, fill = _top_up_front_bar(closes, volumes, online)
+    closes, volumes, fill = _top_up_front_bar(closes, volumes, online,
+                                              persist=MARKET_CACHE)
     warn = "; ".join(x for x in (uni_err, bars_err, fill) if x) or None
     # The source is named in the note because two providers apply the same
     # rules to different listings databases and will not agree on the last
@@ -797,6 +849,10 @@ def rank_table(rows, n_hold: int, exit_rank: int,
         cols[label] = [by_symbol.get(t, "—") for t in wf["symbol"]]
     cols["Ticker"] = list(wf["symbol"])
     cols["Rank"] = [fmt(r, "{:.0f}") for r in wf["rank"]]
+    if "resid_rank" in wf:
+        # The residual book's ranking, placed the same way: a constituent's
+        # standing rank there, an outsider interpolated into it.
+        cols["Resid. rank"] = [fmt(r, "{:.0f}") for r in wf["resid_rank"]]
     cols["Placed"] = ["in index" if c else "interpolated"
                       for c in wf["constituent"]]
     cols["Score"] = [fmt(v, "{:+.3f}") for v in wf["score"]]
@@ -814,6 +870,80 @@ def rank_table(rows, n_hold: int, exit_rank: int,
         lambda _col: [f"background-color: {UP}" if b else "" for b in beats],
         subset=["Rank"])
     return styler, show, wf
+
+
+def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
+                 window: int, rules: HammerRules):
+    """One row per name: volume against its average, and the last 3 candles.
+
+    Returns `(frame, hammer_cells, missing)`. `hammer_cells` is a
+    `{column: [verdict per row]}` map the caller tints from, so the colour
+    follows the rule rather than a re-parse of the cell text; `missing` lists
+    the names with no OHLC at all.
+
+    Read from the per-name OHLC cache (`ohlc_for`), cut at `asof` so moving
+    the date slider shows what was knowable on that date. Volume falls back to
+    the universe volume cache for a name with no OHLC -- the hammer columns
+    cannot, since a candle cannot be drawn from closes.
+    """
+    from qbs.universe import load_universe_volumes
+
+    uvol = load_universe_volumes(list(names))
+    rows, missing = [], []
+    day_cols = ["Hammer D0", "Hammer D-1", "Hammer D-2"]
+    verdicts: Dict[str, list] = {c: [] for c in day_cols}
+    for t in names:
+        ohlc = ohlc_for(t, download_start, bool(online), BAR_EPOCH)
+        bars = None
+        if ohlc is not None and not ohlc.empty:
+            bars = ohlc.loc[:asof]
+            if not {"Open", "High", "Low", "Close"} <= set(bars.columns) or bars.empty:
+                bars = None
+        if bars is not None and "Volume" in bars.columns:
+            vs = volume_stats(bars["Volume"], bars["Close"], window)
+            bar_date = bars.index[-1]
+        elif uvol is not None and t in uvol.columns:
+            v = uvol[t].loc[:asof].dropna()
+            close = uni[t] if t in uni.columns else None
+            vs = volume_stats(v, close, window)
+            bar_date = v.index[-1] if len(v) else None
+        else:
+            vs, bar_date = volume_stats(pd.Series(dtype=float)), None
+
+        row = {"Ticker": t, "Held by": held_by.get(t, "—"),
+               "Bar": f"{bar_date:%m-%d}" if bar_date is not None else "—",
+               "Last vol": vs["last"], f"Avg vol ({window}d)": vs["avg"],
+               "Vol ratio": vs["ratio"],
+               f"Avg $ vol ({window}d)": vs["avg_value"]}
+        if bars is None:
+            missing.append(t)
+            for c in day_cols:
+                row[c] = "—"
+                verdicts[c].append(None)
+            row["Hammers (3d)"] = "—"
+        else:
+            hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
+            n_ham = 0
+            for i, c in enumerate(day_cols):
+                if i >= len(hf):
+                    row[c] = "—"
+                    verdicts[c].append(None)
+                    continue
+                b = hf.iloc[i]
+                share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
+                if b["hammer"]:
+                    row[c], v = f"🔨 {share}", "hammer"
+                    n_ham += 1
+                elif b["hanging_man"]:
+                    row[c], v = f"⚠️ {share}", "hanging"
+                elif b["shape"]:
+                    row[c], v = f"◐ {share}", "shape"
+                else:
+                    row[c], v = share, None
+                verdicts[c].append(v)
+            row["Hammers (3d)"] = n_ham
+        rows.append(row)
+    return pd.DataFrame(rows), verdicts, missing
 
 
 # Loaded once, above the tabs, because two of them need it: the picks tab
@@ -1281,6 +1411,69 @@ with tab_picks:
             + (", ".join(sorted(all3)) if all3 else "no overlap")
             + f" ({len(all3)})"))
 
+    # ---- volume and hammer candles for the names on the page -----------
+    st.divider()
+    st.markdown("#### Volume & hammer candles")
+    held_by: Dict[str, str] = {}
+    for key in books:
+        for t in sorted(picks[key]):
+            held_by[t] = (held_by[t] + ", " if t in held_by else "") + SHORT[key]
+    for t in WATCHLIST:
+        held_by.setdefault(t, "watchlist")
+    cand_names = list(held_by)
+    if not cand_names:
+        st.caption("No held or watched names on this date.")
+    else:
+        vwin = st.number_input(
+            "Average volume window (sessions)", 5, 120, 20, step=5,
+            key="candle_vol_window",
+            help="Sessions averaged for the baseline. The last session is "
+                 "excluded from its own baseline, so a spike is measured "
+                 "against days it did not help set.")
+        HR = HammerRules()
+        ctab, verdicts, no_ohlc = candle_table(
+            cand_names, held_by, asof, int(vwin), HR)
+        vol_cols = [c for c in ctab.columns if c.startswith(("Last vol", "Avg vol"))]
+        val_col = next(c for c in ctab.columns if c.startswith("Avg $ vol"))
+        HAMMER_TINT = {"hammer": f"background-color: {UP}",
+                       "hanging": f"background-color: {DN}",
+                       "shape": ""}
+        cstyle = (ctab.style
+                  .format({**{c: lambda v: fmt(v, "{:,.0f}") for c in vol_cols},
+                           "Vol ratio": lambda v: fmt(v, "{:.2f}×"),
+                           val_col: lambda v: fmt(
+                               v / 1e6 if v == v else v, "${:,.1f}M")})
+                  .background_gradient(subset=["Vol ratio"], cmap="Blues",
+                                       vmin=0.5, vmax=2.5))
+        for c, vs in verdicts.items():
+            cstyle = cstyle.apply(
+                lambda _col, vs=vs: [HAMMER_TINT.get(v, "") if v else ""
+                                     for v in vs], subset=[c])
+        st.dataframe(cstyle, hide_index=True, width="stretch",
+                     height=min(620, 38 + 35 * len(ctab)))
+        st.caption(md(
+            f"Last session's volume against the average of the **{int(vwin)} "
+            "sessions before it** (the last one excluded), and the ratio of the "
+            "two; *Avg $ vol* is close × shares over the same window. "
+            "*Bar* is the date of the last candle read, which can trail the "
+            "slider when a name's OHLC is behind the ranking cache. "
+            "**Hammer D0 / D-1 / D-2** are the last three candles, newest "
+            "first, each showing the lower shadow as a share of the day's "
+            "range. A candle is a hammer **shape** when: body ≤ "
+            f"{HR.max_body:.0%} of the range · lower shadow ≥ "
+            f"{HR.min_lower_to_body:g}× the body **and** ≥ {HR.min_lower:.0%} "
+            f"of the range · upper shadow ≤ {HR.max_upper:.0%} of the range · "
+            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR "
+            "(a tiny range says nothing). 🔨 is that shape **after a "
+            f"{HR.trend_days}-session decline** — the reversal pattern. ⚠️ is "
+            "the same shape after a rise, a *hanging man*, which reads the "
+            "other way. ◐ is the shape with a flat prior trend. "
+            "Descriptive only — nothing here changes a ranking or a holding."
+            + (f" No OHLC for {', '.join(no_ohlc)}"
+               + ("" if online else " — switch **Source** to Online to fetch it")
+               + "; volume there, if shown, is from the universe cache."
+               if no_ohlc else "")))
+
     # ---- watchlist: where a name places, without the book buying it -----
     st.divider()
     st.markdown("#### Watchlist rank")
@@ -1305,9 +1498,9 @@ with tab_picks:
                 f"**{t}** ({e})" for t, e in WATCH_ERR.items())
                 + ". " + remedy), icon="⚠️")
 
-        rows = (watch_rows(uni, px["BOXX"], WATCH_FRAME,
+        rows = (watch_rows(uni, px["BOXX"], px["QQQ"], WATCH_FRAME,
                            ",".join(WATCHLIST), int(n_hold), int(exit_rank),
-                           asof)
+                           int(n_resid), asof)
                 if not WATCH_FRAME.empty else [])
         if not rows:
             st.info("Nothing on the watchlist could be ranked on this date.")
@@ -1330,7 +1523,12 @@ with tab_picks:
                 f"Ranked on {asof:%Y-%m-%d} against the {uni.shape[1]} "
                 "constituents alone, so two watched names never shift each "
                 "other's row, and nothing here changes a holding. A "
-                "constituent shows the rank it already has."
+                "constituent shows the rank it already has. *Rank* is the "
+                "momentum book's ranking; *Resid. rank* places the same name, "
+                "the same way, in the **residual momentum** book's ranking "
+                "(12-1 momentum net of its beta to QQQ) — a name far better "
+                "on *Rank* than on *Resid. rank* owes its strength mostly to "
+                "the market."
                 + outsider_note
                 + " A blank rank means the name was filtered out (too little "
                 "history, or it lost to BOXX over the same window), not that "
@@ -1673,9 +1871,9 @@ with tab_market:
             lead_names = [t for t in lead_rows["symbol"] if t in m_uni.columns]
             lead_frame = pd.DataFrame({
                 t: m_uni[t].reindex(uni.index).ffill() for t in lead_names})
-            rows_l = (watch_rows(uni, px["BOXX"], lead_frame,
+            rows_l = (watch_rows(uni, px["BOXX"], px["QQQ"], lead_frame,
                                  ",".join(lead_names), int(n_hold),
-                                 int(exit_rank), rank_asof)
+                                 int(exit_rank), int(n_resid), rank_asof)
                       if lead_names and rank_asof is not None else [])
             if not rows_l:
                 st.info("These names could not be placed in the book's "

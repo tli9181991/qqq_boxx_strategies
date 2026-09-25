@@ -4236,3 +4236,210 @@ def test_the_picks_tab_and_the_selection_builder_agree_on_the_books():
     assert set(built) == set(labelled) == set(columns), (
         f"built {built}, labelled {labelled}, rendered {columns}")
     assert "resmom" in built, "the residual book is not wired in"
+
+
+# --------------------------------------------------------------------------
+# Candles: hammer rules and volume stats
+# --------------------------------------------------------------------------
+
+def _candle_bars(rows):
+    idx = pd.bdate_range("2026-01-01", periods=len(rows))
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=idx)
+
+
+def _with_history(last, drift):
+    """20 ordinary 2-point-range sessions trending by `drift`, then `last`."""
+    rows, c = [], 100.0
+    for _ in range(20):
+        o, c = c, c + drift
+        rows.append([o, max(o, c) + 0.5, min(o, c) - 0.5, c])
+    return _candle_bars(rows + [last(c)])
+
+
+def test_hammer_after_a_decline_is_a_hammer():
+    from qbs.candles import hammer_frame
+    # Range 4, body 0.4 at the top, lower shadow 3.4, upper 0.2.
+    f = hammer_frame(_with_history(lambda c: [c - 0.2, c + 0.2, c - 3.8, c], -0.5))
+    last = f.iloc[-1]
+    assert last["shape"] and last["hammer"] and not last["hanging_man"]
+
+
+def test_same_shape_after_a_rise_is_a_hanging_man():
+    from qbs.candles import hammer_frame
+    f = hammer_frame(_with_history(lambda c: [c - 0.2, c + 0.2, c - 3.8, c], 0.5))
+    last = f.iloc[-1]
+    assert last["shape"] and last["hanging_man"] and not last["hammer"]
+
+
+def test_long_upper_shadow_or_tiny_range_is_not_a_hammer():
+    from qbs.candles import hammer_frame
+    # Upper shadow as long as the lower one: a spinning top.
+    top = hammer_frame(_with_history(lambda c: [c, c + 2.0, c - 2.0, c + 0.1], -0.5))
+    assert not top.iloc[-1]["shape"]
+    # Perfect geometry on a range a tenth of the usual: says nothing.
+    tiny = hammer_frame(_with_history(lambda c: [c - 0.01, c + 0.01, c - 0.19, c], -0.5))
+    assert tiny.iloc[-1]["lower"] > 0.8 and not tiny.iloc[-1]["shape"]
+
+
+def test_volume_baseline_excludes_the_last_session():
+    from qbs.candles import volume_stats
+    idx = pd.bdate_range("2026-01-01", periods=21)
+    v = pd.Series([100.0] * 20 + [300.0], index=idx)
+    s = volume_stats(v, pd.Series(10.0, index=idx), window=20)
+    assert s["last"] == 300 and s["avg"] == 100 and s["ratio"] == 3.0
+    assert s["avg_value"] == 1000.0 and s["n"] == 20
+
+
+# --------------------------------------------------------------------------
+# Incremental cache updates
+# --------------------------------------------------------------------------
+
+def _truth(names=("AAA", "BBB"), n=30, end="2026-09-18"):
+    idx = pd.bdate_range(end=end, periods=n)
+    return pd.DataFrame({t: 100.0 + i + np.arange(n) for i, t in enumerate(names)},
+                        index=idx).rename_axis("Date")
+
+
+def _fake_download(truth, calls):
+    """A downloader that serves `truth` from `start`, and logs each call."""
+    def download(names, start):
+        calls.append((tuple(names), start))
+        c = truth.loc[pd.Timestamp(start):, [t for t in names if t in truth.columns]]
+        return c, c * 1000, [t for t in names if t not in truth.columns]
+    return download
+
+
+def test_an_agreeing_overlap_appends_the_new_rows():
+    from qbs.incremental import merge_recent
+    truth = _truth()
+    cached = truth.iloc[:-2]
+    merged, rebased, _ = merge_recent(cached, truth.iloc[-8:])
+    assert rebased == []
+    pd.testing.assert_frame_equal(merged, truth, check_freq=False)
+
+
+def test_a_rebased_history_is_not_appended_to():
+    """A dividend re-bases every earlier close; appending would fake a return."""
+    from qbs.incremental import merge_recent
+    truth = _truth()
+    cached = truth.iloc[:-2]
+    recent = truth.iloc[-8:].copy()
+    recent.loc[:, "BBB"] *= 0.995          # yfinance re-adjusted BBB's history
+    merged, rebased, _ = merge_recent(cached, recent)
+    assert rebased == ["BBB"]
+    assert merged["BBB"].dropna().index.max() == cached.index.max(), \
+        "a re-based name must be left for a full download, not appended to"
+    assert merged["AAA"].index.max() == truth.index.max()
+
+
+def test_a_provisional_cell_is_not_evidence_and_is_replaced():
+    from qbs.incremental import merge_recent
+    truth = _truth()
+    cached = truth.copy()
+    last = truth.index[-1]
+    cached.loc[last, "AAA"] = 999.0        # a raw screener print
+    marks = {(last, "AAA")}
+    merged, rebased, left = merge_recent(cached, truth.iloc[-6:], marks)
+    assert rebased == [], "a raw print disagreeing is not a re-basing"
+    assert merged.at[last, "AAA"] == truth.at[last, "AAA"]
+    assert left == set(), "the mark goes once yfinance has the value"
+
+
+def test_refresh_incremental_downloads_full_history_only_where_needed():
+    from qbs.incremental import refresh_incremental, window_start
+    truth = _truth(("AAA", "BBB", "NEW"))
+    cached = truth[["AAA", "BBB"]].iloc[:-3].copy()
+    cached["BBB"] *= 1.01                  # BBB was re-based since the cache
+    calls = []
+    closes, vols, marks, info = refresh_incremental(
+        cached, None, set(), ["AAA", "BBB", "NEW"], "2000-01-01",
+        _fake_download(truth, calls))
+    since = f"{window_start(cached, ()):%Y-%m-%d}"
+    assert calls[0] == (("AAA", "BBB"), since), "one recent window first"
+    assert set(calls[1][0]) == {"BBB", "NEW"} and calls[1][1] == "2000-01-01"
+    pd.testing.assert_frame_equal(closes[["AAA", "BBB", "NEW"]], truth,
+                                  check_freq=False)
+    assert info["rebased"] == ["BBB"] and info["recent"] == 1 and info["full"] == 2
+
+
+def test_the_window_starts_before_the_oldest_provisional_cell():
+    from qbs.incremental import window_start
+    truth = _truth()
+    old = truth.index[-4]
+    assert window_start(truth, {(old, "AAA")}, overlap=5) < old
+    assert window_start(truth, (), overlap=5) < truth.index[-1]
+
+
+def test_persist_fill_never_overwrites_yfinance(tmp_path):
+    from qbs.incremental import persist_fill, read_marks
+    truth = _truth()
+    path, vpath = str(tmp_path / "c.csv"), str(tmp_path / "v.csv")
+    disk = truth.iloc[:-1].copy()
+    session = truth.index[-1]
+    disk.loc[session] = [55.0, np.nan]     # yfinance already has AAA
+    disk.to_csv(path)
+    (disk * 0).to_csv(vpath)
+    n = persist_fill(path, session, pd.Series({"AAA": 1.0, "BBB": 2.0}),
+                     vpath, pd.Series({"AAA": 10.0, "BBB": 20.0}))
+    back = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+    assert n == 1 and back.at[session, "AAA"] == 55.0 and back.at[session, "BBB"] == 2.0
+    assert read_marks(path) == {(session, "BBB")}
+    vback = pd.read_csv(vpath, parse_dates=["Date"], index_col="Date")
+    assert vback.at[session, "BBB"] == 20.0
+
+
+def test_universe_prices_update_incrementally_and_full_refresh_clears_marks(
+        tmp_path, monkeypatch):
+    import qbs.universe as U
+    from qbs.incremental import read_marks, write_marks
+    truth = _truth(("AAA", "BBB"), n=40)
+    calls = []
+    fake = _fake_download(truth, calls)
+    monkeypatch.setattr(U, "_download_universe",
+                        lambda ts, start, end, bs=40: fake(ts, start))
+    start = f"{truth.index[0]:%Y-%m-%d}"
+    d = str(tmp_path)
+    U.load_universe_prices(["AAA", "BBB"], start, cache_dir=d, refresh=True,
+                           verbose=False)
+    assert calls[-1][1] == start
+    # Pretend the cache is two sessions old with a provisional front cell.
+    cache = os.path.join(d, "universe_prices.csv")
+    stale = truth.iloc[:-2].copy()
+    stale.loc[truth.index[-3], "AAA"] = 1.0
+    stale.to_csv(cache)
+    write_marks(cache, {(truth.index[-3], "AAA")})
+    calls.clear()
+    got = U.load_universe_prices(["AAA", "BBB"], start, cache_dir=d,
+                                 incremental=True, verbose=False)
+    assert len(calls) == 1 and calls[0][1] > start, "a window, not the history"
+    pd.testing.assert_frame_equal(got, truth, check_freq=False)
+    assert read_marks(cache) == set()
+    write_marks(cache, {(truth.index[-1], "AAA")})
+    U.load_universe_prices(["AAA", "BBB"], start, cache_dir=d, refresh=True,
+                           verbose=False)
+    assert read_marks(cache) == set(), "a full download is yfinance end to end"
+
+
+def test_market_bars_update_incrementally(tmp_path, monkeypatch):
+    import yfinance
+    from qbs.finviz import load_universe_bars
+    truth = _truth(("AAA", "BBB", "CCC"), n=40)
+    calls = []
+
+    def download(batch, start=None, **_):
+        calls.append((tuple(batch), start))
+        c = truth.loc[pd.Timestamp(start):, list(batch)]
+        return pd.concat({"Close": c, "Volume": c * 1000}, axis=1)
+
+    monkeypatch.setattr(yfinance, "download", download)
+    start = f"{truth.index[0]:%Y-%m-%d}"
+    d = str(tmp_path)
+    truth[["AAA", "BBB"]].iloc[:-2].to_csv(os.path.join(d, "us_closes.csv"))
+    (truth[["AAA", "BBB"]].iloc[:-2] * 1000).to_csv(os.path.join(d, "us_volumes.csv"))
+    c, v, err = load_universe_bars(["AAA", "BBB", "CCC"], start=start,
+                                   cache_dir=d, verbose=False, stale_after=1,
+                                   incremental=True)
+    assert calls[0][0] == ("AAA", "BBB") and calls[0][1] > start
+    assert calls[1] == (("CCC",), start), "only the new name in full"
+    pd.testing.assert_frame_equal(c[["AAA", "BBB", "CCC"]], truth,
+                                  check_freq=False, check_names=False)

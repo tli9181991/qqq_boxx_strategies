@@ -2348,3 +2348,40 @@ def test_the_watchlist_string_parses_the_same_everywhere():
             os.environ.pop("QBS_WATCHLIST", None)
         else:
             os.environ["QBS_WATCHLIST"] = old
+
+
+def test_watchlist_residual_rank_matches_the_residual_book():
+    """A constituent's residual rank is the one `residual_momentum` acts on,
+    and an outsider is placed there without moving anyone else."""
+    from qbs.config import MomentumParams, ResidualMomentumParams
+    from qbs.shadow import watchlist_residual_ranks
+    from qbs.strategies import cross_sectional_momentum, residual_momentum_score
+
+    cfg, frame, names = _watch_fixture()
+    uni, safe = frame[names], frame[cfg.momentum.safe_asset]
+    market = frame[cfg.dd_stop_benchmark]
+    rp = ResidualMomentumParams(min_history=200, beta_window=120)
+
+    mp = MomentumParams(lookback_months=rp.lookback_months,
+                        skip_months=rp.skip_months, n_hold=rp.n_hold,
+                        exit_rank=rp.exit_rank, safe_asset=rp.safe_asset,
+                        min_history=rp.min_history)
+    live = cross_sectional_momentum(
+        uni, safe, mp, score=residual_momentum_score(uni, market, rp),
+        record_ranks=99)
+    dt = live.weights.index[-1]
+    standing = {t: r for t, r, _ in live.rank_log[dt]}
+    assert standing, "the fixture must rank something"
+    inside = max(standing, key=standing.get)
+
+    # Noisy, or it has no residual at all and is (rightly) unrankable.
+    noise = np.random.default_rng(7).normal(0.004, 0.02, len(frame))
+    outside = pd.DataFrame(
+        {"TSMX": 100 * np.exp(np.cumsum(noise))}, index=frame.index)
+    ranks = watchlist_residual_ranks(uni, safe, market,
+                                     uni[[inside]].join(outside), rp)
+    assert set(ranks) == {inside, "TSMX"}
+    assert ranks[inside] == standing[inside]
+    assert ranks["TSMX"] == ranks["TSMX"], "the outsider should be ranked"
+    alone = watchlist_residual_ranks(uni, safe, market, outside, rp)
+    assert alone["TSMX"] == ranks["TSMX"]

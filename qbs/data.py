@@ -74,6 +74,27 @@ def _download_one(ticker: str, start: str, end: Optional[str]) -> pd.Series:
     return s
 
 
+def _update_one(ticker: str, cached: pd.Series, start: str) -> pd.Series:
+    """`cached` brought up to date from a recent window, or re-downloaded.
+
+    A failed recent download returns the cache unchanged: stale is better
+    than nothing, and the caller's freshness check will say so.
+    """
+    from .incremental import merge_recent, window_start
+
+    since = f"{window_start(cached.to_frame(), ()):%Y-%m-%d}"
+    try:
+        recent = _download_one(ticker, since, None)
+    except Exception:  # noqa: BLE001
+        return cached
+    merged, rebased, _ = merge_recent(cached.to_frame(), recent.to_frame())
+    if rebased:
+        return _download_one(ticker, start, None)
+    out = merged[ticker].dropna()
+    out.name = ticker
+    return out
+
+
 OHLC_CACHE = os.path.join(CACHE_DIR, "ohlc")
 
 
@@ -428,6 +449,7 @@ def load_prices(
     use_cache: bool = True,
     refresh: bool = False,
     offline: bool = False,
+    incremental: bool = False,
 ) -> pd.DataFrame:
     """Return adjusted closes for `tickers` as a wide, gap-free DataFrame.
 
@@ -437,6 +459,10 @@ def load_prices(
         the next call. Keeps repeat notebook runs instant and offline-safe.
     refresh : ignore the cache and re-download.
     offline : never hit the network; raise if the cache is missing.
+    incremental : update a cached ticker from a short recent window instead of
+        returning it as is, re-downloading its full history only when the
+        provider re-based it -- see `qbs.incremental`. Ignored with `refresh`
+        (always a full download) and `offline`.
     """
     tickers = list(tickers)
     series: List[pd.Series] = []
@@ -446,6 +472,11 @@ def load_prices(
         s = None
         if use_cache and not refresh:
             s = _read_cache(t)
+        if (s is not None and incremental and not offline and end is None
+                and s.index.min() <= pd.Timestamp(start) + pd.Timedelta(days=10)):
+            s = _update_one(t, s, start)
+            if use_cache:
+                _write_cache(t, s)
         if s is None:
             if offline:
                 missing.append(t)
