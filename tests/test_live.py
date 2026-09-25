@@ -2374,11 +2374,14 @@ def test_watchlist_residual_rank_matches_the_residual_book():
     assert standing, "the fixture must rank something"
     inside = max(standing, key=standing.get)
 
+    # Noisy, or it has no residual at all and is (rightly) unrankable.
+    noise = np.random.default_rng(7).normal(0.004, 0.02, len(frame))
     outside = pd.DataFrame(
-        {"TSMX": 100 * 1.004 ** np.arange(len(frame))}, index=frame.index)
+        {"TSMX": 100 * np.exp(np.cumsum(noise))}, index=frame.index)
     ranks = watchlist_residual_ranks(uni, safe, market,
                                      uni[[inside]].join(outside), rp)
     assert set(ranks) == {inside, "TSMX"}
     assert ranks[inside] == standing[inside]
+    assert ranks["TSMX"] == ranks["TSMX"], "the outsider should be ranked"
     alone = watchlist_residual_ranks(uni, safe, market, outside, rp)
     assert alone["TSMX"] == ranks["TSMX"]
