@@ -2288,9 +2288,18 @@ with tab_analyst:
     freshness_banner()
     st.subheader("Ask the analyst")
 
-    # The picks tab's date slider drives this tab too -- two sliders for one
-    # date is a way to have the chart and the chat disagree about "today".
-    asof_analyst = asof
+    # Always the latest bar, NOT the picks tab's history slider. Half the
+    # agent's tools cannot go back in time -- the Market overview, the news
+    # and the fundamentals are today's -- so a chart and a price read cut at
+    # a past date would be analysed against today's market and headlines,
+    # two different days presented as one. The slider stays the picks tab's.
+    asof_analyst = LAST_BAR
+    if pd.Timestamp(asof) < LAST_BAR:
+        st.caption(md(
+            f"🗓️ The Daily picks slider is on **{pd.Timestamp(asof):%Y-%m-%d}**; "
+            f"this tab always reads the latest bar, **{LAST_BAR:%Y-%m-%d}**, "
+            "because the market backdrop, news and fundamentals the analyst "
+            "uses exist only for today."))
     screen_names = names_on("finviz", asof_analyst)
     momentum_names = names_on("momentum", asof_analyst)
 
@@ -2443,8 +2452,9 @@ with tab_analyst:
             # re-reading the cache: a three-tool answer would otherwise spend a
             # minute rebuilding a universe that is sitting in memory.
             #
-            # Cut at the picks tab's date, the date the chart on the left is
-            # drawn to, so the numbers the agent reads are the ones on screen.
+            # Cut at the date the chart on the left is drawn to (the latest
+            # bar -- see `asof_analyst`), so the numbers the agent reads are
+            # the ones on screen even if the frames ever run past it.
             # The watchlist's outsiders ride along as `extra`, so a watched
             # name outside the index can be profiled as the panel profiles it.
             book = Book(universe=uni.loc[:asof_analyst],
@@ -2463,8 +2473,14 @@ with tab_analyst:
                 checklist=list(auto.values()))
             # The selected ticker rides along as context, so "is it extended?"
             # means the name on screen rather than whatever was mentioned last.
+            # The Market tab's universe comes from a different provider and
+            # can end a session apart from the book's; say so rather than let
+            # the two dates read as one.
+            m_last = pd.Timestamp(m_uni.index.max())
+            m_note = ("" if m_last == pd.Timestamp(asof_analyst) else
+                      f"; the Market overview's last bar is {m_last:%Y-%m-%d}")
             asked = (f"[the chart on screen is showing {chart_ticker}, as of "
-                     f"{pd.Timestamp(asof_analyst):%Y-%m-%d}] {prompt}"
+                     f"{pd.Timestamp(asof_analyst):%Y-%m-%d}{m_note}] {prompt}"
                      if chart_ticker else prompt)
             history = [{"role": t["role"], "content": t["content"]}
                        for t in st.session_state["chat"]]
