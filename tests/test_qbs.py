@@ -4574,3 +4574,30 @@ def test_short_history_answers_none_rather_than_no():
     px = _checklist_px(n_days=30)
     a = _answers(px, px.mean(axis=1))
     assert a["oversold"] is None and a["final_high"] is None
+
+
+
+def test_market_bars_report_progress_per_batch(tmp_path, monkeypatch):
+    import yfinance
+    from qbs.finviz import load_universe_bars
+    truth = _truth(tuple(f"T{i}" for i in range(5)), n=40)
+
+    def download(batch, start=None, **_):
+        c = truth.loc[pd.Timestamp(start):, list(batch)]
+        return pd.concat({"Close": c, "Volume": c * 1000}, axis=1)
+
+    monkeypatch.setattr(yfinance, "download", download)
+    seen = []
+    load_universe_bars(list(truth.columns), start=f"{truth.index[0]:%Y-%m-%d}",
+                       cache_dir=str(tmp_path), refresh=True, verbose=False,
+                       batch_size=2, progress=lambda d, t, w: seen.append((d, t, w)))
+    assert seen == [(2, 5, "full history"), (4, 5, "full history"),
+                    (5, 5, "full history")]
+
+    # A callback that raises must not cost the download.
+    def boom(*_):
+        raise RuntimeError("ui gone")
+    c, _, _ = load_universe_bars(list(truth.columns), start=f"{truth.index[0]:%Y-%m-%d}",
+                                 cache_dir=str(tmp_path), refresh=True,
+                                 verbose=False, batch_size=2, progress=boom)
+    assert c is not None and c.shape[1] == 5

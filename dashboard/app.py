@@ -511,9 +511,29 @@ def load_us_market(download_start: str, online: bool, force: bool,
             uni_err or "unknown failure"), False, None
 
     tickers = uni["Ticker"].tolist()
-    closes, volumes, bars_err = load_universe_bars(
-        tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False, stale_after=1 if auto else None, incremental=True)
+
+    # Created on the first batch, not up front: a cache hit downloads nothing
+    # and should not flash an empty bar. Made INSIDE this cached function on
+    # purpose -- an element on a container created outside it cannot be
+    # replayed on a cache hit, and Streamlit raises there rather than skip it.
+    bar = None
+
+    def _progress(done: int, total: int, what: str) -> None:
+        nonlocal bar
+        text = (f"Loading US universe {what} — {done:,} of {total:,} stocks "
+                f"({done / total:.0%})")
+        if bar is None:
+            bar = st.progress(0.0, text=text)
+        bar.progress(min(1.0, done / total), text=text)
+
+    try:
+        closes, volumes, bars_err = load_universe_bars(
+            tickers, start=download_start, refresh=force, offline=not online,
+            verbose=False, stale_after=1 if auto else None, incremental=True,
+            progress=_progress)
+    finally:
+        if bar is not None:
+            bar.empty()
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
