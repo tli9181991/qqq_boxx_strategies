@@ -433,6 +433,7 @@ def daily_breadth(
     p: Optional[BreadthParams] = None,
     universe_note: str = "",
     qqq_ohlc: Optional[pd.DataFrame] = None,
+    spy_ohlc: Optional[pd.DataFrame] = None,
 ) -> BreadthResult:
     """One row per session: the whole breadth monitor.
 
@@ -457,7 +458,8 @@ def daily_breadth(
     whose return would span two sessions, shows its move counts as missing
     rather than as a day's.
 
-    `qqq_ohlc` (Open/High/Low/Close) gives the QQQ ATR a real true range.
+    `qqq_ohlc` / `spy_ohlc` (Open/High/Low/Close) give that index's ATR a
+    real true range, and stand in for `qqq` / `spy` when those are None.
     Without it the range is close-to-close, which understates it and so
     overstates the distance -- see `atr_distance`.
     """
@@ -488,15 +490,16 @@ def daily_breadth(
     out["pct_above_slow"] = _pct_above(px, slow, priced)
 
     has_index = False
-    for name, series in (("spy_atr", spy), ("qqq_atr", qqq)):
-        if series is not None:
-            hi = lo = None
-            if name == "qqq_atr" and qqq_ohlc is not None and {
-                    "High", "Low", "Close"} <= set(qqq_ohlc.columns):
+    for name, series, ohlc in (("spy_atr", spy, spy_ohlc),
+                               ("qqq_atr", qqq, qqq_ohlc)):
+        if ohlc is not None and not {"High", "Low", "Close"} <= set(ohlc.columns):
+            ohlc = None
+        if series is not None or ohlc is not None:
+            if ohlc is not None:
                 # On the OHLC frame's own calendar, then aligned: the EMA and
                 # the ATR are properties of the index's sessions, not of
                 # whichever days the stock universe happens to have.
-                bars = qqq_ohlc.sort_index()
+                bars = ohlc.sort_index()
                 d = atr_distance(bars["Close"], bars["High"], bars["Low"],
                                  ema_span=p.ema_span, atr_window=p.atr_window)
                 out[name] = d.reindex(px.index)

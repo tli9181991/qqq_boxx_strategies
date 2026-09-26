@@ -4601,3 +4601,16 @@ def test_market_bars_report_progress_per_batch(tmp_path, monkeypatch):
                                  cache_dir=str(tmp_path), refresh=True,
                                  verbose=False, batch_size=2, progress=boom)
     assert c is not None and c.shape[1] == 5
+
+
+def test_spy_atr_is_filled_from_its_own_bars():
+    """SPY needs no close series of its own: its OHLC stands in for one."""
+    from qbs.breadth import daily_breadth
+    px = _wide_days(n_names=40)
+    s = px.mean(axis=1) * 1.1
+    ohlc = pd.DataFrame({"Open": s, "High": s * 1.02, "Low": s * 0.98, "Close": s})
+    t = daily_breadth(px, spy_ohlc=ohlc).table
+    assert t["spy_atr"].notna().all()
+    assert t["qqq_atr"].isna().all(), "and QQQ stays empty when not given"
+    with_close = daily_breadth(px, spy=s, spy_ohlc=ohlc).table["spy_atr"]
+    pd.testing.assert_series_equal(with_close, t["spy_atr"])
