@@ -403,9 +403,26 @@ def watch_rows(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
 @st.cache_data(show_spinner="Computing breadth…")
 def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
                   _volumes: Optional[pd.DataFrame] = None,
-                  bar_epoch: str = "", _qqq_ohlc: Optional[pd.DataFrame] = None):
+                  bar_epoch: str = "", _qqq_ohlc: Optional[pd.DataFrame] = None,
+                  _spy: Optional[pd.Series] = None,
+                  _spy_ohlc: Optional[pd.DataFrame] = None):
     return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note,
-                         qqq_ohlc=_qqq_ohlc)
+                         qqq_ohlc=_qqq_ohlc, spy=_spy, spy_ohlc=_spy_ohlc)
+
+
+@st.cache_data(show_spinner=False)
+def spy_close_for(download_start: str, online: bool, bar_epoch: str):
+    """SPY closes, for when its OHLC could not be had. `(series, error)`.
+
+    Through the per-ticker close cache (`data/SPY.csv`): read when present,
+    updated online, downloaded the first time. Offline with no cache there
+    is nothing to read, and the error says so.
+    """
+    try:
+        return load_prices(["SPY"], start=download_start, offline=not online,
+                           incremental=online)["SPY"], None
+    except Exception as exc:  # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 @st.cache_data(show_spinner="Checking the checklist…")
@@ -511,9 +528,29 @@ def load_us_market(download_start: str, online: bool, force: bool,
             uni_err or "unknown failure"), False, None
 
     tickers = uni["Ticker"].tolist()
-    closes, volumes, bars_err = load_universe_bars(
-        tickers, start=download_start, refresh=force, offline=not online,
-        verbose=False, stale_after=1 if auto else None, incremental=True)
+
+    # Created on the first batch, not up front: a cache hit downloads nothing
+    # and should not flash an empty bar. Made INSIDE this cached function on
+    # purpose -- an element on a container created outside it cannot be
+    # replayed on a cache hit, and Streamlit raises there rather than skip it.
+    bar = None
+
+    def _progress(done: int, total: int, what: str) -> None:
+        nonlocal bar
+        text = (f"Loading US universe {what} — {done:,} of {total:,} stocks "
+                f"({done / total:.0%})")
+        if bar is None:
+            bar = st.progress(0.0, text=text)
+        bar.progress(min(1.0, done / total), text=text)
+
+    try:
+        closes, volumes, bars_err = load_universe_bars(
+            tickers, start=download_start, refresh=force, offline=not online,
+            verbose=False, stale_after=1 if auto else None, incremental=True,
+            progress=_progress)
+    finally:
+        if bar is not None:
+            bar.empty()
     if closes is None or closes.empty:
         return None, None, {}, filters.label, (
             f"Finviz listed {len(tickers)} tickers but no prices loaded — "
@@ -870,8 +907,14 @@ selections, SCREEN_VOLUME_APPLIED = build_selections(
 # close-to-close, which understates it and roughly doubles the reading next to
 # a source that uses real bars. None falls back to closes.
 QQQ_OHLC = ohlc_for("QQQ", download_start, bool(online), BAR_EPOCH)
+# SPY is not one of the core ETFs the books trade, so nothing else loads it.
+# Its bars are fetched here, the same way as QQQ's -- real High/Low for the
+# ATR -- and cached under data/ohlc/. Closes are the fallback.
+SPY_OHLC = ohlc_for("SPY", download_start, bool(online), BAR_EPOCH)
+SPY_CLOSE, SPY_ERR = ((SPY_OHLC["Close"], None) if SPY_OHLC is not None
+                      else spy_close_for(download_start, bool(online), BAR_EPOCH))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH,
-                        _qqq_ohlc=QQQ_OHLC)
+                        _qqq_ohlc=QQQ_OHLC, _spy=SPY_CLOSE, _spy_ohlc=SPY_OHLC)
 
 def names_on(key: str, when) -> list:
     """The tickers a strategy held on a date, from the prebuilt selections.
@@ -987,10 +1030,8 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
             for c in day_cols:
                 row[c] = "—"
                 verdicts[c].append(None)
-            row["Hammers (3d)"] = "—"
         else:
             hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
-            n_ham = 0
             for i, c in enumerate(day_cols):
                 if i >= len(hf):
                     row[c] = "—"
@@ -1000,7 +1041,6 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
                 if b["hammer"]:
                     row[c], v = f"🔨 {share}", "hammer"
-                    n_ham += 1
                 elif b["hanging_man"]:
                     row[c], v = f"⚠️ {share}", "hanging"
                 elif b["shape"]:
@@ -1008,7 +1048,6 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 else:
                     row[c], v = share, None
                 verdicts[c].append(v)
-            row["Hammers (3d)"] = n_ham
         rows.append(row)
     return pd.DataFrame(rows), verdicts, missing
 
@@ -1647,7 +1686,8 @@ with tab_market:
         m_vols = mkt_vols
         universe_label = f"{m_uni.shape[1]} US names · {mkt_note}"
         breadth_m = build_breadth(m_uni, px["QQQ"], universe_label, m_vols,
-                                  bar_epoch=BAR_EPOCH, _qqq_ohlc=QQQ_OHLC)
+                                  bar_epoch=BAR_EPOCH, _qqq_ohlc=QQQ_OHLC,
+                                  _spy=SPY_CLOSE, _spy_ohlc=SPY_OHLC)
         # Say which of the two happened. "Fetched just now" and "served from a
         # cache built at some point" look identical on screen otherwise, and
         # the difference is the whole reason for the auto-refresh.
@@ -1719,8 +1759,16 @@ with tab_market:
     k[2].metric("% above 50-day", fmt(last["pct_above_slow"]), fmt(d_slow, "{:+.1f}"))
     k[2].caption("vs prior session")
 
-    k[3].metric("SPY vs 50D EMA", "—")
-    k[3].caption("SPY is not cached in this package")
+    k[3].metric("SPY vs 50D EMA", fmt(last["spy_atr"], "{:+.2f}"))
+    if SPY_CLOSE is None:
+        k[3].caption(
+            "no SPY data — " + ("the download failed" if online else
+                                "offline and not cached; switch Source to "
+                                "Online to fetch it once"))
+    else:
+        k[3].caption("in units of 14-day ATR"
+                     + ("" if SPY_OHLC is not None else
+                        " · close-only range, reads high"))
 
     k[4].metric("QQQ vs 50D EMA", fmt(last["qqq_atr"], "{:+.2f}"))
     k[4].caption("in units of 14-day ATR"
@@ -1761,8 +1809,8 @@ with tab_market:
 
     # ---- the daily monitor table -----------------------------------------
     st.markdown("#### Daily monitor")
-    st.caption("The ATR column is (close − 50-day EMA) ÷ 14-day ATR — how many ATRs "
-               "the index sits from its own 50-day line.")
+    st.caption("The SPY and QQQ ATR columns are (close − 50-day EMA) ÷ 14-day "
+               "ATR — how many ATRs each index sits from its own 50-day line.")
     n_rows = st.slider("Sessions shown", 10, 250, 20, key="table_days")
     view = tbl.tail(n_rows).iloc[::-1]
     disp = pd.DataFrame({
@@ -1771,6 +1819,7 @@ with tab_market:
         "Dn 4%": view["dn4"],
         "% > 20D": view["pct_above_fast"],
         "% > 50D": view["pct_above_slow"],
+        "SPY ATR": view["spy_atr"],
         "QQQ ATR": view["qqq_atr"],
         "MLI %": view["mli_pct"],
         "MLI adv%": view["mli_up_pct"],
@@ -1792,14 +1841,15 @@ with tab_market:
                     for i, v in enumerate(col)]
         if name == "% > 50D":
             return [f"background-color: {CELL[ma_class(v, 'slow')]}" for v in col]
-        if name == "QQQ ATR":
+        if name in ("SPY ATR", "QQQ ATR"):
             return [f"background-color: {CELL[atr_class(v)]}" for v in col]
         return ["" for _ in col]
 
     styled = (disp.style
               .apply(_style, axis=0)
               .format({"Up 4%": "{:.0f}", "Dn 4%": "{:.0f}",
-                       "% > 20D": "{:.1f}", "% > 50D": "{:.1f}", "QQQ ATR": "{:+.2f}",
+                       "% > 20D": "{:.1f}", "% > 50D": "{:.1f}",
+                       "SPY ATR": "{:+.2f}", "QQQ ATR": "{:+.2f}",
                        "MLI %": "{:+.2f}", "MLI adv%": "{:.1f}"}, na_rep="—"))
     st.dataframe(styled, hide_index=True, width="stretch",
                  height=min(720, 45 + 35 * len(disp)))

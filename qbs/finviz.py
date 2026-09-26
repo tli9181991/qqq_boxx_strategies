@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -474,6 +474,7 @@ def load_universe_bars(
     verbose: bool = True,
     stale_after: Optional[int] = None,
     incremental: bool = False,
+    progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[str]]:
     """`(closes, volumes, error)` for a wide universe, cached as two CSVs.
 
@@ -498,6 +499,11 @@ def load_universe_bars(
     re-download: a recent window for the names it holds, full history only
     for names it does not hold or whose history the provider re-based.
     `refresh=True` is always a full download.
+
+    `progress(done, total, what)` is called after every batch that is
+    downloaded, with `what` naming the phase ("full history", or the recent
+    window's start). Not called at all on a cache hit. A failing callback is
+    ignored: a progress bar must never cost a download.
     """
     os.makedirs(cache_dir, exist_ok=True)
     c_path = os.path.join(cache_dir, f"{prefix}_closes.csv")
@@ -586,6 +592,7 @@ def load_universe_bars(
         """`(closes, volumes, failed)` for `names` from `since`, batched."""
         nonlocal last_error
         closes, volumes, failed = [], [], []
+        what = "full history" if since == start else f"prices since {since}"
         for i in range(0, len(names), batch_size):
             batch = names[i:i + batch_size]
             try:
@@ -610,6 +617,11 @@ def load_universe_bars(
                     print(f"[finviz] batch {i // batch_size + 1} failed ({exc})")
             if verbose and (i // batch_size) % 5 == 0:
                 print(f"[finviz] {min(i + batch_size, len(names))}/{len(names)} tickers")
+            if progress is not None:
+                try:
+                    progress(min(i + batch_size, len(names)), len(names), what)
+                except Exception:  # noqa: BLE001
+                    pass
         if not closes:
             return None, None, failed
 
