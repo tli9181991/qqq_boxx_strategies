@@ -1030,10 +1030,8 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
             for c in day_cols:
                 row[c] = "—"
                 verdicts[c].append(None)
-            row["Hammers (3d)"] = "—"
         else:
             hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
-            n_ham = 0
             for i, c in enumerate(day_cols):
                 if i >= len(hf):
                     row[c] = "—"
@@ -1043,7 +1041,6 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
                 if b["hammer"]:
                     row[c], v = f"🔨 {share}", "hammer"
-                    n_ham += 1
                 elif b["hanging_man"]:
                     row[c], v = f"⚠️ {share}", "hanging"
                 elif b["shape"]:
@@ -1051,7 +1048,6 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 else:
                     row[c], v = share, None
                 verdicts[c].append(v)
-            row["Hammers (3d)"] = n_ham
         rows.append(row)
     return pd.DataFrame(rows), verdicts, missing
 
