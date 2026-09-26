@@ -1413,12 +1413,28 @@ any of these — a rerun alone will not pick it up.
 |---|---|
 | `current_picks` | what each strategy holds on the latest bar, and how much they overlap |
 | `name_momentum` | one name's returns, universe rank, location vs every MA, and each strategy gate |
-| `market_breadth` | participation over the last N sessions, not the index |
+| `price_action` | one name's recent performance as the price panel computes it: returns vs QQQ/SPY, the 10/20/50/200 EMAs, range and drawdown, ATR, realised vol and beta, nearest support/resistance, volume vs its 20-day average, the last N sessions |
+| `market_overview` | the Market overview tab: 4% movers, % above the 20/50-day, SPY/QQQ stretch in ATR, the leader group, the daily monitor, the bear checklist |
+| `sector_leadership` | where the momentum leaders sit by sector, and who leads each |
+| `stock_vs_market` | one name's sector, return percentiles against the market and its sector, and whether it is a leader today |
 | `strategy_performance` | the backtest comparison table |
 | `breakout_funnel` | selection → breakout conversion, stage by stage |
 | `breakout_trades` | trade statistics in R, with the concentration check |
 | `fundamentals` | valuation, margins, growth, balance sheet, analyst view (yfinance) |
 | `search_news` / `ticker_headlines` | the web, and Yahoo's feed for one symbol |
+| `market_news` | the News tab's feed for the last N hours, plus that tab's cached model read |
+
+In the dashboard the tools read the frames the app already loaded: the price panel's
+date, the watchlist's non-constituents, and the Market overview tab's own universe
+(the ~2,400-name US universe when it loaded, the Nasdaq-100 fallback — flagged on
+every report — when it did not). **📊 Analyse &lt;ticker&gt;** next to the chat asks for
+the full single-stock read: the system prompt has the agent gather price action,
+momentum, relative strength, the market backdrop and news, then write a stance
+(constructive / neutral / cautious) with the evidence for and against it and the levels
+or events that would change it — never a position size or a "buy now".
+
+Without an LLM, `python -m qbs.agent --report price --ticker MU` and
+`--report market` print exactly what those tools return.
 
 ### The problem this is built around
 

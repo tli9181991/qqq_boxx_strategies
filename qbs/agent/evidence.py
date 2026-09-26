@@ -45,6 +45,11 @@ class Book:
     prices: pd.DataFrame                    # QQQ / VEU / BOXX
     cfg: Config
     note: str = ""
+    # Closes for names OUTSIDE the ranking universe -- the dashboard's
+    # watchlist outsiders -- on the universe's calendar. Never ranked as
+    # constituents: a report on one of them interpolates it into the
+    # universe for that report only, the way the dashboard's panel does.
+    extra: Optional[pd.DataFrame] = None
 
     @property
     def asof(self) -> pd.Timestamp:
@@ -57,6 +62,41 @@ class Book:
     @property
     def stale_sessions(self) -> int:
         return sessions_behind(self.asof)
+
+    def has(self, ticker: str) -> bool:
+        """Whether any closes are held for `ticker`, constituent or not."""
+        t = ticker.upper().strip()
+        return t in self.universe.columns or (
+            self.extra is not None and t in self.extra.columns)
+
+    def is_outsider(self, ticker: str) -> bool:
+        t = ticker.upper().strip()
+        return t not in self.universe.columns and self.has(t)
+
+    def closes(self, ticker: str) -> Optional[pd.Series]:
+        """One name's closes through `asof`, or None when none are held."""
+        t = ticker.upper().strip()
+        if t in self.universe.columns:
+            s = self.universe[t]
+        elif self.extra is not None and t in self.extra.columns:
+            s = self.extra[t].reindex(self.universe.index).ffill()
+        else:
+            return None
+        s = s.loc[:self.asof].dropna()
+        return s if not s.empty else None
+
+    def ranked_with(self, ticker: str) -> pd.DataFrame:
+        """The universe, with `ticker` joined in if it is an outsider.
+
+        One name at a time, as the dashboard's panel does it: joining a whole
+        watchlist would rank the outsiders against each other too, and a
+        name's percentile would depend on what else was in the box.
+        """
+        t = ticker.upper().strip()
+        if not self.is_outsider(t):
+            return self.universe
+        return self.universe.join(
+            self.extra[[t]].reindex(self.universe.index).ffill(), how="left")
 
     def header(self) -> str:
         behind = self.stale_sessions
@@ -169,20 +209,26 @@ def picks_report(book: Book, n_hold: int = 6,
 def name_report(book: Book, ticker: str, n_hold: int = 6) -> str:
     """Returns, rank, location and every strategy gate for one name."""
     ticker = ticker.upper().strip()
-    if ticker not in book.universe.columns:
+    if not book.has(ticker):
         near = [c for c in book.universe.columns if c.startswith(ticker[:2])][:8]
         return (f"{ticker} is not in the cached universe "
                 f"({book.universe.shape[1]} names). "
                 + (f"Nearest by prefix: {', '.join(near)}." if near else ""))
 
-    prof = momentum_profile(book.universe, ticker, safe=book.safe,
+    outsider = book.is_outsider(ticker)
+    prof = momentum_profile(book.ranked_with(ticker), ticker, safe=book.safe,
                             screen=FinvizScreenParams(n_hold=n_hold),
                             momentum=MomentumParams(n_hold=n_hold))
     if prof["returns"].empty:
         return f"{ticker} has too little history in the cache to profile."
 
-    lines = [f"MOMENTUM PROFILE — {ticker}", book.header(), "",
-             "[Returns — Rank is a percentile in THIS universe on THIS date, "
+    lines = [f"MOMENTUM PROFILE — {ticker}", book.header(), ""]
+    if outsider:
+        lines += [f"{ticker} is NOT a constituent: it is on the watchlist and "
+                  "is interpolated into the constituents' ranking for this "
+                  "report only. A strong rank means it WOULD place there, "
+                  "not that any book holds it -- the books cannot buy it.", ""]
+    lines += ["[Returns — Rank is a percentile in THIS universe on THIS date, "
              "1-99; momentum is a relative question and the rank is the answer]"]
     # By column name, not itertuples position: "Universe median" has a space
     # in it, so itertuples renames it to `_4` and any column added ahead of

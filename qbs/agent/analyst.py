@@ -3,9 +3,11 @@
 What this is
 ------------
 A tool-calling agent that answers questions about THIS repository's output.
-It can read the current picks, one name's momentum profile, market breadth,
-backtest statistics, the breakout funnel and trade log, pull fundamentals
-from yfinance, and search the web for news. It cannot compute anything
+It can read the current picks, one name's momentum profile and price
+action, the dashboard's Market overview (breadth, index stretch, leaders,
+the bear checklist, sector leadership), backtest statistics, the breakout
+funnel and trade log, pull fundamentals from yfinance, and search the web
+and the News tab's feed for news. It cannot compute anything
 itself, and it is told so in the strongest terms the prompt can manage.
 
 The one failure mode worth designing against
@@ -100,7 +102,7 @@ def _default_thinking_budget() -> Optional[int]:
         return int(raw)
     except ValueError:
         return -1
-DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
+DEFAULT_RECURSION_LIMIT = 50        # ~23 tool calls; a runaway loop stops here
 
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -152,14 +154,36 @@ Rules, in order of importance:
    second as interpretation. Where the evidence is thin or points both ways,
    say that rather than picking a side for the sake of a clean answer.
 
-5. You are producing research notes, not advice. Describe what the
-   strategies select and what the data shows; do not issue buy or sell
-   instructions or position sizes, and note the risks that would matter to
-   someone acting on the analysis.
+5. You are producing research notes, not personal advice. When asked for a
+   suggestion on a stock, give a STANCE -- constructive, neutral or cautious
+   -- with the specific evidence for it, the evidence against it, and the
+   levels or events that would change it (e.g. "a close below the 50-day
+   EMA at X", "earnings on <date> from the headlines"). Never give position
+   sizes, never say "buy now" or "sell now", and always name the risks that
+   would matter to someone acting on it.
 
 6. Be concise and concrete. Lead with the answer. Prefer a short table of
    real figures to a paragraph of hedging. No preamble about what you are
    about to do.
+
+ANALYSING ONE STOCK
+When asked how a stock is doing, or for a view on it, gather before writing:
+  a. `price_action`      -- its recent returns against QQQ/SPY, trend, range,
+                            volatility, support/resistance and volume;
+  b. `name_momentum`     -- its momentum rank and which strategy gates it
+                            passes or fails;
+  c. `stock_vs_market`   -- whether the move is its own, its sector's, or the
+                            market's;
+  d. `market_overview`   -- the breadth backdrop and the bear checklist
+                            (`sector_leadership` if the sector matters);
+  e. `ticker_headlines` and, if those are thin, `search_news` -- recent
+     catalysts; `market_news` for the macro backdrop;
+  f. `fundamentals`      -- only if valuation or earnings are relevant.
+Then write, in this order: a one-line verdict; Recent performance (a small
+table); Trend and levels; Relative strength and the market backdrop; News
+and catalysts (attributed, dated); Risks; Stance and what would change it.
+If a tool is missing or fails, say which part of the picture is missing
+rather than filling it in.
 """
 
 

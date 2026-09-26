@@ -981,9 +981,11 @@ def _tools(**kwargs):
 def test_tools_cover_the_advertised_surface():
     from qbs.agent.tools import tool_names
     names = tool_names(_tools())
-    for expected in ("current_picks", "name_momentum", "market_breadth",
+    for expected in ("current_picks", "name_momentum", "price_action",
+                     "market_overview", "sector_leadership", "stock_vs_market",
                      "strategy_performance", "breakout_funnel",
-                     "breakout_trades", "fundamentals", "search_news"):
+                     "breakout_trades", "fundamentals", "search_news",
+                     "ticker_headlines", "market_news"):
         assert expected in names
 
 
@@ -993,7 +995,8 @@ def test_disabling_the_web_removes_the_tools_entirely():
     from qbs.agent.tools import tool_names
     names = tool_names(_tools(allow_web=False))
     assert "search_news" not in names and "ticker_headlines" not in names
-    assert "current_picks" in names
+    assert "market_news" not in names
+    assert "current_picks" in names and "price_action" in names
 
 
 def test_every_tool_describes_itself():
@@ -1013,6 +1016,146 @@ def test_a_failing_tool_explains_rather_than_returning_nothing():
     tools = {t.name: t for t in _tools()}
     text = tools["name_momentum"].invoke({"ticker": "ZZZZ"})
     assert text.strip() and "not in the cached universe" in text
+
+
+def test_the_prompt_only_names_tools_that_exist():
+    """The stock-analysis procedure routes by tool name. A renamed tool the
+    prompt still asks for is a step the model will report it could not do."""
+    import re
+
+    from qbs.agent.analyst import SYSTEM_PROMPT
+    from qbs.agent.tools import tool_names
+    names = set(tool_names(_tools()))
+    asked = set(re.findall(r"`([a-z_]+)`", SYSTEM_PROMPT))
+    assert asked, "the procedure should name its tools"
+    assert asked <= names, asked - names
+
+
+# --------------------------------------------------------------------------
+# One stock, and the market around it
+# --------------------------------------------------------------------------
+
+def _ohlcv(close: pd.Series) -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    c = close.dropna()
+    wiggle = 1 + np.abs(rng.normal(0, 0.01, len(c)))
+    return pd.DataFrame({"Open": c.shift(1).fillna(c), "High": c * wiggle,
+                         "Low": c / wiggle, "Close": c,
+                         "Volume": rng.integers(1e6, 3e6, len(c)).astype(float)},
+                        index=c.index)
+
+
+def _with_outsider():
+    """A book whose watchlist holds one name that is not a constituent."""
+    book = _book()
+    t = book.universe.columns[0]
+    extra = (book.universe[[t]] * 1.1).rename(columns={t: "WATCHME"})
+    return ev.Book(universe=book.universe, prices=book.prices, cfg=book.cfg,
+                   note="synthetic", extra=extra)
+
+
+def test_price_action_reports_returns_trend_levels_and_sessions():
+    from qbs.agent.stock import price_action_report
+    book = _book()
+    t = book.universe.columns[0]
+    text = price_action_report(book, t, sessions=5)
+    for part in ("PRICE ACTION", "QQQ", "EMA 200", "52-week high",
+                 "Nearest resistance", "Nearest support", "[Last 5 sessions]",
+                 "closes only"):
+        assert part in text, part
+    # Closes only: the report says volume is missing rather than inventing it.
+    assert "No volume" in text
+
+
+def test_price_action_uses_real_bars_and_volume_when_given():
+    from qbs.agent.stock import price_action_report
+    book = _book()
+    t = book.universe.columns[0]
+    text = price_action_report(book, t, ohlc=_ohlcv(book.universe[t]),
+                               spy=book.prices["QQQ"])
+    assert "from real highs and lows" in text
+    assert "x its prior 20-day average" in text
+    assert "SPY was not supplied" not in text
+
+
+def test_price_action_explains_an_unknown_ticker():
+    from qbs.agent.stock import price_action_report
+    text = price_action_report(_book(), "ZZZZ")
+    assert text.strip() and "No prices for ZZZZ" in text
+
+
+def test_a_watchlist_outsider_is_profiled_but_flagged():
+    """The dashboard's panel profiles outsiders by joining them into the
+    ranking; the agent must be able to, and must say it did."""
+    from qbs.agent.stock import price_action_report
+    book = _with_outsider()
+    assert "WATCHME" not in book.universe.columns
+    name = ev.name_report(book, "watchme")
+    assert "NOT a constituent" in name and "not in the cached universe" not in name
+    assert "watchlist name outside" in price_action_report(book, "WATCHME")
+
+
+def test_market_overview_flags_the_index_fallback_and_answers_the_checklist():
+    from qbs.agent.market import market_from_book, overview_report
+    text = overview_report(market_from_book(_book()), sessions=3)
+    assert "NASDAQ-100 FALLBACK" in text
+    assert "[Daily monitor — last 3 sessions" in text
+    assert "Bear-market checklist" in text and "FedWatch" in text
+
+
+def test_market_uses_what_the_dashboard_already_computed():
+    """The overview's breadth table is handed in, not rebuilt per call."""
+    from qbs.agent.market import Market
+    from qbs.breadth import daily_breadth
+    book = _book()
+    res = daily_breadth(book.universe, qqq=book.prices["QQQ"])
+    m = Market(closes=book.universe, qqq=book.prices["QQQ"], breadth=res,
+               checklist=[])
+    assert m.get_breadth() is res and m.get_checklist() == []
+
+
+def test_sector_reports_need_a_sector_map_and_say_so():
+    from qbs.agent.market import (Market, market_from_book, sector_report,
+                                  stock_context_report)
+    book = _book()
+    assert "No sector map" in sector_report(market_from_book(book))
+
+    cols = list(book.universe.columns)
+    secs = {t: ("Tech" if i % 2 else "Health") for i, t in enumerate(cols)}
+    m = Market(closes=book.universe, sectors=secs, qqq=book.prices["QQQ"])
+    text = stock_context_report(m, cols[1], book=book)
+    assert "Sector: Tech" in text and "market pct" in text
+    assert "Momentum leader today" in text
+    joined = stock_context_report(m, "WATCHME", book=_with_outsider())
+    assert "joined in for this report only" in joined
+
+
+def test_the_price_tool_reads_bars_through_the_loader():
+    book = _book()
+    t = book.universe.columns[0]
+    seen = []
+
+    def loader(ticker):
+        seen.append(ticker)
+        return _ohlcv(book.universe[t])
+
+    pytest.importorskip("langchain_core")
+    from qbs.agent.tools import build_tools
+    tools = {x.name: x for x in build_tools(book=book, ohlc_loader=loader,
+                                            allow_web=False)}
+    text = tools["price_action"].invoke({"ticker": t.lower()})
+    assert seen == [t] and "from real highs and lows" in text
+    assert "MARKET OVERVIEW" in tools["market_overview"].invoke({})
+
+
+def test_market_news_fences_headlines_as_untrusted(monkeypatch):
+    from qbs.agent import sentiment as snt
+    feed = snt.NewsFeed(hours=12, headlines=_headlines(2), n_dated=2)
+    monkeypatch.setattr(snt, "fetch_news", lambda hours=12, **k: feed)
+    monkeypatch.setattr(snt, "load_cached", lambda *a, **k: None)
+    tools = {t.name: t for t in _tools()}
+    text = tools["market_news"].invoke({"hours": 12})
+    assert "<untrusted_headlines>" in text and "headline 2" in text
 
 
 # --------------------------------------------------------------------------
