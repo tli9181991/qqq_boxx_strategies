@@ -1424,17 +1424,37 @@ any of these — a rerun alone will not pick it up.
 | `search_news` / `ticker_headlines` | the web, and Yahoo's feed for one symbol |
 | `market_news` | the News tab's feed for the last N hours, plus that tab's cached model read |
 
-In the dashboard the tools read the frames the app already loaded: the price panel's
-date, the watchlist's non-constituents, and the Market overview tab's own universe
-(the ~2,400-name US universe when it loaded, the Nasdaq-100 fallback — flagged on
-every report — when it did not). **📊 Analyse &lt;ticker&gt;** next to the chat asks for
-the full single-stock read: the system prompt has the agent gather price action,
-momentum, relative strength, the market backdrop and news, then write a stance
-(constructive / neutral / cautious) with the evidence for and against it and the levels
-or events that would change it — never a position size or a "buy now".
+That is the full tool set, used by the CLI. **The dashboard's chat works differently:**
+what the dashboard has already computed goes to the model up front, as two JSON
+aggregates in the system prompt (`qbs/agent/context.py`):
 
-Without an LLM, `python -m qbs.agent --report price --ticker MU` and
-`--report market` print exactly what those tools return.
+```
+Market overview (~2,400 US names) ─→ MARKET_CONTEXT ─┐
+NDX + watchlist closes            ─→ STOCK_CONTEXT  ─┼─→ Gemini
+fundamentals / news tools         ───────────────────┘
+```
+
+- **MARKET_CONTEXT** — breadth (4% movers, % above the 20/50-day, leaders), SPY/QQQ
+  stretch in ATR, the 5- and 20-session breadth trend, the checklist (score and which
+  rows fired), sector leadership, and the limits of the reading. Aggregates only; the
+  2,400-name frame never reaches the model. On the Nasdaq-100 fallback it says so.
+- **STOCK_CONTEXT** — only for the name on the chart, which is a Nasdaq-100 constituent
+  or a watchlist name: membership, **normal and residual momentum** (score, rank, held
+  by the book or not), trend vs the EMAs and SMA 200, returns vs QQQ/SPY, market
+  percentile, nearest levels, volume. A watchlist name outside the index is
+  `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx` and
+  `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
+- **Tools: only `fundamentals`, `ticker_headlines` and `search_news`.** "Why do AMD's
+  normal and residual momentum differ?" is answered from the context with no call;
+  "is AMD's rise about earnings or AI news?" calls fundamentals and news.
+
+Both contexts are folded under every answer so each figure can be checked. The tab
+always reads the latest bar. **📊 Analyse &lt;ticker&gt;** asks for the full read, ending
+in a stance (constructive / neutral / cautious) with the evidence for and against it
+and what would change it — never a position size or a "buy now".
+
+Without an LLM: `python -m qbs.agent --report context --ticker MU` prints the two
+blocks, and `--report price` / `--report market` what the full tools return.
 
 ### The problem this is built around
 

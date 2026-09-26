@@ -1323,7 +1323,28 @@ from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
                            load_env, news_analysis_disabled,
                            news_read_disabled, retired_vars_in_use)
 from qbs.agent.evidence import Book
+from qbs.agent.context import (context_block, market_context,
+                               momentum_ranks, stock_context)
 from qbs.agent.market import Market
+
+
+@st.cache_data(show_spinner=False)
+def market_context_for(_market: Market, label: str, bar_epoch: str,
+                       n_names: int) -> dict:
+    """`market_context` behind a cache. The market frame is not hashed; the
+    universe label, bar epoch and name count are what change it."""
+    return market_context(_market)
+
+
+@st.cache_data(show_spinner="Ranking the name in both books…")
+def stock_ranks(_book: Book, ticker: str, n_hold: int, exit_rank: int,
+                n_resid: int, bar_epoch: str) -> dict:
+    """Normal and residual momentum rank and score for one chartable name,
+    the dashboard's own watchlist placement (`qbs.shadow`)."""
+    return momentum_ranks(
+        _book, ticker, MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
+        ResidualMomentumParams(n_hold=n_resid,
+                               exit_rank=n_resid + RESID_BAND))
 from qbs.agent.news import available_backends, backend_note
 from qbs.agent.sentiment import parse_published as snt_parse_published
 
@@ -2342,13 +2363,13 @@ with tab_analyst:
     st.caption(f"🔑 `.env`: {env_load.summary()}")
 
     st.caption(
-        "The analyst can read the current picks, any name's momentum profile "
-        "and price action (returns vs QQQ/SPY, EMAs, levels, volume), the "
-        "Market overview tab (breadth, index stretch, leaders, the checklist, "
-        "sector leadership), the breakout funnel and trade log, company "
-        "fundamentals from yfinance, the News tab's feed, and the web. It is told that every figure "
-        "must come from one of those tools, and every call it made is listed "
-        "under each answer so you can check the figures against their source."
+        "The analyst is handed two pre-computed contexts with each message: "
+        "the Market overview (breadth, index stretch, leaders, the checklist, "
+        "sector leadership) and the charted name (membership, normal and "
+        "residual momentum, trend, levels, volume). Its only tools are company "
+        "fundamentals from yfinance and news search. It is told that every figure "
+        "must come from the contexts or a tool call; both are folded under "
+        "each answer so you can check the figures against their source."
     )
 
     a_cols = st.columns([1.35, 1])
@@ -2427,6 +2448,12 @@ with tab_analyst:
             for turn in st.session_state["chat"]:
                 with st.chat_message(turn["role"]):
                     st.markdown(turn["content"])
+                    ctx = turn.get("context") or {}
+                    for label, key in (("Market context", "market"),
+                                       ("Stock context", "stock")):
+                        if ctx.get(key):
+                            with st.expander(f"📋 {label} (given to the model)"):
+                                st.json(ctx[key], expanded=True)
                     for i, call in enumerate(turn.get("tool_calls", []), 1):
                         args = ", ".join(f"{k}={v!r}"
                                          for k, v in call["args"].items())
@@ -2448,15 +2475,16 @@ with tab_analyst:
                       "change it.")
 
         if prompt:
-            # The agent gets the frames this app already loaded rather than
-            # re-reading the cache: a three-tool answer would otherwise spend a
-            # minute rebuilding a universe that is sitting in memory.
+            # Everything the dashboard already computed goes to the model up
+            # front, as two JSON aggregates (qbs.agent.context): the market,
+            # and the name on the chart. The model's only tools are the ones
+            # that reach outside the dashboard -- fundamentals and news -- so
+            # "why do its two momentum ranks differ?" costs no tool call.
             #
             # Cut at the date the chart on the left is drawn to (the latest
-            # bar -- see `asof_analyst`), so the numbers the agent reads are
-            # the ones on screen even if the frames ever run past it.
-            # The watchlist's outsiders ride along as `extra`, so a watched
-            # name outside the index can be profiled as the panel profiles it.
+            # bar -- see `asof_analyst`). The watchlist's outsiders ride along
+            # as `extra`, so a watched name outside the index gets a context
+            # built the way the panel profiles it.
             book = Book(universe=uni.loc[:asof_analyst],
                         prices=px.loc[:asof_analyst], cfg=cfg,
                         note=UNIVERSE_NOTE,
@@ -2471,16 +2499,33 @@ with tab_analyst:
                 qqq_ohlc=QQQ_OHLC, spy_ohlc=SPY_OHLC,
                 index_fallback=m_uni is uni, breadth=breadth_m,
                 checklist=list(auto.values()))
-            # The selected ticker rides along as context, so "is it extended?"
-            # means the name on screen rather than whatever was mentioned last.
-            # The Market tab's universe comes from a different provider and
-            # can end a session apart from the book's; say so rather than let
-            # the two dates read as one.
-            m_last = pd.Timestamp(m_uni.index.max())
-            m_note = ("" if m_last == pd.Timestamp(asof_analyst) else
-                      f"; the Market overview's last bar is {m_last:%Y-%m-%d}")
-            asked = (f"[the chart on screen is showing {chart_ticker}, as of "
-                     f"{pd.Timestamp(asof_analyst):%Y-%m-%d}{m_note}] {prompt}"
+            with st.spinner("Building the dashboard context…"):
+                mctx = market_context_for(market, universe_label, BAR_EPOCH,
+                                          m_uni.shape[1])
+                sctx = None
+                if chart_ticker:
+                    sctx = stock_context(
+                        book, chart_ticker, market=market,
+                        watchlist=WATCHLIST,
+                        ohlc=ohlc_for(chart_ticker, download_start,
+                                      bool(online), BAR_EPOCH),
+                        spy=SPY_CLOSE,
+                        ranks=stock_ranks(book, chart_ticker, int(n_hold),
+                                          int(exit_rank), int(n_resid),
+                                          BAR_EPOCH),
+                        # The books as the picks tab built them, with the
+                        # sidebar's slots -- not a second, default-sized run.
+                        held={"normal": names_on("momentum", LAST_BAR),
+                              "residual": names_on("resmom", LAST_BAR)},
+                        momentum=MomentumParams(n_hold=int(n_hold),
+                                                exit_rank=int(exit_rank)),
+                        residual=ResidualMomentumParams(
+                            n_hold=int(n_resid),
+                            exit_rank=int(n_resid) + RESID_BAND))
+            # The selected ticker rides along in the question too, so "is it
+            # extended?" means the name on screen rather than whatever was
+            # mentioned last.
+            asked = (f"[the chart on screen is showing {chart_ticker}] {prompt}"
                      if chart_ticker else prompt)
             history = [{"role": t["role"], "content": t["content"]}
                        for t in st.session_state["chat"]]
@@ -2490,32 +2535,29 @@ with tab_analyst:
                 answer = analyse(
                     asked, model=model_name.strip() or None, history=history,
                     thinking_budget=int(thinking),
-                    book=book, n_hold=int(n_hold), allow_web=bool(allow_web),
-                    offline_fundamentals=not live_fundamentals,
-                    market=market, spy=SPY_CLOSE,
-                    ohlc_loader=lambda t: ohlc_for(
-                        t, download_start, bool(online), BAR_EPOCH))
+                    context=context_block(mctx, sctx),
+                    allow_web=bool(allow_web),
+                    offline_fundamentals=not live_fundamentals)
 
             if answer.disabled:
                 text = f"⏸️ **Switched off.** {answer.text}"
             elif answer.error:
                 text = f"🚫 **Could not answer.** {answer.text}"
-            elif not answer.tool_calls:
-                # Say it in the transcript, not in a banner that the next
-                # message scrolls away from the answer it is about.
-                text = (answer.text + "\n\n---\n⚠️ *Answered without calling a "
-                        "tool, so nothing above is sourced from your data. "
-                        "Treat it as opinion.*")
             else:
+                # No tool call is normal now: the numbers came in the
+                # context, which is kept with the answer so each figure can
+                # be checked against what the model was actually given.
                 text = answer.text
             st.session_state["chat"].append(
                 {"role": "assistant", "content": text,
-                 "tool_calls": answer.tool_calls})
+                 "tool_calls": answer.tool_calls,
+                 "context": {"market": mctx, "stock": sctx}})
             st.rerun()
 
         st.caption(
-            "Every number should appear in one of the tool calls folded under "
-            "the answer. One that does not is a fabrication. Only the last 20 "
-            "turns are re-sent, and tool output is never replayed — the model "
-            "calls the tool again when it needs the numbers twice."
+            "Every number should appear in the contexts or the tool calls "
+            "folded under the answer. One that does not is a fabrication. The "
+            "contexts are rebuilt for the name on the chart with every "
+            "message; only the last 20 turns are re-sent, and tool output is "
+            "never replayed."
         )

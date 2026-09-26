@@ -1159,6 +1159,118 @@ def test_market_news_fences_headlines_as_untrusted(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Pre-computed dashboard context
+# --------------------------------------------------------------------------
+
+def test_context_mode_hands_the_model_only_the_research_tools():
+    """The design: the dashboard's numbers arrive in the prompt, and the tools
+    left are the ones that reach outside it."""
+    from qbs.agent.tools import build_tools, tool_names
+    pytest.importorskip("langchain_core")
+    # No book is passed, and none is loaded: context mode needs no prices.
+    names = tool_names(build_tools(toolset="context"))
+    assert names == ["fundamentals", "search_news", "ticker_headlines"]
+    assert tool_names(build_tools(toolset="context", allow_web=False)) == [
+        "fundamentals"]
+    with pytest.raises(ValueError):
+        build_tools(toolset="everything")
+
+
+def test_the_context_prompt_only_routes_to_the_research_tools():
+    import re
+
+    from qbs.agent.analyst import system_prompt
+    pytest.importorskip("langchain_core")
+    from qbs.agent.tools import build_tools, tool_names
+    prompt = system_prompt(context="MARKET_CONTEXT\n{}")
+    asked = set(re.findall(r"`([a-z_]+)`", prompt))
+    assert asked == set(tool_names(build_tools(toolset="context")))
+    assert "MARKET_CONTEXT" in prompt and "ANALYSING ONE STOCK" not in prompt
+    assert "must have come back from a tool call" in prompt.lower()
+
+
+def test_market_context_is_an_aggregate_not_the_frame():
+    import json
+
+    from qbs.agent.context import market_context
+    from qbs.agent.market import market_from_book
+    ctx = market_context(market_from_book(_book()))
+    for key in ("analysis_date", "data_as_of", "universe", "sample_size",
+                "breadth", "index_condition", "breadth_trend_5d",
+                "checklist", "sector_leadership", "interpretation_limits"):
+        assert key in ctx, key
+    assert "FALLBACK" in ctx["universe"]
+    assert ctx["checklist"]["automatic_score"] == len(ctx["checklist"]["triggered"])
+    assert any("FedWatch" in x for x in ctx["interpretation_limits"])
+    text = json.dumps(ctx)                   # JSON-safe: no NaN leaks through
+    assert "NaN" not in text and len(text) < 8000
+
+
+def test_stock_context_for_a_constituent_reports_both_books():
+    import json
+
+    from qbs.agent.context import stock_context
+    from qbs.shadow import watchlist_rows
+    book = _book()
+    t = book.universe.columns[3]
+    ctx = stock_context(book, t, watchlist=[t],
+                        held={"normal": [t], "residual": []})
+    assert ctx["membership"] == "Nasdaq-100" and ctx["watchlist"] is True
+    nm, rm = ctx["normal_momentum"], ctx["residual_momentum"]
+    assert "rank" in nm and "placement_rank_against_ndx" not in nm
+    assert nm["currently_held"] is True and rm["currently_held"] is False
+    # The rank is the dashboard's own watchlist placement, not a new one.
+    row = watchlist_rows(book.universe, book.safe, book.universe[[t]],
+                         asof=book.asof)[0]
+    if row["rank"] == row["rank"]:
+        assert nm["rank"] == int(row["rank"])
+    for key in ("trend", "relative", "levels", "last_5_sessions"):
+        assert ctx[key], key
+    assert "NaN" not in json.dumps(ctx)
+
+
+def test_stock_context_marks_a_watchlist_outsider_as_a_placement():
+    from qbs.agent.context import stock_context
+    book = _with_outsider()
+    ctx = stock_context(book, "WATCHME",
+                        held={"normal": ["WATCHME"], "residual": ["WATCHME"]})
+    assert ctx["membership"] == "watchlist_outside_ndx"
+    for blk in (ctx["normal_momentum"], ctx["residual_momentum"]):
+        assert "placement_rank_against_ndx" in blk and "rank" not in blk
+        # Held is False by construction: no book can buy a non-constituent.
+        assert blk["currently_held"] is False
+
+
+def test_stock_context_refuses_a_name_the_dashboard_cannot_chart():
+    from qbs.agent.context import stock_context
+    ctx = stock_context(_book(), "ZZZZ", held={}, ranks={})
+    assert "error" in ctx and "watchlist" in ctx["error"]
+
+
+def test_context_block_labels_both_blocks_and_states_a_missing_one():
+    from qbs.agent.context import context_block
+    text = context_block({"a": 1}, None)
+    assert "MARKET_CONTEXT" in text and "STOCK_CONTEXT" in text
+    assert "not available" in text
+
+
+def test_analyse_with_context_builds_the_context_agent(monkeypatch):
+    from qbs.agent import analyst
+    seen = {}
+
+    def fake_build(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(analyst, "chat_disabled", lambda: None)
+    monkeypatch.setattr(analyst, "build_analyst", fake_build)
+    ans = analyst.analyse("q", context="MARKET_CONTEXT\n{}")
+    assert ans.error == "stop here"
+    assert seen["toolset"] == "context"
+    assert "MARKET_CONTEXT" in seen["system_prompt"]
+
+
+# --------------------------------------------------------------------------
 # The agent itself
 # --------------------------------------------------------------------------
 

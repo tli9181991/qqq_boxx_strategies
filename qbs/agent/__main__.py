@@ -5,6 +5,7 @@
     python -m qbs.agent --report name --ticker MU
     python -m qbs.agent --report price --ticker MU
     python -m qbs.agent --report market
+    python -m qbs.agent --report context --ticker MU   # the dashboard's JSON
     python -m qbs.agent --check
 
 `--report` is the escape hatch worth knowing about: it prints exactly what
@@ -28,8 +29,8 @@ import argparse
 import os
 import sys
 
-REPORTS = ("picks", "name", "price", "breadth", "market", "universe",
-           "fundamentals", "news")
+REPORTS = ("picks", "name", "price", "breadth", "market", "context",
+           "universe", "fundamentals", "news")
 
 
 def main(argv=None) -> int:
@@ -250,6 +251,18 @@ def _report(args) -> int:
         except Exception:      # noqa: BLE001 -- the report says n/a
             spy = None
         print(overview_report(market_from_book(book, spy=spy)))
+    elif args.report == "context":
+        # Exactly the two JSON blocks the dashboard hands the model, over the
+        # ranking universe (the CLI has no Finviz download).
+        from ..data import load_daily_ohlc
+        from .context import context_block, market_context, stock_context
+        from .market import market_from_book
+        market = market_from_book(book)
+        sctx = (stock_context(book, args.ticker, market=market,
+                              ohlc=load_daily_ohlc(args.ticker.upper(),
+                                                   offline=not args.online))
+                if args.ticker else None)
+        print(context_block(market_context(market), sctx))
     return 0
 
 
