@@ -4519,3 +4519,58 @@ def test_the_update_window_reaches_back_to_a_recent_gap():
     px.loc[gap, px.columns[20:]] = np.nan
     assert gap in thin_rows(px)
     assert window_start(px, ()) < gap
+
+
+# --------------------------------------------------------------------------
+# Bear-market checklist
+# --------------------------------------------------------------------------
+
+def _checklist_px(n_days=400, n_names=200, drift=0.0, seed=3):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range(end="2026-09-24", periods=n_days)
+    steps = rng.normal(drift, 0.02, (n_days, n_names))
+    return pd.DataFrame(100 * np.exp(np.cumsum(steps, axis=0)), index=idx,
+                        columns=[f"T{i}" for i in range(n_names)])
+
+
+def _answers(px, index):
+    from qbs.breadth import bear_checklist
+    return {r["key"]: r["answer"] for r in bear_checklist(px, index)}
+
+
+def test_a_long_slide_trips_the_oversold_question():
+    px = _checklist_px()
+    px.iloc[-30:] = px.iloc[-31].to_numpy() * np.exp(
+        np.cumsum(np.full((30, px.shape[1]), -0.01), axis=0))
+    assert _answers(px, px.mean(axis=1))["oversold"] is True
+
+
+def test_a_steady_rise_answers_no_to_the_bearish_questions():
+    px = _checklist_px(drift=0.002)
+    a = _answers(px, px.mean(axis=1))
+    assert a["oversold"] is False and a["divergence"] is False and a["mli"] is False
+
+
+def test_final_high_needs_the_index_at_a_new_high_and_weak_leaders():
+    px = _checklist_px()
+    idx = pd.Series(np.linspace(100, 200, len(px)), index=px.index)   # new high today
+    # Leaders (up >10% on the quarter) that have since dropped under their 50-day.
+    # +60% into the high, then back to +35%: still a leader on the quarter,
+    # but under its own 50-day average.
+    px.iloc[-63:, :50] = px.iloc[-64, :50].to_numpy() * np.r_[
+        np.linspace(1.0, 1.6, 55), np.linspace(1.6, 1.35, 8)][:, None]
+    # Everyone else flat, so no random name joins the leaders.
+    px.iloc[-63:, 50:] = px.iloc[-64, 50:].to_numpy()
+    from qbs.breadth import bear_checklist
+    row = {r["key"]: r for r in bear_checklist(px, idx)}["final_high"]
+    assert "252-day high" in row["reading"]
+    assert row["answer"] is True, row["reading"]
+    flat = pd.Series(np.r_[np.linspace(100, 200, len(px) - 10), np.full(10, 150.0)],
+                     index=px.index)
+    assert _answers(px, flat)["final_high"] is False, "no new high, no pattern"
+
+
+def test_short_history_answers_none_rather_than_no():
+    px = _checklist_px(n_days=30)
+    a = _answers(px, px.mean(axis=1))
+    assert a["oversold"] is None and a["final_high"] is None

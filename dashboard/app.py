@@ -41,7 +41,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qbs.breadth import (BreadthParams, atr_class, daily_breadth, ma_class,
+from qbs.breadth import (BreadthParams, atr_class, bear_checklist,
+                         daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown,
                          sector_leaders)
@@ -405,6 +406,46 @@ def build_breadth(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
                   bar_epoch: str = "", _qqq_ohlc: Optional[pd.DataFrame] = None):
     return daily_breadth(_uni, qqq=_qqq, volumes=_volumes, universe_note=note,
                          qqq_ohlc=_qqq_ohlc)
+
+
+@st.cache_data(show_spinner="Checking the checklist…")
+def build_checklist(_uni: pd.DataFrame, _qqq: pd.Series, note: str,
+                    _volumes: Optional[pd.DataFrame] = None,
+                    bar_epoch: str = ""):
+    """`bear_checklist` behind a cache; `note` and `bar_epoch` key it."""
+    return bear_checklist(_uni, _qqq, volumes=_volumes)
+
+
+# The checklist, in its source's words. `auto` rows are answered from the
+# data by `qbs.breadth.bear_checklist`; the rest are the reader's to tick.
+# `weight` 2 is the source's "(Weighted double)".
+CHECKLIST = [
+    dict(key="oversold", auto=True, weight=1,
+         q="Has the percentage of NYSE stocks above their 40-day moving "
+           "average stayed below 20% for over 10 trading days after dropping "
+           "below 20%?",
+         yes="Oversold condition has turned into a trend; historically bearish."),
+    dict(key="final_high", auto=True, weight=1,
+         q="On the day the index reaches a new high, is the percentage of "
+           "momentum stocks above their 50-day moving average still below 30%?",
+         yes="\"Final New High\" pattern."),
+    dict(key="divergence", auto=True, weight=1,
+         q="Is the index rising while component new lows still outnumber new "
+           "highs?",
+         yes="Divergence has not been resolved."),
+    dict(key="mli", auto=True, weight=1,
+         q="Is the number of momentum stocks (MLiN) continuing to decline "
+           "without stabilizing?",
+         yes="Market leaders are still receding / pulling back."),
+    dict(key="fedwatch", auto=False, weight=1,
+         q="Are FedWatch rate hike expectations for October and December "
+           "continuing to rise?",
+         yes="\"Fuel\" is not yet exhausted; the market bottom has not arrived."),
+    dict(key="stops", auto=False, weight=2,
+         q="Have a large number of current positions simultaneously hit "
+           "stop-loss levels? (Weighted double)",
+         yes="Your own portfolio has confirmed the trend/risk."),
+]
 
 
 SENTIMENT_TINT = {"bullish": UP_STRONG, "leaning bullish": UP,
@@ -1803,6 +1844,60 @@ with tab_market:
             f"4%), and this sample is **{_sample} names** — no session here can "
             f"reach that, so Up 4% shades dark red throughout and means nothing. "
             "Turn the US universe on above for the scale to apply.", icon="🎨")
+
+    # ---- checklist ---------------------------------------------------------
+    st.divider()
+    st.markdown("#### Checklist")
+    auto = {r["key"]: r for r in build_checklist(
+        m_uni, px["QQQ"], universe_label, m_vols, bar_epoch=BAR_EPOCH)}
+    manual: Dict[str, bool] = {}
+    mc = st.columns(2)
+    for col, item in zip(mc, [i for i in CHECKLIST if not i["auto"]]):
+        manual[item["key"]] = col.checkbox(
+            item["q"], key=f"check_{item['key']}",
+            help="Not in this data — tick it yourself. Kept for this session "
+                 "only.")
+
+    rows, answers = [], []
+    for item in CHECKLIST:
+        if item["auto"]:
+            r = auto.get(item["key"], {})
+            ans, reading = r.get("answer"), r.get("reading", "—")
+        else:
+            ans = manual.get(item["key"], False)
+            reading = "ticked by you" if ans else "not ticked"
+        answers.append(ans)
+        rows.append({"Question": item["q"],
+                     'Answering "Yes" means': item["yes"],
+                     "Answer": "—" if ans is None else ("Yes" if ans else "No"),
+                     "Reading": reading})
+    ck = pd.DataFrame(rows)
+    st.dataframe(
+        ck.style.apply(lambda _c: [f"background-color: {DN}" if a else ""
+                                   for a in answers], subset=["Answer"]),
+        hide_index=True, width="stretch",
+        column_config={"Question": st.column_config.TextColumn(width="large"),
+                       'Answering "Yes" means': st.column_config.TextColumn(width="medium"),
+                       "Reading": st.column_config.TextColumn(width="medium")},
+        height=45 + 35 * len(ck))
+    score = sum(i["weight"] for i, a in zip(CHECKLIST, answers) if a)
+    total = sum(i["weight"] for i in CHECKLIST)
+    unknown = sum(1 for a in answers if a is None)
+    st.metric("Checklist score", f"{score} / {total}",
+              help="Each Yes counts 1; the stop-loss question counts 2.")
+    st.caption(md(
+        f"The first four are answered from the data on **{tbl.index[-1]:%Y-%m-%d}**, "
+        f"over **this universe ({m_uni.shape[1]:,} names)** rather than the NYSE, "
+        "with **QQQ** as the index. The thresholds: Q1 counts consecutive "
+        "sessions with under 20% of names above their 40-day average (Yes above "
+        "10). Q2 asks only when QQQ closes at a 52-week high, and measures the "
+        "momentum leaders (the MLI set) against their 50-day average. Q3 is "
+        "QQQ up over 5 sessions while more names sit at a 52-week low than a "
+        "52-week high. Q4 is fewer leaders than 5 sessions ago **and** the "
+        "fewest in 10 — still falling, no floor yet. FedWatch and your own "
+        "stop-losses are not in this data, so they are yours to tick."
+        + (f" {unknown} row{'s' if unknown != 1 else ''} could not be "
+           "answered for lack of history." if unknown else "")))
 
     # ---- momentum leaders -------------------------------------------------
     st.divider()
