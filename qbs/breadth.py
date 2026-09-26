@@ -860,3 +860,129 @@ def _atr_pct(close: pd.Series, window: int) -> float:
     if atr.notna().sum() == 0 or close.iloc[-1] == 0:
         return float("nan")
     return float(atr.iloc[-1] / close.iloc[-1])
+
+
+# --------------------------------------------------------------------------
+# Bear-market checklist
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ChecklistRules:
+    """Thresholds behind the checklist's automatic answers.
+
+    The checklist's questions are qualitative ("stayed below 20% for over 10
+    days", "continuing to decline without stabilizing"); these are the numbers
+    that turn each into a yes/no, kept in one place so they can be tuned.
+    """
+    oversold_ma: int = 40               # Q1: % above the 40-day average ...
+    oversold_level: float = 20.0        # ... below 20% ...
+    oversold_days: int = 10             # ... for MORE than 10 sessions
+    high_window: int = 252              # a "new high" / "new low" is a 52-week one
+    final_high_ma: int = 50             # Q2: leaders above their 50-day average ...
+    final_high_level: float = 30.0      # ... below 30% on the index's new-high day
+    rising_days: int = 5                # Q3: "the index is rising" = up over 5 sessions
+    mli_lookback: int = 5               # Q4: leaders fewer than 5 sessions ago ...
+    mli_low_window: int = 10            # ... and at their lowest in 10 sessions
+
+
+def bear_checklist(
+    closes: pd.DataFrame,
+    index_close: pd.Series,
+    volumes: Optional[pd.DataFrame] = None,
+    p: Optional[BreadthParams] = None,
+    rules: Optional[ChecklistRules] = None,
+    index_name: str = "QQQ",
+) -> List[Dict]:
+    """The four checklist questions this data can answer, on the last session.
+
+    Each row is `{key, answer, reading}` -- `answer` True ("yes", the bearish
+    reading), False, or None when there is not enough history to say, and
+    `reading` the numbers behind it, so a "yes" can be checked rather than
+    trusted.
+
+    What is measured is this universe, not the NYSE: the % above the 40-day
+    average and the new-high / new-low counts are over the names in
+    `closes`, and "the index" is `index_close`. Sessions most names are
+    missing are left out first, as in `daily_breadth`.
+    """
+    from .data import thin_rows
+
+    p = p or BreadthParams()
+    r = rules or ChecklistRules()
+    px = closes.sort_index()
+    gaps = thin_rows(px)
+    if gaps:
+        px = px.drop(index=list(gaps))
+    idx = index_close.sort_index().reindex(px.index).ffill()
+    out: List[Dict] = []
+
+    # Q1 -- oversold that has turned into a trend.
+    ma40 = px.rolling(r.oversold_ma, min_periods=r.oversold_ma).mean()
+    pct40 = _pct_above(px, ma40, px.notna()).dropna()
+    if pct40.empty:
+        out.append(dict(key="oversold", answer=None,
+                        reading=f"not enough history for a {r.oversold_ma}-day average"))
+    else:
+        below = (pct40 < r.oversold_level).to_numpy()[::-1]
+        run = int(np.argmin(below)) if not below.all() else len(below)
+        out.append(dict(
+            key="oversold", answer=run > r.oversold_days,
+            reading=(f"{pct40.iloc[-1]:.1f}% above the {r.oversold_ma}-day · "
+                     + (f"below {r.oversold_level:.0f}% for {run} session"
+                        f"{'s' if run != 1 else ''}" if run else
+                        f"not below {r.oversold_level:.0f}%"))))
+
+    # Q2 -- "final new high": the index makes one while leaders do not follow.
+    hi = idx.rolling(r.high_window, min_periods=r.high_window).max()
+    if pd.isna(hi.iloc[-1]):
+        out.append(dict(key="final_high", answer=None,
+                        reading=f"under {r.high_window} sessions of {index_name}"))
+    else:
+        new_high = bool(idx.iloc[-1] >= hi.iloc[-1])
+        leaders = leader_mask(px, volumes, p).iloc[-1]
+        ma50 = px.rolling(r.final_high_ma, min_periods=r.final_high_ma).mean().iloc[-1]
+        valid = leaders & ma50.notna()
+        n = int(valid.sum())
+        share = (100.0 * (px.iloc[-1][valid] > ma50[valid]).sum() / n) if n else np.nan
+        lead_txt = (f"{share:.0f}% of {n} leaders above their {r.final_high_ma}-day"
+                    if n else "no leaders to measure")
+        if new_high:
+            out.append(dict(key="final_high",
+                            answer=bool(n and share < r.final_high_level),
+                            reading=f"{index_name} at a {r.high_window}-day high · {lead_txt}"))
+        else:
+            off = idx.iloc[-1] / hi.iloc[-1] - 1.0
+            out.append(dict(key="final_high", answer=False,
+                            reading=f"{index_name} not at a new high "
+                                    f"({off:.1%} off its {r.high_window}-day high) · {lead_txt}"))
+
+    # Q3 -- the index rising over a tape making more new lows than new highs.
+    roll_hi = px.rolling(r.high_window, min_periods=r.high_window).max()
+    roll_lo = px.rolling(r.high_window, min_periods=r.high_window).min()
+    last = px.iloc[-1]
+    has = roll_hi.iloc[-1].notna() & last.notna()
+    n_hi = int((last[has] >= roll_hi.iloc[-1][has]).sum())
+    n_lo = int((last[has] <= roll_lo.iloc[-1][has]).sum())
+    if len(idx) <= r.rising_days or not has.any():
+        out.append(dict(key="divergence", answer=None,
+                        reading="not enough history for 52-week highs and lows"))
+    else:
+        chg = idx.iloc[-1] / idx.iloc[-1 - r.rising_days] - 1.0
+        out.append(dict(
+            key="divergence", answer=bool(chg > 0 and n_lo > n_hi),
+            reading=(f"{index_name} {chg:+.1%} over {r.rising_days} sessions · "
+                     f"{n_hi} new highs vs {n_lo} new lows")))
+
+    # Q4 -- leaders still shrinking, no floor yet.
+    mli = leader_mask(px, volumes, p).sum(axis=1)
+    need = max(r.mli_lookback, r.mli_low_window) + 1
+    if len(mli) < need or mli.iloc[-need:].eq(0).all():
+        out.append(dict(key="mli", answer=None, reading="not enough history"))
+    else:
+        now, then = int(mli.iloc[-1]), int(mli.iloc[-1 - r.mli_lookback])
+        floor = int(mli.iloc[-1 - r.mli_low_window:-1].min())
+        out.append(dict(
+            key="mli", answer=bool(now < then and now <= floor),
+            reading=(f"{now} leaders now · {r.mli_lookback} sessions ago: {then} · "
+                     f"lowest of the prior {r.mli_low_window}: {floor}")))
+    return out
