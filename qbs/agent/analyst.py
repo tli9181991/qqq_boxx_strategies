@@ -3,9 +3,11 @@
 What this is
 ------------
 A tool-calling agent that answers questions about THIS repository's output.
-It can read the current picks, one name's momentum profile, market breadth,
-backtest statistics, the breakout funnel and trade log, pull fundamentals
-from yfinance, and search the web for news. It cannot compute anything
+It can read the current picks, one name's momentum profile and price
+action, the dashboard's Market overview (breadth, index stretch, leaders,
+the bear checklist, sector leadership), backtest statistics, the breakout
+funnel and trade log, pull fundamentals from yfinance, and search the web
+and the News tab's feed for news. It cannot compute anything
 itself, and it is told so in the strongest terms the prompt can manage.
 
 The one failure mode worth designing against
@@ -100,7 +102,7 @@ def _default_thinking_budget() -> Optional[int]:
         return int(raw)
     except ValueError:
         return -1
-DEFAULT_RECURSION_LIMIT = 40        # ~18 tool calls; a runaway loop stops here
+DEFAULT_RECURSION_LIMIT = 50        # ~23 tool calls; a runaway loop stops here
 
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -123,7 +125,7 @@ YOUR SOURCE OF TRUTH IS THE TOOLS. You cannot calculate, and you must not.
 Rules, in order of importance:
 
 1. Every number in your answer must have come back from a tool call in this
-   conversation. Not one figure may be recalled, estimated, interpolated or
+   conversation, or from a DASHBOARD CONTEXT block when one is given below. Not one figure may be recalled, estimated, interpolated or
    inferred. If you need a number you do not have, call the tool; if no tool
    provides it, say plainly "I don't have that" and name what would be
    needed. An answer with an unsourced number in it is worse than no answer,
@@ -152,18 +154,90 @@ Rules, in order of importance:
    second as interpretation. Where the evidence is thin or points both ways,
    say that rather than picking a side for the sake of a clean answer.
 
-5. You are producing research notes, not advice. Describe what the
-   strategies select and what the data shows; do not issue buy or sell
-   instructions or position sizes, and note the risks that would matter to
-   someone acting on the analysis.
+5. You are producing research notes, not personal advice. When asked for a
+   suggestion on a stock, give a STANCE -- constructive, neutral or cautious
+   -- with the specific evidence for it, the evidence against it, and the
+   levels or events that would change it (e.g. "a close below the 50-day
+   EMA at X", "earnings on <date> from the headlines"). Never give position
+   sizes, never say "buy now" or "sell now", and always name the risks that
+   would matter to someone acting on it.
 
 6. Be concise and concrete. Lead with the answer. Prefer a short table of
    real figures to a paragraph of hedging. No preamble about what you are
    about to do.
+
+{procedure}"""
+
+TOOL_PROCEDURE = """\
+ANALYSING ONE STOCK
+When asked how a stock is doing, or for a view on it, gather before writing:
+  a. `price_action`      -- its recent returns against QQQ/SPY, trend, range,
+                            volatility, support/resistance and volume;
+  b. `name_momentum`     -- its momentum rank and which strategy gates it
+                            passes or fails;
+  c. `stock_vs_market`   -- whether the move is its own, its sector's, or the
+                            market's;
+  d. `market_overview`   -- the breadth backdrop and the bear checklist
+                            (`sector_leadership` if the sector matters);
+  e. `ticker_headlines` and, if those are thin, `search_news` -- recent
+     catalysts; `market_news` for the macro backdrop;
+  f. `fundamentals`      -- only if valuation or earnings are relevant.
+Then write, in this order: a one-line verdict; Recent performance (a small
+table); Trend and levels; Relative strength and the market backdrop; News
+and catalysts (attributed, dated); Risks; Stance and what would change it.
+If a tool is missing or fails, say which part of the picture is missing
+rather than filling it in.
+"""
+
+CONTEXT_PROCEDURE = """\
+DASHBOARD CONTEXT
+The dashboard has already computed two JSON blocks, below: MARKET_CONTEXT
+(an aggregate of the US market universe) and STOCK_CONTEXT (the name on the
+chart). They are this lab's own numbers -- treat them exactly as tool
+output. Answer from them directly and do NOT call a tool for anything they
+contain; e.g. "why do its normal and residual momentum ranks differ?" needs
+no tool call at all.
+
+Your only tools reach outside the dashboard: `fundamentals` for valuation,
+margins, growth and earnings; `ticker_headlines` for the company's recent
+news, and `search_news` when those are thin or the question is broader
+(e.g. "is the rise linked to earnings or AI news?" needs both kinds).
+
+Reading STOCK_CONTEXT:
+- "membership" "watchlist_outside_ndx" means the name is NOT a Nasdaq-100
+  constituent. Its "placement_rank_against_ndx" is where it WOULD rank among
+  the constituents, and no book can hold it. Never call it a constituent or
+  a holding.
+- "normal_momentum" is the book's trailing-return rank; "residual_momentum"
+  ranks the same universe on the drift the market (QQQ) does not explain,
+  as a t-statistic. A name ranked much better on normal than on residual
+  momentum owes its strength largely to market beta; the reverse is a name
+  moving on its own story. "currently_held" is the book on the last bar;
+  "sell_below_rank" is where a held name is sold.
+- Returns and distances are fractions (0.08 = 8%). "excess_vs_qqq_*" is the
+  name minus QQQ over the same sessions.
+
+Reading MARKET_CONTEXT, judge in turn: is breadth expanding or contracting
+("breadth_trend_5d", "breadth_trend_20d"); risk-on, neutral or risk-off
+overall; any divergence between the index and breadth (the checklist's
+"divergence" row, index strength against falling % above averages); whether
+the index is stretched ("index_condition" beyond "stretched_beyond_atr");
+whether leadership is concentrated ("sector_leadership",
+"top3_sector_concentration_pct"). Respect "interpretation_limits" and
+"sessions_behind", and say which date the data stands on.
+
+For a full analysis of the stock, call `ticker_headlines` (and
+`search_news` if those are thin) for catalysts, `fundamentals` only when
+valuation or earnings matter, then write in this order: a one-line verdict;
+Recent performance (a small table); Trend and levels; Momentum in both
+books and what their difference says; Relative strength and the market
+backdrop; News and catalysts (attributed, dated); Risks; Stance and what
+would change it. For a narrow question, answer only that.
 """
 
 
-def system_prompt(momentum: Optional[Any] = None) -> str:
+def system_prompt(momentum: Optional[Any] = None,
+                  context: Optional[str] = None) -> str:
     """The prompt, with the ranker's lookback filled in from config.
 
     Rendered rather than written out. The lookback has already moved from
@@ -175,7 +249,14 @@ def system_prompt(momentum: Optional[Any] = None) -> str:
 
     # `replace`, not `format`: the prompt is prose that may well grow a brace
     # one day, and `.format` would then raise on a docstring edit.
-    return SYSTEM_PROMPT_TEMPLATE.replace("{momentum}", momentum_label(momentum))
+    #
+    # `context` switches the procedure: the dashboard's pre-computed JSON
+    # replaces the data tools, so the prompt must stop routing to them.
+    base = SYSTEM_PROMPT_TEMPLATE.replace("{momentum}", momentum_label(momentum))
+    if context is None:
+        return base.replace("{procedure}", TOOL_PROCEDURE)
+    return (base.replace("{procedure}", CONTEXT_PROCEDURE)
+            + "\n" + context.strip() + "\n")
 
 
 SYSTEM_PROMPT = system_prompt()
@@ -310,9 +391,15 @@ def analyse(
     history: Optional[List[Dict[str, str]]] = None,
     max_history: int = 20,
     thinking_budget: object = "default",
+    context: Optional[str] = None,
     **tool_kwargs,
 ) -> Answer:
     """Ask the analyst one question. Returns an `Answer`, never raises.
+
+    `context` is pre-computed dashboard context (see `qbs.agent.context`,
+    `context_block`). With it the prompt carries the numbers and the model
+    gets only the research tools -- fundamentals and news; without it the
+    model fetches everything through the full tool set.
 
     Failures come back in `Answer.error` with the text explaining what went
     wrong, because the callers are a CLI and a Streamlit tab and both want to
@@ -340,6 +427,11 @@ def analyse(
         return Answer(text=f"The chat is disabled — {off}", model=name,
                       error=off, disabled=True)
     try:
+        if agent is None and context is not None:
+            tool_kwargs["toolset"] = "context"
+            agent = build_analyst(model=name, thinking_budget=thinking_budget,
+                                  system_prompt=system_prompt(context=context),
+                                  **tool_kwargs)
         agent = agent or build_analyst(model=name,
                                        thinking_budget=thinking_budget,
                                        **tool_kwargs)

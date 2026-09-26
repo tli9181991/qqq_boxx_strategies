@@ -4,12 +4,15 @@ Layered so that only the top one needs LangChain:
 
     env.py          `.env` loading: the shell wins, no value is ever printed
     evidence.py     the lab's own numbers, rendered as text with their caveats
+    stock.py        one name's price action, as the dashboard's panel reads it
+    market.py       the Market overview tab: breadth, checklist, sectors
     fundamentals.py yfinance company data, cached  (no LangChain)
     news.py         web search and headlines       (no LangChain)
-    tools.py        the three above, as LangChain tools
+    tools.py        the modules above, as LangChain tools
     analyst.py      a Gemini agent that may use them
 
-The split is the point. `evidence`, `fundamentals` and `news` are ordinary
+The split is the point. `evidence`, `stock`, `market`, `fundamentals`
+and `news` are ordinary
 Python that a notebook, the dashboard or a test can call, and they behave the
 same whether or not an LLM is involved. Nothing about the analysis depends on
 the model being available -- the model only decides which report to read and

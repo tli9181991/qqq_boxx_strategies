@@ -265,6 +265,23 @@ def watchlist_residual_ranks(
     Returns `{symbol: rank}`, NaN for a name the ranker filtered out, and an
     empty dict if nothing could be scored -- a log must not raise.
     """
+    return {t: r for t, (r, _) in watchlist_residual_rows(
+        universe, safe_prices, market, watch, params, asof).items()}
+
+
+def watchlist_residual_rows(
+    universe: pd.DataFrame,
+    safe_prices: pd.Series,
+    market: pd.Series,
+    watch: pd.DataFrame,
+    params: Optional[ResidualMomentumParams] = None,
+    asof: Optional[pd.Timestamp] = None,
+) -> Dict[str, tuple]:
+    """`watchlist_residual_ranks` with the score kept: `{symbol: (rank, score)}`.
+
+    The score is the residual book's own sort key (a t-statistic on the
+    name's market-neutral drift), NaN where the ranker filtered it out.
+    """
     rp = params or ResidualMomentumParams()
     mp = MomentumParams(
         lookback_months=rp.lookback_months, skip_months=rp.skip_months,
@@ -278,5 +295,8 @@ def watchlist_residual_ranks(
     if placed_rows is None:
         return {}
     base, placed, _ = placed_rows
-    return {t: _rank_in(base, t, placed.get(t, float("nan")))
-            for t in watch.columns}
+    out = {}
+    for t in watch.columns:
+        sc = placed.get(t, float("nan"))
+        out[t] = (_rank_in(base, t, sc), sc)
+    return out

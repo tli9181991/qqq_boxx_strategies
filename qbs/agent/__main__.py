@@ -3,6 +3,9 @@
     python -m qbs.agent "Why is MU in the momentum book but not the screen?"
     python -m qbs.agent --report picks
     python -m qbs.agent --report name --ticker MU
+    python -m qbs.agent --report price --ticker MU
+    python -m qbs.agent --report market
+    python -m qbs.agent --report context --ticker MU   # the dashboard's JSON
     python -m qbs.agent --check
 
 `--report` is the escape hatch worth knowing about: it prints exactly what
@@ -26,7 +29,8 @@ import argparse
 import os
 import sys
 
-REPORTS = ("picks", "name", "breadth", "universe", "fundamentals", "news")
+REPORTS = ("picks", "name", "price", "breadth", "market", "context",
+           "universe", "fundamentals", "news")
 
 
 def main(argv=None) -> int:
@@ -36,7 +40,7 @@ def main(argv=None) -> int:
     ap.add_argument("question", nargs="*", help="what to ask the analyst")
     ap.add_argument("--report", choices=REPORTS,
                     help="print one report directly, with no LLM involved")
-    ap.add_argument("--ticker", default="", help="for --report name/fundamentals")
+    ap.add_argument("--ticker", default="", help="for --report name/price/fundamentals")
     ap.add_argument("--query", default="", help="for --report news")
     ap.add_argument("--model", default=None, help="override the Gemini model")
     ap.add_argument("--no-web", action="store_true",
@@ -228,6 +232,37 @@ def _report(args) -> int:
             print("--report name needs --ticker", file=sys.stderr)
             return 2
         print(ev.name_report(book, args.ticker))
+    elif args.report == "price":
+        if not args.ticker:
+            print("--report price needs --ticker", file=sys.stderr)
+            return 2
+        from ..data import load_daily_ohlc
+        from .stock import price_action_report
+        print(price_action_report(
+            book, args.ticker,
+            ohlc=load_daily_ohlc(args.ticker.upper(), offline=not args.online)))
+    elif args.report == "market":
+        # The ranking universe, not the US one: the CLI has no Finviz
+        # download to hand, and the report says so in its first line.
+        from ..data import load_prices
+        from .market import market_from_book, overview_report
+        try:
+            spy = load_prices(["SPY"], offline=not args.online)["SPY"]
+        except Exception:      # noqa: BLE001 -- the report says n/a
+            spy = None
+        print(overview_report(market_from_book(book, spy=spy)))
+    elif args.report == "context":
+        # Exactly the two JSON blocks the dashboard hands the model, over the
+        # ranking universe (the CLI has no Finviz download).
+        from ..data import load_daily_ohlc
+        from .context import context_block, market_context, stock_context
+        from .market import market_from_book
+        market = market_from_book(book)
+        sctx = (stock_context(book, args.ticker, market=market,
+                              ohlc=load_daily_ohlc(args.ticker.upper(),
+                                                   offline=not args.online))
+                if args.ticker else None)
+        print(context_block(market_context(market), sctx))
     return 0
 
 

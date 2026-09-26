@@ -981,9 +981,11 @@ def _tools(**kwargs):
 def test_tools_cover_the_advertised_surface():
     from qbs.agent.tools import tool_names
     names = tool_names(_tools())
-    for expected in ("current_picks", "name_momentum", "market_breadth",
+    for expected in ("current_picks", "name_momentum", "price_action",
+                     "market_overview", "sector_leadership", "stock_vs_market",
                      "strategy_performance", "breakout_funnel",
-                     "breakout_trades", "fundamentals", "search_news"):
+                     "breakout_trades", "fundamentals", "search_news",
+                     "ticker_headlines", "market_news"):
         assert expected in names
 
 
@@ -993,7 +995,8 @@ def test_disabling_the_web_removes_the_tools_entirely():
     from qbs.agent.tools import tool_names
     names = tool_names(_tools(allow_web=False))
     assert "search_news" not in names and "ticker_headlines" not in names
-    assert "current_picks" in names
+    assert "market_news" not in names
+    assert "current_picks" in names and "price_action" in names
 
 
 def test_every_tool_describes_itself():
@@ -1013,6 +1016,258 @@ def test_a_failing_tool_explains_rather_than_returning_nothing():
     tools = {t.name: t for t in _tools()}
     text = tools["name_momentum"].invoke({"ticker": "ZZZZ"})
     assert text.strip() and "not in the cached universe" in text
+
+
+def test_the_prompt_only_names_tools_that_exist():
+    """The stock-analysis procedure routes by tool name. A renamed tool the
+    prompt still asks for is a step the model will report it could not do."""
+    import re
+
+    from qbs.agent.analyst import SYSTEM_PROMPT
+    from qbs.agent.tools import tool_names
+    names = set(tool_names(_tools()))
+    asked = set(re.findall(r"`([a-z_]+)`", SYSTEM_PROMPT))
+    assert asked, "the procedure should name its tools"
+    assert asked <= names, asked - names
+
+
+# --------------------------------------------------------------------------
+# One stock, and the market around it
+# --------------------------------------------------------------------------
+
+def _ohlcv(close: pd.Series) -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    c = close.dropna()
+    wiggle = 1 + np.abs(rng.normal(0, 0.01, len(c)))
+    return pd.DataFrame({"Open": c.shift(1).fillna(c), "High": c * wiggle,
+                         "Low": c / wiggle, "Close": c,
+                         "Volume": rng.integers(1e6, 3e6, len(c)).astype(float)},
+                        index=c.index)
+
+
+def _with_outsider():
+    """A book whose watchlist holds one name that is not a constituent."""
+    book = _book()
+    t = book.universe.columns[0]
+    extra = (book.universe[[t]] * 1.1).rename(columns={t: "WATCHME"})
+    return ev.Book(universe=book.universe, prices=book.prices, cfg=book.cfg,
+                   note="synthetic", extra=extra)
+
+
+def test_price_action_reports_returns_trend_levels_and_sessions():
+    from qbs.agent.stock import price_action_report
+    book = _book()
+    t = book.universe.columns[0]
+    text = price_action_report(book, t, sessions=5)
+    for part in ("PRICE ACTION", "QQQ", "EMA 200", "52-week high",
+                 "Nearest resistance", "Nearest support", "[Last 5 sessions]",
+                 "closes only"):
+        assert part in text, part
+    # Closes only: the report says volume is missing rather than inventing it.
+    assert "No volume" in text
+
+
+def test_price_action_uses_real_bars_and_volume_when_given():
+    from qbs.agent.stock import price_action_report
+    book = _book()
+    t = book.universe.columns[0]
+    text = price_action_report(book, t, ohlc=_ohlcv(book.universe[t]),
+                               spy=book.prices["QQQ"])
+    assert "from real highs and lows" in text
+    assert "x its prior 20-day average" in text
+    assert "SPY was not supplied" not in text
+
+
+def test_price_action_explains_an_unknown_ticker():
+    from qbs.agent.stock import price_action_report
+    text = price_action_report(_book(), "ZZZZ")
+    assert text.strip() and "No prices for ZZZZ" in text
+
+
+def test_a_watchlist_outsider_is_profiled_but_flagged():
+    """The dashboard's panel profiles outsiders by joining them into the
+    ranking; the agent must be able to, and must say it did."""
+    from qbs.agent.stock import price_action_report
+    book = _with_outsider()
+    assert "WATCHME" not in book.universe.columns
+    name = ev.name_report(book, "watchme")
+    assert "NOT a constituent" in name and "not in the cached universe" not in name
+    assert "watchlist name outside" in price_action_report(book, "WATCHME")
+
+
+def test_market_overview_flags_the_index_fallback_and_answers_the_checklist():
+    from qbs.agent.market import market_from_book, overview_report
+    text = overview_report(market_from_book(_book()), sessions=3)
+    assert "NASDAQ-100 FALLBACK" in text
+    assert "[Daily monitor — last 3 sessions" in text
+    assert "Bear-market checklist" in text and "FedWatch" in text
+
+
+def test_market_uses_what_the_dashboard_already_computed():
+    """The overview's breadth table is handed in, not rebuilt per call."""
+    from qbs.agent.market import Market
+    from qbs.breadth import daily_breadth
+    book = _book()
+    res = daily_breadth(book.universe, qqq=book.prices["QQQ"])
+    m = Market(closes=book.universe, qqq=book.prices["QQQ"], breadth=res,
+               checklist=[])
+    assert m.get_breadth() is res and m.get_checklist() == []
+
+
+def test_sector_reports_need_a_sector_map_and_say_so():
+    from qbs.agent.market import (Market, market_from_book, sector_report,
+                                  stock_context_report)
+    book = _book()
+    assert "No sector map" in sector_report(market_from_book(book))
+
+    cols = list(book.universe.columns)
+    secs = {t: ("Tech" if i % 2 else "Health") for i, t in enumerate(cols)}
+    m = Market(closes=book.universe, sectors=secs, qqq=book.prices["QQQ"])
+    text = stock_context_report(m, cols[1], book=book)
+    assert "Sector: Tech" in text and "market pct" in text
+    assert "Momentum leader today" in text
+    joined = stock_context_report(m, "WATCHME", book=_with_outsider())
+    assert "joined in for this report only" in joined
+
+
+def test_the_price_tool_reads_bars_through_the_loader():
+    book = _book()
+    t = book.universe.columns[0]
+    seen = []
+
+    def loader(ticker):
+        seen.append(ticker)
+        return _ohlcv(book.universe[t])
+
+    pytest.importorskip("langchain_core")
+    from qbs.agent.tools import build_tools
+    tools = {x.name: x for x in build_tools(book=book, ohlc_loader=loader,
+                                            allow_web=False)}
+    text = tools["price_action"].invoke({"ticker": t.lower()})
+    assert seen == [t] and "from real highs and lows" in text
+    assert "MARKET OVERVIEW" in tools["market_overview"].invoke({})
+
+
+def test_market_news_fences_headlines_as_untrusted(monkeypatch):
+    from qbs.agent import sentiment as snt
+    feed = snt.NewsFeed(hours=12, headlines=_headlines(2), n_dated=2)
+    monkeypatch.setattr(snt, "fetch_news", lambda hours=12, **k: feed)
+    monkeypatch.setattr(snt, "load_cached", lambda *a, **k: None)
+    tools = {t.name: t for t in _tools()}
+    text = tools["market_news"].invoke({"hours": 12})
+    assert "<untrusted_headlines>" in text and "headline 2" in text
+
+
+# --------------------------------------------------------------------------
+# Pre-computed dashboard context
+# --------------------------------------------------------------------------
+
+def test_context_mode_hands_the_model_only_the_research_tools():
+    """The design: the dashboard's numbers arrive in the prompt, and the tools
+    left are the ones that reach outside it."""
+    from qbs.agent.tools import build_tools, tool_names
+    pytest.importorskip("langchain_core")
+    # No book is passed, and none is loaded: context mode needs no prices.
+    names = tool_names(build_tools(toolset="context"))
+    assert names == ["fundamentals", "search_news", "ticker_headlines"]
+    assert tool_names(build_tools(toolset="context", allow_web=False)) == [
+        "fundamentals"]
+    with pytest.raises(ValueError):
+        build_tools(toolset="everything")
+
+
+def test_the_context_prompt_only_routes_to_the_research_tools():
+    import re
+
+    from qbs.agent.analyst import system_prompt
+    pytest.importorskip("langchain_core")
+    from qbs.agent.tools import build_tools, tool_names
+    prompt = system_prompt(context="MARKET_CONTEXT\n{}")
+    asked = set(re.findall(r"`([a-z_]+)`", prompt))
+    assert asked == set(tool_names(build_tools(toolset="context")))
+    assert "MARKET_CONTEXT" in prompt and "ANALYSING ONE STOCK" not in prompt
+    assert "must have come back from a tool call" in prompt.lower()
+
+
+def test_market_context_is_an_aggregate_not_the_frame():
+    import json
+
+    from qbs.agent.context import market_context
+    from qbs.agent.market import market_from_book
+    ctx = market_context(market_from_book(_book()))
+    for key in ("analysis_date", "data_as_of", "universe", "sample_size",
+                "breadth", "index_condition", "breadth_trend_5d",
+                "checklist", "sector_leadership", "interpretation_limits"):
+        assert key in ctx, key
+    assert "FALLBACK" in ctx["universe"]
+    assert ctx["checklist"]["automatic_score"] == len(ctx["checklist"]["triggered"])
+    assert any("FedWatch" in x for x in ctx["interpretation_limits"])
+    text = json.dumps(ctx)                   # JSON-safe: no NaN leaks through
+    assert "NaN" not in text and len(text) < 8000
+
+
+def test_stock_context_for_a_constituent_reports_both_books():
+    import json
+
+    from qbs.agent.context import stock_context
+    from qbs.shadow import watchlist_rows
+    book = _book()
+    t = book.universe.columns[3]
+    ctx = stock_context(book, t, watchlist=[t],
+                        held={"normal": [t], "residual": []})
+    assert ctx["membership"] == "Nasdaq-100" and ctx["watchlist"] is True
+    nm, rm = ctx["normal_momentum"], ctx["residual_momentum"]
+    assert "rank" in nm and "placement_rank_against_ndx" not in nm
+    assert nm["currently_held"] is True and rm["currently_held"] is False
+    # The rank is the dashboard's own watchlist placement, not a new one.
+    row = watchlist_rows(book.universe, book.safe, book.universe[[t]],
+                         asof=book.asof)[0]
+    if row["rank"] == row["rank"]:
+        assert nm["rank"] == int(row["rank"])
+    for key in ("trend", "relative", "levels", "last_5_sessions"):
+        assert ctx[key], key
+    assert "NaN" not in json.dumps(ctx)
+
+
+def test_stock_context_marks_a_watchlist_outsider_as_a_placement():
+    from qbs.agent.context import stock_context
+    book = _with_outsider()
+    ctx = stock_context(book, "WATCHME",
+                        held={"normal": ["WATCHME"], "residual": ["WATCHME"]})
+    assert ctx["membership"] == "watchlist_outside_ndx"
+    for blk in (ctx["normal_momentum"], ctx["residual_momentum"]):
+        assert "placement_rank_against_ndx" in blk and "rank" not in blk
+        # Held is False by construction: no book can buy a non-constituent.
+        assert blk["currently_held"] is False
+
+
+def test_stock_context_refuses_a_name_the_dashboard_cannot_chart():
+    from qbs.agent.context import stock_context
+    ctx = stock_context(_book(), "ZZZZ", held={}, ranks={})
+    assert "error" in ctx and "watchlist" in ctx["error"]
+
+
+def test_context_block_labels_both_blocks_and_states_a_missing_one():
+    from qbs.agent.context import context_block
+    text = context_block({"a": 1}, None)
+    assert "MARKET_CONTEXT" in text and "STOCK_CONTEXT" in text
+    assert "not available" in text
+
+
+def test_analyse_with_context_builds_the_context_agent(monkeypatch):
+    from qbs.agent import analyst
+    seen = {}
+
+    def fake_build(**kw):
+        seen.update(kw)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(analyst, "chat_disabled", lambda: None)
+    monkeypatch.setattr(analyst, "build_analyst", fake_build)
+    ans = analyst.analyse("q", context="MARKET_CONTEXT\n{}")
+    assert ans.error == "stop here"
+    assert seen["toolset"] == "context"
+    assert "MARKET_CONTEXT" in seen["system_prompt"]
 
 
 # --------------------------------------------------------------------------
