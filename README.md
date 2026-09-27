@@ -313,6 +313,31 @@ universe (Sharpe 1.33 against 1.41). Pick one.
 
 ---
 
+### 4d. Stop losses — stop the book, not the name
+
+`StopLossParams` adds per-position stops (fixed, trailing, chandelier/ATR,
+and a *residual* stop on the fall the market does not explain) inside the
+ranking loop of both Top-6 books; `drawdown_stop` is the book-level one.
+Full study, two windows and a paired test over 8 `(n_hold, exit_rank)`
+cells: **[`docs/STOP_LOSS.md`](docs/STOP_LOSS.md)**.
+
+| Default window | CAGR | Vol | Max DD | Turnover |
+|---|---|---|---|---|
+| Top-6 momentum, no stop | 48.1% | 49.2% | −40.4% | 21.1× |
+| + trailing 15% per name | 37.7% | 41.0% | −35.8% | 51.8× |
+| + chandelier 3× ATR per name | 40.4% | 40.1% | −37.6% | 86.7× |
+| **+ book drawdown 20%** | **53.9%** | **37.4%** | **−22.0%** | **19.9×** |
+| Top-6 residual, no stop | 68.4% | 39.6% | −34.9% | 14.5× |
+| + trailing 15% per name | 32.2% | 31.7% | −23.6% | 35.2× |
+| + fixed 10% from entry | 60.8% | 36.4% | −26.6% | 25.2× |
+| **+ book drawdown 13%** | **58.2%** | **33.5%** | **−20.4%** | **21.5×** |
+
+Per-name price stops sell ordinary volatility in 50%-vol names and pay for
+it in turnover; across the paired grid they rarely improve Calmar. A
+book-level drawdown stop cuts max drawdown in 16/16 cells for the plain book
+(at 20%) and 13/16 for the residual book (at 13%). All stops are off by
+default; `python run_backtest.py --sweep-stops` prints the table.
+
 ### 5. VIX circuit breaker
 
 A binary risk switch laid over the momentum book. Three states, evaluated each close:

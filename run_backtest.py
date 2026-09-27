@@ -90,6 +90,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--sweep-corr-cap", action="store_true",
                    help="also print the correlation-cap table (read 'Eff. bets' "
                         "and vol, not CAGR)")
+    p.add_argument("--sweep-stops", action="store_true",
+                   help="also print the stop-loss table for the Top-6 and residual "
+                        "books (per-position and book-level; see docs/STOP_LOSS.md)")
     p.add_argument("--synthetic", action="store_true", help="use generated prices, no network")
     p.add_argument("--offline", action="store_true", help="use only the CSV cache")
     p.add_argument("--refresh", action="store_true", help="re-download, ignoring the cache")
@@ -282,6 +285,15 @@ def main(argv=None) -> int:
               "and vol; CAGR is not, which is what noise looks like):")
         with pd.option_context("display.width", 200):
             print(scc.round(4).to_string(index=False))
+
+    if args.sweep_stops and "momentum" in lab.signals:
+        from qbs.pipeline import sweep_stops as _sweep_stops
+        books = [b for b in ("momentum", "resmom") if b in lab.signals]
+        sst = _sweep_stops(lab, books=books)
+        print("\nStop-loss comparison (each row against its own book's 'no stop' "
+              "row; read the paired test in docs/STOP_LOSS.md before any cell):")
+        with pd.option_context("display.width", 250, "display.max_columns", 30):
+            print(sst.iloc[:, :10].round(4).to_string(index=False))
 
     if args.sweep_band and "momentum" in lab.signals:
         sw = sweep_band(lab, n_holds=[cfg.momentum.n_hold],

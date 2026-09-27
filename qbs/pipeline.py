@@ -12,6 +12,7 @@ from .config import (
     BACKTEST_END, BACKTEST_START, Config, INTL_ASSET, RISK_ASSET,
     SAFE_ASSET, STRATEGY_LABELS, VOL_INDEX,
 )
+from .config import StopLossParams  # noqa: F401  (re-exported for sweeps)
 from .data import load_prices, load_vix, synthetic_prices, synthetic_vix
 from .engine import BacktestResult, run_backtest
 from .metrics import format_summary, summarise, summary_table
@@ -506,3 +507,104 @@ def sweep_corr_cap(
             "Book corr": rho, "Eff. bets": n / (1.0 + (n - 1) * rho),
         })
     return pd.DataFrame(rows)
+
+
+def default_stop_variants() -> List["StopLossParams"]:
+    """The stop grid `sweep_stops` runs: every kind, at a spread of distances.
+
+    Deliberately wide. A stop that only works at one distance is a fitted
+    number, not a rule, so the table is read for which *kind* holds up across
+    its own row, not for the best cell.
+    """
+    from .config import StopLossParams as S
+    return (
+        [S()]
+        + [S(kind="fixed", stop_pct=x) for x in (0.10, 0.15, 0.20)]
+        + [S(kind="trailing", stop_pct=x) for x in (0.10, 0.15, 0.20, 0.25)]
+        + [S(kind="chandelier", atr_mult=k) for k in (3.0, 4.0, 5.0, 6.0)]
+        + [S(kind="residual", resid_mult=k) for k in (1.0, 1.5, 2.0, 3.0)]
+    )
+
+
+def stop_signal(lab: Lab, book: str, stop) -> StrategySignals:
+    """Rebuild `book` ("momentum" or "resmom") with a per-position stop."""
+    if lab.combined is None:
+        raise ValueError("run(with_momentum=True) first")
+    cfg = lab.config
+    uni = lab.combined.drop(columns=[SAFE_ASSET])
+    safe, mkt = lab.prices[SAFE_ASSET], lab.prices[RISK_ASSET]
+    if book == "momentum":
+        return cross_sectional_momentum(uni, safe, cfg.momentum, stop=stop,
+                                        market=mkt, name="momentum")
+    if book == "resmom":
+        return residual_momentum(uni, safe, mkt, cfg.resmom, stop=stop,
+                                 name="resmom")
+    raise ValueError(f"unknown book {book!r}")
+
+
+def sweep_stops(
+    lab: Lab,
+    variants: Optional[Sequence] = None,
+    books: Sequence[str] = ("momentum", "resmom"),
+    book_stops: Sequence[float] = (0.10, 0.13, 0.20),
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> pd.DataFrame:
+    """Backtest each book under each per-position stop, plus book-level stops.
+
+    Per-position rows rebuild the book with `StopLossParams` inside the
+    ranking loop. The `book dd` rows lay the existing `drawdown_stop` over the
+    UNSTOPPED book (QQQ leg off), which is the other place a stop can live:
+    on the whole portfolio rather than on a name. Every row goes through the
+    same engine, costs and window, so the rows differ only by the stop.
+
+    Read the `vs none` columns: each stop against its own book's no-stop row.
+    Like `sweep_corr_cap` this ignores point-in-time membership.
+    """
+    from .config import DrawdownStopParams
+
+    cfg = lab.config
+    start = start or cfg.backtest_start
+    end = end or cfg.backtest_end
+    variants = list(variants) if variants is not None else default_stop_variants()
+
+    def _row(book, label, sig, n_stops):
+        res = run_backtest(lab.combined, sig, start=start, end=end,
+                           lag=cfg.execution_lag, cost_bps=cfg.cost_bps,
+                           slippage_bps=cfg.slippage_bps)
+        s = summarise(res, rf=lab.rf)
+        return {
+            "Book": book, "Stop": label,
+            "CAGR": s["CAGR"], "Ann. vol": s["Ann. vol"],
+            "Sharpe": s["Sharpe (vs BOXX)"], "Max drawdown": s["Max drawdown"],
+            "Calmar": s["Calmar"], "Ann. turnover": s["Ann. turnover"],
+            "Avg exposure": s["Avg risk exposure"], "Stops": n_stops,
+        }
+
+    rows = []
+    for book in books:
+        base = None
+        for v in variants:
+            sig = stop_signal(lab, book, v)
+            if not v.enabled:
+                base = sig
+            n = sum(1 for _, e in sig.events.iterrows()
+                    if str(e.get("reason", "")).startswith("stop:")
+                    and (start is None or e["date"] >= pd.Timestamp(start)))
+            rows.append(_row(book, v.label, sig, n))
+        if base is None:
+            base = stop_signal(lab, book, None)
+        for x in book_stops:
+            p = DrawdownStopParams(exit_drawdown=x, qqq_drawdown=0.0)
+            sig = drawdown_stop(base, lab.combined, p, lag=cfg.execution_lag)
+            blocked = sig.diagnostics["blocked"]
+            if start is not None:
+                blocked = blocked[blocked.index >= pd.Timestamp(start)]
+            n = int(((blocked > 0) & (blocked.shift(fill_value=0) == 0)).sum())
+            rows.append(_row(book, f"book dd {x:.0%} (cd {p.cooldown_days})", sig, n))
+
+    df = pd.DataFrame(rows)
+    for col in ("CAGR", "Ann. vol", "Max drawdown", "Calmar", "Ann. turnover"):
+        base_val = df.groupby("Book")[col].transform("first")
+        df[f"{col} vs none"] = df[col] - base_val
+    return df
