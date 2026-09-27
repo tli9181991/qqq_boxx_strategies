@@ -62,7 +62,7 @@ from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
 from qbs.screens import finviz_momentum_screen
 from qbs.candles import HammerRules, hammer_frame, volume_stats
 from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
-                        watchlist_rows)
+                        watchlist_rows, watchlist_stop_levels)
 from qbs.strategies import cross_sectional_momentum, residual_momentum
 from qbs.incremental import persist_fill
 from qbs.universe import UNIVERSE_DIR, load_universe, load_universe_prices
@@ -932,7 +932,8 @@ def names_on(key: str, when) -> list:
 
 def rank_table(rows, n_hold: int, exit_rank: int,
                lead: Optional[Dict[str, Dict[str, str]]] = None,
-               sort: bool = True):
+               sort: bool = True,
+               stops: Optional[Dict[str, Dict]] = None):
     """The watchlist / sector-leaders table, as one Styler.
 
     Two panels show these same seven columns about different sets of names --
@@ -947,6 +948,11 @@ def rank_table(rows, n_hold: int, exit_rank: int,
     `sort=False` keeps the caller's order, which the sector panel needs: it
     groups by sector first and ranks inside it, so a global sort by rank
     would shuffle the groups apart.
+
+    `stops` is `qbs.shadow.watchlist_stop_levels` output. It appends the last
+    close, the trailing high and one stop-price column per distance, each
+    with the last close's room above it; a cell at or below its stop is
+    tinted.
     """
     wf = pd.DataFrame(rows)
     if sort:
@@ -972,6 +978,18 @@ def rank_table(rows, n_hold: int, exit_rank: int,
                                                 for v in wf["band_cutoff"]]
     cols["Beats the book"] = ["✅" if b else "—" for b in wf["beats_book"]]
 
+    breached: Dict[str, list] = {}
+    if stops is not None:
+        lv = [stops.get(t) for t in wf["symbol"]]
+        cols["Last"] = [fmt(x["last"], "{:,.2f}") if x else "—" for x in lv]
+        cols["High (63d)"] = [fmt(x["high"], "{:,.2f}") if x else "—" for x in lv]
+        pcts = sorted({p for x in lv if x for p in x["stops"]})
+        for p in pcts:
+            c = f"SL {p:.0%}"
+            cols[c] = [f"{x['stops'][p]:,.2f} ({x['room'][p]:+.1%})" if x else "—"
+                       for x in lv]
+            breached[c] = [bool(x and x["room"][p] <= 0) for x in lv]
+
     show = pd.DataFrame(cols)
     beats = list(wf["beats_book"])
     # The tint is on the rank cell only: it is the one number the row is
@@ -979,6 +997,11 @@ def rank_table(rows, n_hold: int, exit_rank: int,
     styler = show.style.apply(
         lambda _col: [f"background-color: {UP}" if b else "" for b in beats],
         subset=["Rank"])
+    for c, hit in breached.items():
+        styler = styler.apply(
+            lambda _col, hit=hit: [f"background-color: {DN}" if h else ""
+                                   for h in hit],
+            subset=[c])
     return styler, show, wf
 
 
@@ -1633,7 +1656,9 @@ with tab_picks:
         if not rows:
             st.info("Nothing on the watchlist could be ranked on this date.")
         else:
-            styler, show_w, wf = rank_table(rows, int(n_hold), int(exit_rank))
+            styler, show_w, wf = rank_table(
+                rows, int(n_hold), int(exit_rank),
+                stops=watchlist_stop_levels(WATCH_FRAME, asof=asof))
             st.dataframe(styler, hide_index=True, width="stretch",
                          height=min(420, 38 + 35 * len(show_w)))
             n_out = int((~wf["constituent"]).sum())
@@ -1660,7 +1685,11 @@ with tab_picks:
                 + outsider_note
                 + " A blank rank means the name was filtered out (too little "
                 "history, or it lost to BOXX over the same window), not that "
-                "it placed last."))
+                "it placed last. *SL 13%* / *SL 20%* are the book drawdown "
+                "stops' distances applied to the name: its highest close over "
+                "the last 63 sessions × 0.87 / × 0.80, with the last close's "
+                "room above it in brackets (red at or below). Reference "
+                "levels only — the book runs no per-name stop."))
 
     st.divider()
     st.markdown("#### Selection history")
