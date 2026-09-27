@@ -23,7 +23,7 @@ import pandas as pd
 from .config import (
     BookVolTargetParams, DrawdownStopParams, EXECUTION_LAG, GEMParams,
     MomentumParams, RSI2Params, ResidualMomentumParams, SAFE_ASSET,
-    TRADING_DAYS, VixBreakerParams, VolTargetParams,
+    StopLossParams, TRADING_DAYS, VixBreakerParams, VolTargetParams,
 )
 from .indicators import realized_vol, sma, total_return, wilder_rsi
 
@@ -327,6 +327,47 @@ def vol_target_overlay(
 # 4. Top-N cross-sectional momentum (Nasdaq-100) with a hysteresis band
 # ==========================================================================
 
+def stop_inputs(
+    universe_prices: pd.DataFrame,
+    params: StopLossParams,
+    market: Optional[pd.Series] = None,
+) -> tuple:
+    """The two frames a per-position stop reads: `(level, dist)`.
+
+    level  date x ticker series whose fall from its reference is measured --
+           the close itself, or for ``residual`` a wealth index built from the
+           returns the market does not explain.
+    dist   date x ticker allowed fall, as a fraction of the reference, read on
+           the day it is checked (a chandelier's ATR moves with the tape).
+
+    Both are strictly causal: every row uses returns up to and including that
+    date and nothing later, and the engine lags the resulting weights again.
+    """
+    px = universe_prices.sort_index()
+    p = params
+    if p.kind in ("fixed", "trailing"):
+        dist = pd.DataFrame(p.stop_pct, index=px.index, columns=px.columns)
+        return px, dist
+    if p.kind == "chandelier":
+        # Close-only ATR: the cache has no highs or lows. See StopLossParams.
+        atr = px.diff().abs().rolling(p.atr_window, min_periods=p.atr_window // 2).mean()
+        return px, (p.atr_mult * atr / px).clip(upper=0.95)
+    if p.kind == "residual":
+        if market is None:
+            raise ValueError("a residual stop needs the market series")
+        r = px.pct_change()
+        rm = market.reindex(px.index).ffill().pct_change()
+        half = max(2, p.beta_window // 2)
+        var_m = rm.rolling(p.beta_window, min_periods=half).var()
+        beta = r.rolling(p.beta_window, min_periods=half).cov(rm).div(var_m, axis=0)
+        resid = r.sub(beta.mul(rm, axis=0))
+        level = (1.0 + resid.fillna(0.0)).cumprod()
+        sd = resid.rolling(p.resid_window, min_periods=p.resid_window // 2).std()
+        dist = (p.resid_mult * sd * np.sqrt(p.resid_horizon)).clip(upper=0.95)
+        return level, dist
+    raise ValueError(f"no stop inputs for kind {p.kind!r}")
+
+
 def cross_sectional_momentum(
     universe_prices: pd.DataFrame,
     safe_prices: pd.Series,
@@ -335,6 +376,8 @@ def cross_sectional_momentum(
     record_ranks: int = 0,
     score: Optional[pd.DataFrame] = None,
     name: str = "momentum",
+    stop: Optional[StopLossParams] = None,
+    market: Optional[pd.Series] = None,
 ) -> StrategySignals:
     """Rank the universe by 6-1 momentum, hold the top N, exit on a band.
 
@@ -359,6 +402,10 @@ def cross_sectional_momentum(
                       can be scored by the one loop the live book uses, rather
                       than by a second copy of it that would drift. None ranks
                       on momentum and is bit-identical to not passing it.
+    stop            : a per-position stop (`StopLossParams`), checked on every
+                      close before the ranking is consulted. None or kind
+                      "off" is bit-identical to not passing it.
+    market          : the market series, needed only by the residual stop.
 
     The momentum measure
     --------------------
@@ -443,6 +490,18 @@ def cross_sectional_momentum(
         rebal_dates = [d for d in marks if d in px.index]
 
     rebal_set = set(rebal_dates)
+
+    # ---- per-position stop state ----------------------------------------
+    use_stop = stop is not None and stop.enabled
+    if use_stop:
+        stop_level, stop_dist = stop_inputs(px, stop, market)
+        lvl_arr = stop_level.to_numpy()
+        dist_arr = stop_dist.to_numpy()
+        col_ix = {c: i for i, c in enumerate(px.columns)}
+    ref: Dict[str, float] = {}           # entry level, or high-water mark since entry
+    barred_until: Dict[str, int] = {}    # ticker -> first row it may be bought again
+    n_stops = 0
+
     assets = list(px.columns) + [p.safe_asset]
     weights = pd.DataFrame(0.0, index=px.index, columns=assets)
 
@@ -453,7 +512,34 @@ def cross_sectional_momentum(
     rank_log: Dict[pd.Timestamp, List[tuple]] = {}
     n_cash_slots: Dict[pd.Timestamp, int] = {}
 
-    for dt in px.index:
+    for i_dt, dt in enumerate(px.index):
+        if use_stop and held:
+            # Checked on the close, before the ranking: a name stopped today
+            # is sold today and is not eligible to be re-picked below.
+            for t in list(held):
+                j = col_ix[t]
+                lvl = lvl_arr[i_dt, j]
+                if np.isnan(lvl):
+                    continue
+                if stop.kind != "fixed":
+                    ref[t] = max(ref.get(t, lvl), lvl)
+                r0 = ref.get(t, lvl)
+                d = dist_arr[i_dt, j]
+                if np.isnan(d) or r0 <= 0:
+                    continue
+                fall = lvl / r0 - 1.0
+                if fall <= -d:
+                    held.remove(t)
+                    ref.pop(t, None)
+                    barred_until[t] = i_dt + 1 + int(stop.cooldown_days)
+                    n_stops += 1
+                    events.append(dict(
+                        date=dt, action="sell", asset=t,
+                        price=float(px.at[dt, t]),
+                        reason=f"stop: {stop.kind} fall {fall:+.1%} past -{d:.1%}",
+                        rank=np.nan, score=float(ranker.at[dt, t]),
+                    ))
+
         if dt in rebal_set:
             row = ranker.loc[dt]
             ok = rankable.loc[dt]
@@ -474,6 +560,15 @@ def cross_sectional_momentum(
             order = cand.sort_values(ascending=False)
             rank = pd.Series(np.arange(1, len(order) + 1), index=order.index)
 
+            # Names inside a stop's cooldown keep their place in the ranking --
+            # removing them would promote everything below -- but may not be
+            # bought. Without `refill`, each one the band would still have
+            # held keeps its slot in the safe asset instead of passing it on.
+            barred = {t for t, until in barred_until.items() if i_dt < until}
+            slots = p.n_hold
+            if use_stop and not stop.refill:
+                slots -= sum(1 for t in barred if rank.get(t, np.inf) <= p.exit_rank)
+
             keep = [t for t in held if rank.get(t, np.inf) <= p.exit_rank]
             for t in held:
                 if t not in keep:
@@ -493,7 +588,7 @@ def cross_sectional_momentum(
             # rebalance over the top `corr_pool` candidates -- not per
             # candidate, and never over the whole universe.
             cmat = None
-            if corr_rets is not None and len(keep) < p.n_hold:
+            if corr_rets is not None and len(keep) < slots:
                 # The pool is the candidates a slot may reach PLUS whatever is
                 # already held. A name kept by the band can sit below
                 # `corr_pool` in the ranking, and leaving it out would let a
@@ -506,9 +601,9 @@ def cross_sectional_momentum(
                         cmat = win.corr()
 
             for t in order.index:
-                if len(keep) >= p.n_hold:
+                if len(keep) >= slots:
                     break
-                if t in keep:
+                if t in keep or t in barred:
                     continue
                 if cmat is not None and t in cmat.index:
                     # Reject a name too close to something already chosen.
@@ -526,6 +621,9 @@ def cross_sectional_momentum(
                     if too_close is not None:
                         continue
                 keep.append(t)
+                if use_stop:
+                    # The stop's reference starts at the close it was bought on.
+                    ref[t] = lvl_arr[i_dt, col_ix[t]]
                 events.append(dict(
                     date=dt, action="buy", asset=t, price=float(px.at[dt, t]),
                     # The label names the actual lookback, so changing the
@@ -541,6 +639,10 @@ def cross_sectional_momentum(
                     rank=float(rank[t]),
                     score=float(order[t]),
                 ))
+            if use_stop:
+                for t in held:
+                    if t not in keep:
+                        ref.pop(t, None)
             held = keep
             # The rank each held name survived at, recorded where it is known
             # exactly. Recomputing this outside the loop would mean redoing the
@@ -585,7 +687,11 @@ def cross_sectional_momentum(
     })
 
     ev = pd.DataFrame(events) if events else _empty_events()
-    sig = StrategySignals(name, weights, diagnostics, ev, params=p.__dict__.copy())
+    params_out = p.__dict__.copy()
+    if use_stop:
+        params_out["stop"] = stop.__dict__.copy()
+        params_out["n_stops"] = n_stops
+    sig = StrategySignals(name, weights, diagnostics, ev, params=params_out)
     sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
     sig.holdings_log = holdings_log
     sig.held_ranks = held_ranks
@@ -660,6 +766,7 @@ def residual_momentum(
     params: Optional[ResidualMomentumParams] = None,
     eligible: Optional[pd.DataFrame] = None,
     name: str = "resmom",
+    stop: Optional[StopLossParams] = None,
 ) -> StrategySignals:
     """The Top-N book, ranked on residual rather than total momentum.
 
@@ -694,9 +801,10 @@ def residual_momentum(
     )
     sig = cross_sectional_momentum(
         universe_prices, safe_prices, mp, eligible=eligible, name=name,
-        score=score,
+        score=score, stop=stop, market=market,
     )
-    sig.params = p.__dict__.copy()
+    extra = {k: sig.params[k] for k in ("stop", "n_stops") if k in sig.params}
+    sig.params = {**p.__dict__, **extra}
     return sig
 
 

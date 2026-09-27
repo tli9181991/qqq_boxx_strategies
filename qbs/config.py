@@ -394,6 +394,89 @@ class DrawdownStopParams:
 
 
 @dataclass
+class StopLossParams:
+    """A per-position stop inside the Top-N books, checked on every close.
+
+    `DrawdownStopParams` stops the whole BOOK; this stops one NAME. It sits
+    inside the ranking loop rather than on top of it, because only there can
+    a stopped name be kept out of the next day's ranking -- an overlay would
+    zero the name and the ranker would buy it straight back.
+
+    The stop distance is where the kinds differ, and the distance is the
+    thing being estimated:
+
+    ==============  ============================  ===========================
+    kind            reference level               distance
+    ==============  ============================  ===========================
+    ``fixed``       entry close                   ``stop_pct``
+    ``trailing``    highest close since entry     ``stop_pct``
+    ``chandelier``  highest close since entry     ``atr_mult`` x close-ATR / price
+    ``residual``    peak of the name's RESIDUAL   ``resid_mult`` x residual
+                    wealth since entry            sigma x sqrt(``resid_horizon``)
+    ==============  ============================  ===========================
+
+    ``chandelier`` scales the distance to each name's own volatility, so a
+    60%-vol semiconductor and a 20%-vol staple are stopped at the same number
+    of *typical moves*, not the same percentage. The ATR is built from closes
+    alone (mean absolute close-to-close change) because the cache holds no
+    highs and lows. It runs below a true-range ATR (no intraday range), so a
+    given multiple here is a little tighter than the textbook one.
+
+    ``residual`` measures the fall the market does NOT explain -- the return
+    minus beta times QQQ, as in the residual-momentum ranker. A name that
+    drops 12% on a day QQQ drops 7% at a beta of 1.7 has not failed; a name
+    that drops 12% on a flat day has. It is the stop that asks the same
+    question the residual book was built to ask.
+
+    What happens to the freed slot is ``refill``: True hands it to the next
+    name in the ranking the same day, False leaves it in the safe asset for
+    as long as the stopped name would otherwise still have been held (in the
+    band, inside its cooldown). ``cooldown_days`` bars the stopped name from
+    being bought back; without it a daily-rebalanced book re-buys a name that
+    is still top-ranked on the very next close.
+
+    Read `docs/STOP_LOSS.md` before switching one on: most variants measured
+    there make the book WORSE, and the ones that help are specific.
+    """
+    kind: str = "off"             # "off" | "fixed" | "trailing" | "chandelier" | "residual"
+    stop_pct: float = 0.15        # fixed / trailing distance, as a fraction
+    atr_mult: float = 3.0         # chandelier: multiples of the close-ATR
+    atr_window: int = 20
+    resid_mult: float = 2.0       # residual: multiples of the horizon residual vol
+    resid_horizon: int = 21       # trading days the residual sigma is scaled to
+    resid_window: int = 63        # days behind the residual sigma estimate
+    beta_window: int = 252        # days behind the residual stop's beta
+    cooldown_days: int = 21       # sessions a stopped name may not be re-bought
+    refill: bool = True           # freed slot -> next ranked name (True) or cash
+
+    KINDS = ("off", "fixed", "trailing", "chandelier", "residual")
+
+    def __post_init__(self):
+        if self.kind not in self.KINDS:
+            raise ValueError(f"kind must be one of {self.KINDS}, got {self.kind!r}")
+        if not 0.0 < self.stop_pct < 1.0:
+            raise ValueError("stop_pct must be in (0, 1)")
+        if self.atr_mult <= 0 or self.resid_mult <= 0:
+            raise ValueError("stop multiples must be positive")
+        if self.cooldown_days < 0:
+            raise ValueError("cooldown_days must not be negative")
+
+    @property
+    def enabled(self) -> bool:
+        return self.kind != "off"
+
+    @property
+    def label(self) -> str:
+        if self.kind == "off":
+            return "no stop"
+        dist = {"fixed": f"{self.stop_pct:.0%}", "trailing": f"{self.stop_pct:.0%}",
+                "chandelier": f"{self.atr_mult:g}x ATR{self.atr_window}",
+                "residual": f"{self.resid_mult:g}x resid sigma"}[self.kind]
+        tail = "" if self.refill else ", slot->cash"
+        return f"{self.kind} {dist} (cd {self.cooldown_days}{tail})"
+
+
+@dataclass
 class BookVolTargetParams:
     """Volatility targeting applied to a WHOLE book, on its own realised vol.
 
