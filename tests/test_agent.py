@@ -1176,17 +1176,22 @@ def test_context_mode_hands_the_model_only_the_research_tools():
         build_tools(toolset="everything")
 
 
-def test_the_context_prompt_only_routes_to_the_research_tools():
+def test_the_context_prompt_only_routes_to_the_context_tools():
     import re
 
     from qbs.agent.analyst import system_prompt
+    from qbs.agent.context import NOT_IN_FOCUS_MESSAGE
     pytest.importorskip("langchain_core")
     from qbs.agent.tools import build_tools, tool_names
     prompt = system_prompt(context="MARKET_CONTEXT\n{}")
     asked = set(re.findall(r"`([a-z_]+)`", prompt))
-    assert asked == set(tool_names(build_tools(toolset="context")))
+    tools = tool_names(build_tools(toolset="context", stock_lookup=lambda t: {}))
+    assert tools[0] == "stock_data"
+    assert asked == set(tools)
     assert "MARKET_CONTEXT" in prompt and "ANALYSING ONE STOCK" not in prompt
     assert "must have come back from a tool call" in prompt.lower()
+    # The refusal is quoted word for word, from the one constant.
+    assert NOT_IN_FOCUS_MESSAGE in prompt
 
 
 def test_market_context_is_an_aggregate_not_the_frame():
@@ -1247,11 +1252,90 @@ def test_stock_context_refuses_a_name_the_dashboard_cannot_chart():
     assert "error" in ctx and "watchlist" in ctx["error"]
 
 
-def test_context_block_labels_both_blocks_and_states_a_missing_one():
+def test_context_block_carries_the_market_and_a_stock_only_if_given():
     from qbs.agent.context import context_block
-    text = context_block({"a": 1}, None)
-    assert "MARKET_CONTEXT" in text and "STOCK_CONTEXT" in text
-    assert "not available" in text
+    text = context_block({"a": 1})
+    assert "MARKET_CONTEXT" in text and "STOCK_CONTEXT" not in text
+    assert "STOCK_CONTEXT" in context_block({"a": 1}, {"b": 2})
+    assert "not available" in context_block(None)
+
+
+def test_focus_lookup_covers_constituents_and_the_watchlist_only():
+    from qbs.agent.context import NOT_IN_FOCUS_MESSAGE, focus_lookup
+    book = _with_outsider()
+    built = []
+
+    def build(t):
+        built.append(t)
+        return {"ticker": t}
+
+    member = book.universe.columns[2]
+    assert focus_lookup(book, f" ${member.lower()} ", build=build)[
+        "in_focus_list"] is True
+    assert focus_lookup(book, "WATCHME", watchlist=["WATCHME"],
+                        build=build)["in_focus_list"] is True
+    out = focus_lookup(book, "ZZZZ", build=build)
+    assert out == {"ticker": "ZZZZ", "in_focus_list": False,
+                   "message": NOT_IN_FOCUS_MESSAGE}
+    # Nothing is computed for a name outside the list.
+    assert built == [member, "WATCHME"]
+
+
+def test_a_watched_name_without_prices_is_not_told_to_join_the_watchlist():
+    from qbs.agent.context import focus_lookup
+    out = focus_lookup(_book(), "NOPX", watchlist=["nopx"])
+    assert out["in_focus_list"] is True and "no prices" in out["error"]
+
+
+def test_the_stock_data_tool_relays_the_refusal_word_for_word():
+    pytest.importorskip("langchain_core")
+    from qbs.agent.context import NOT_IN_FOCUS_MESSAGE, focus_lookup
+    from qbs.agent.tools import build_tools
+    book = _book()
+    member = book.universe.columns[0]
+    tools = {t.name: t for t in build_tools(
+        toolset="context", allow_web=False,
+        stock_lookup=lambda t: focus_lookup(
+            book, t, build=lambda x: {"ticker": x, "membership": "Nasdaq-100"}))}
+    assert set(tools) == {"stock_data", "fundamentals"}
+    ok = tools["stock_data"].invoke({"ticker": member})
+    assert ok.startswith("STOCK_CONTEXT") and member in ok
+    no = tools["stock_data"].invoke({"ticker": "ZZZZ"})
+    assert "NOT IN FOCUS LIST" in no and NOT_IN_FOCUS_MESSAGE in no
+
+
+def test_the_chat_follows_whichever_stock_the_user_names():
+    """"tell me about A", then "how about B", then a name outside the list --
+    through the real agent loop with a scripted model."""
+    pytest.importorskip("langchain")
+    from langchain.agents import create_agent
+    from langchain_core.messages import AIMessage
+    from qbs.agent.analyst import _tool_calls, system_prompt
+    from qbs.agent.context import (NOT_IN_FOCUS_MESSAGE, context_block,
+                                   focus_lookup, stock_context)
+    from qbs.agent.tools import build_tools
+
+    book = _with_outsider()
+    a = book.universe.columns[1]
+    tools = build_tools(
+        toolset="context", allow_web=False,
+        stock_lookup=lambda t: focus_lookup(
+            book, t, watchlist=["WATCHME"],
+            build=lambda x: stock_context(book, x, watchlist=["WATCHME"],
+                                          held={}, ranks={})))
+    prompt = system_prompt(context=context_block({"breadth": {}}))
+    for ticker, expect in ((a, '"membership":"Nasdaq-100"'),
+                           ("WATCHME", "watchlist_outside_ndx"),
+                           ("ZZZZ", NOT_IN_FOCUS_MESSAGE)):
+        model = _scripted([
+            AIMessage(content="", tool_calls=[
+                {"name": "stock_data", "args": {"ticker": ticker}, "id": "c1"}]),
+            AIMessage(content="summary"),
+        ])
+        state = create_agent(model, tools, system_prompt=prompt).invoke(
+            {"messages": [{"role": "user", "content": f"tell me about {ticker}"}]})
+        call = _tool_calls(state)[0]
+        assert call["name"] == "stock_data" and expect in call["result"], ticker
 
 
 def test_analyse_with_context_builds_the_context_agent(monkeypatch):
@@ -1264,9 +1348,11 @@ def test_analyse_with_context_builds_the_context_agent(monkeypatch):
 
     monkeypatch.setattr(analyst, "chat_disabled", lambda: None)
     monkeypatch.setattr(analyst, "build_analyst", fake_build)
-    ans = analyst.analyse("q", context="MARKET_CONTEXT\n{}")
+    lookup = lambda t: {}                   # noqa: E731
+    ans = analyst.analyse("q", context="MARKET_CONTEXT\n{}",
+                          stock_lookup=lookup)
     assert ans.error == "stop here"
-    assert seen["toolset"] == "context"
+    assert seen["toolset"] == "context" and seen["stock_lookup"] is lookup
     assert "MARKET_CONTEXT" in seen["system_prompt"]
 
 

@@ -1450,33 +1450,39 @@ any of these — a rerun alone will not pick it up.
 | `market_news` | the News tab's feed for the last N hours, plus that tab's cached model read |
 
 That is the full tool set, used by the CLI. **The dashboard's chat works differently:**
-what the dashboard has already computed goes to the model up front, as two JSON
-aggregates in the system prompt (`qbs/agent/context.py`):
+the user names the stock to discuss, and the dashboard's own numbers answer
+(`qbs/agent/context.py`):
 
 ```
-Market overview (~2,400 US names) ─→ MARKET_CONTEXT ─┐
-NDX + watchlist closes            ─→ STOCK_CONTEXT  ─┼─→ Gemini
-fundamentals / news tools         ───────────────────┘
+Market overview (~2,400 US names) ─→ MARKET_CONTEXT (in the prompt) ─┐
+"tell me about MRVL" ─→ stock_data("MRVL") ─→ STOCK_CONTEXT ─────────┼─→ Gemini
+fundamentals / news tools ───────────────────────────────────────────┘
 ```
 
-- **MARKET_CONTEXT** — breadth (4% movers, % above the 20/50-day, leaders), SPY/QQQ
-  stretch in ATR, the 5- and 20-session breadth trend, the checklist (score and which
-  rows fired), sector leadership, and the limits of the reading. Aggregates only; the
-  2,400-name frame never reaches the model. On the Nasdaq-100 fallback it says so.
-- **STOCK_CONTEXT** — only for the name on the chart, which is a Nasdaq-100 constituent
-  or a watchlist name: membership, **normal and residual momentum** (score, rank, held
-  by the book or not), trend vs the EMAs and SMA 200, returns vs QQQ/SPY, market
-  percentile, nearest levels, volume. A watchlist name outside the index is
-  `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx` and
-  `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
-- **Tools: only `fundamentals`, `ticker_headlines` and `search_news`.** "Why do AMD's
-  normal and residual momentum differ?" is answered from the context with no call;
+- **MARKET_CONTEXT** — sent with every message: breadth (4% movers, % above the
+  20/50-day, leaders), SPY/QQQ stretch in ATR, the 5- and 20-session breadth trend,
+  the checklist (score and which rows fired), sector leadership, and the limits of the
+  reading. Aggregates only; the 2,400-name frame never reaches the model. On the
+  Nasdaq-100 fallback it says so.
+- **`stock_data(ticker)`** — called for whichever stock the user names ("tell me
+  about MRVL", then "how about TSM?"): membership, **normal and residual momentum**
+  (score, rank, held by the book or not), trend vs the EMAs and SMA 200, returns vs
+  QQQ/SPY, market percentile, nearest levels, volume. A watchlist name outside the
+  index is `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx`
+  and `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
+- **The focus list is the dashboard's tables** — the Nasdaq-100 constituents and the
+  watchlist. Any other name gets, word for word: *"The stock is not in our focused
+  list, please add it to watchlist for analysis."* A watched name whose prices could
+  not be loaded is told so instead.
+- **Other tools: `fundamentals`, `ticker_headlines`, `search_news`**, used only when
+  the question needs them. "Tell me about AMD" is answered from the dashboard's data;
   "is AMD's rise about earnings or AI news?" calls fundamentals and news.
 
-Both contexts are folded under every answer so each figure can be checked. The tab
-always reads the latest bar. **📊 Analyse &lt;ticker&gt;** asks for the full read, ending
-in a stance (constructive / neutral / cautious) with the evidence for and against it
-and what would change it — never a position size or a "buy now".
+The market context and every `stock_data` call are folded under each answer so each
+figure can be checked. The tab always reads the latest bar. **📊 Analyse
+&lt;ticker&gt;** asks for the full read of the charted name, ending in a stance
+(constructive / neutral / cautious) with the evidence for and against it and what
+would change it — never a position size or a "buy now".
 
 Without an LLM: `python -m qbs.agent --report context --ticker MU` prints the two
 blocks, and `--report price` / `--report market` what the full tools return.

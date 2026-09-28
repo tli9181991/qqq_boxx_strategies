@@ -191,19 +191,38 @@ rather than filling it in.
 
 CONTEXT_PROCEDURE = """\
 DASHBOARD CONTEXT
-The dashboard has already computed two JSON blocks, below: MARKET_CONTEXT
-(an aggregate of the US market universe) and STOCK_CONTEXT (the name on the
-chart). They are this lab's own numbers -- treat them exactly as tool
-output. Answer from them directly and do NOT call a tool for anything they
-contain; e.g. "why do its normal and residual momentum ranks differ?" needs
-no tool call at all.
+The user chooses which stock to discuss by naming it. The dashboard has
+already computed the market, below as MARKET_CONTEXT (an aggregate of the
+US market universe), and computes any stock it covers on request through
+`stock_data`. Both are this lab's own numbers -- treat them exactly as tool
+output.
 
-Your only tools reach outside the dashboard: `fundamentals` for valuation,
+Which stock:
+- When the user names a stock -- a ticker, or a company you can map to its
+  ticker ("Marvell" is MRVL) -- call `stock_data` with the ticker. Call it
+  again for each new stock ("how about TSM?"), and again when you need a
+  stock's numbers a second time: earlier results are not kept.
+- A follow-up with no stock named ("and its volume?") means the stock the
+  conversation is about. If no stock has been named at all, ask which one.
+- If `stock_data` reports a stock NOT IN FOCUS LIST, reply with exactly
+  this sentence and nothing else, and call no other tool for it:
+  {not_in_focus}
+- A question about the market as a whole needs no stock: answer from
+  MARKET_CONTEXT.
+
+"Tell me about X": summarise the dashboard's data on X -- where it stands
+in both momentum books, its trend and levels, recent performance against
+QQQ and the market, volume -- and place it against the market backdrop in
+a line or two. Answer from the data; do not call the news or fundamentals
+tools unless the user asks why, asks about news, earnings or valuation, or
+asks for a full analysis or a suggestion.
+
+Your other tools reach outside the dashboard: `fundamentals` for valuation,
 margins, growth and earnings; `ticker_headlines` for the company's recent
 news, and `search_news` when those are thin or the question is broader
 (e.g. "is the rise linked to earnings or AI news?" needs both kinds).
 
-Reading STOCK_CONTEXT:
+Reading a stock_data result:
 - "membership" "watchlist_outside_ndx" means the name is NOT a Nasdaq-100
   constituent. Its "placement_rank_against_ndx" is where it WOULD rank among
   the constituents, and no book can hold it. Never call it a constituent or
@@ -226,7 +245,7 @@ whether leadership is concentrated ("sector_leadership",
 "top3_sector_concentration_pct"). Respect "interpretation_limits" and
 "sessions_behind", and say which date the data stands on.
 
-For a full analysis of the stock, call `ticker_headlines` (and
+For a full analysis or a suggestion, also call `ticker_headlines` (and
 `search_news` if those are thin) for catalysts, `fundamentals` only when
 valuation or earnings matter, then write in this order: a one-line verdict;
 Recent performance (a small table); Trend and levels; Momentum in both
@@ -255,7 +274,10 @@ def system_prompt(momentum: Optional[Any] = None,
     base = SYSTEM_PROMPT_TEMPLATE.replace("{momentum}", momentum_label(momentum))
     if context is None:
         return base.replace("{procedure}", TOOL_PROCEDURE)
-    return (base.replace("{procedure}", CONTEXT_PROCEDURE)
+    from .context import NOT_IN_FOCUS_MESSAGE
+
+    procedure = CONTEXT_PROCEDURE.replace("{not_in_focus}", NOT_IN_FOCUS_MESSAGE)
+    return (base.replace("{procedure}", procedure)
             + "\n" + context.strip() + "\n")
 
 
@@ -397,9 +419,10 @@ def analyse(
     """Ask the analyst one question. Returns an `Answer`, never raises.
 
     `context` is pre-computed dashboard context (see `qbs.agent.context`,
-    `context_block`). With it the prompt carries the numbers and the model
-    gets only the research tools -- fundamentals and news; without it the
-    model fetches everything through the full tool set.
+    `context_block`). With it the prompt carries the market, and the model
+    gets `stock_data` (when a `stock_lookup` is passed) plus the research
+    tools -- fundamentals and news; without it the model fetches everything
+    through the full tool set.
 
     Failures come back in `Answer.error` with the text explaining what went
     wrong, because the callers are a CLI and a Streamlit tab and both want to
