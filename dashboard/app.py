@@ -316,12 +316,19 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
 
     for key, sig in (("momentum", mom), ("resmom", res), ("finviz", fin)):
         ev = sig.events
+        ranks = getattr(sig, "held_ranks", None) or {}
         rows = []
         for d, names in sig.holdings_log.items():
             day = ev[ev["date"] == d] if not ev.empty else ev
+            r = ranks.get(d, {})
             rows.append({
                 "date": d,
                 "holdings": ", ".join(names),
+                # Each held name's rank that day, in the same order -- the
+                # band keeps names past the top n_hold, so "held" and "top"
+                # are not the same list.
+                "ranks": ", ".join("" if pd.isna(r.get(t, np.nan))
+                                   else f"{r[t]:.0f}" for t in names),
                 "n": len(names),
                 "buys": ", ".join(day.loc[day["action"] == "buy", "asset"]) if len(day) else "",
                 "sells": ", ".join(day.loc[day["action"] == "sell", "asset"]) if len(day) else "",
@@ -928,6 +935,26 @@ def names_on(key: str, when) -> list:
         return []
     raw = frame.loc[when, "holdings"]
     return [t for t in str(raw).split(", ") if t]
+
+
+# How many of each book's names the volume & candles table lists.
+CANDLE_TOP_N = 6
+
+
+def top_held(key: str, when, n: int) -> list:
+    """The `n` best-ranked names `key`'s book held on `when`, best first.
+
+    From the ranks recorded beside the holdings; a name with no rank sorts
+    last rather than being dropped.
+    """
+    frame = selections.get(key)
+    if frame is None or when not in frame.index:
+        return []
+    names = [t for t in str(frame.loc[when, "holdings"]).split(", ") if t]
+    raw = str(frame.loc[when, "ranks"]) if "ranks" in frame.columns else ""
+    ranks = [float(x) if x else float("inf") for x in raw.split(", ")] if raw else []
+    ranks += [float("inf")] * (len(names) - len(ranks))
+    return [t for _, t in sorted(zip(ranks, names), key=lambda p: p[0])][:n]
 
 
 def rank_table(rows, n_hold: int, exit_rank: int,
@@ -1566,11 +1593,11 @@ with tab_picks:
     st.divider()
     st.markdown("#### Volume & hammer candles")
     held_by: Dict[str, str] = {}
-    for key in books:
-        for t in sorted(picks[key]):
+    for key in ("momentum", "resmom"):
+        for t in top_held(key, asof, CANDLE_TOP_N):
             held_by[t] = (held_by[t] + ", " if t in held_by else "") + SHORT[key]
     for t in WATCHLIST:
-        held_by.setdefault(t, "watchlist")
+        held_by[t] = (held_by[t] + ", " if t in held_by else "") + "watchlist"
     cand_names = list(held_by)
     if not cand_names:
         st.caption("No held or watched names on this date.")
@@ -1603,6 +1630,9 @@ with tab_picks:
         st.dataframe(cstyle, hide_index=True, width="stretch",
                      height=min(620, 38 + 35 * len(ctab)))
         st.caption(md(
+            f"Listed: the **{CANDLE_TOP_N} best-ranked names** held by the "
+            f"{STRATEGY_LABELS['momentum']} and {STRATEGY_LABELS['resmom']} "
+            "books on this date, and the watchlist. "
             f"Last session's volume against the average of the **{int(vwin)} "
             "sessions before it** (the last one excluded), and the ratio of the "
             "two; *Avg $ vol* is close × shares over the same window. "
@@ -1698,7 +1728,7 @@ with tab_picks:
                      horizontal=True, key="hist")
     hist = selections[which].loc[selections[which].index <= asof].tail(120).iloc[::-1]
     show = hist.reset_index().rename(columns={
-        "date": "Date", "holdings": "Holdings", "n": "N",
+        "date": "Date", "holdings": "Holdings", "ranks": "Ranks", "n": "N",
         "buys": "Bought", "sells": "Sold"})
     show["Date"] = show["Date"].dt.strftime("%Y-%m-%d")
     st.dataframe(show, hide_index=True, width="stretch", height=460)
