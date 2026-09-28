@@ -88,6 +88,9 @@ PAIRED = [
     StopLossParams(kind="chandelier", atr_mult=6.0),
     StopLossParams(kind="residual", resid_mult=1.0),
     StopLossParams(kind="residual", resid_mult=2.0),
+    StopLossParams(kind="support", support_atr_mult=0.5),
+    StopLossParams(kind="support", support_atr_mult=1.0),
+    StopLossParams(kind="support", support_atr_mult=2.0),
 ]
 CELLS = [(4, 6), (4, 8), (6, 8), (6, 10), (6, 12), (8, 10), (8, 12), (8, 14)]
 
@@ -145,8 +148,16 @@ def main(argv=None):
             for cd in (5, 21, 63):
                 for refill in (True, False):
                     extra.append(StopLossParams(cooldown_days=cd, refill=refill, **kind_kw))
+        # The support stop's own dials: how strict a swing low is, how far
+        # back one may be.
+        for k in (3, 10):
+            extra.append(StopLossParams(kind="support", support_atr_mult=1.0,
+                                        support_pivot=k))
+        for lb in (63, 252):
+            extra.append(StopLossParams(kind="support", support_atr_mult=1.0,
+                                        support_lookback=lb))
         dc = sweep_stops(lab, variants=[StopLossParams()] + extra, book_stops=())
-        parts.append(f"### {window}: cooldown and refill\n")
+        parts.append(f"### {window}: cooldown, refill and support-stop dials\n")
         parts.append(fmt(dc[cols]) + "\n")
 
         if not a.quick:

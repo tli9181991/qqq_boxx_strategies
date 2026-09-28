@@ -38,6 +38,7 @@ differently, and would be *worse* on gap-downs.
 | `trailing` | highest close since entry | fixed % (10 / 15 / 20 / 25) |
 | `chandelier` | highest close since entry | k × 20-day close-ATR (k = 3 / 4 / 5 / 6) — vol-scaled per name |
 | `residual` | peak of the name's residual wealth (return − β·QQQ, 252-day β) | k × 63-day residual σ × √21 (k = 1 / 1.5 / 2 / 3) |
+| `support` | highest confirmed swing low below the close (5-bar pivot, last 126 days), ratcheted up only | that level − m × 20-day close-ATR (m = 0 / 0.5 / 1 / 2) |
 | book dd | the whole book's own equity high | 10 / 13 / 20% below it → all BOXX for 5 sessions |
 
 Per-position stops live inside the ranking loop
@@ -88,6 +89,36 @@ many cells it improves. A stop that only wins at the shipped cell is noise.
    ~30–40% vol with shallower swings, and at 20% it fired on the *wrong*
    episodes in the extended window (max DD −38% vs −35% unstopped, 1/8 cells
    improved), while 13% held up (7/8 and 6/8).
+
+## Support level minus ATR (from `M6_finalnotebook`)
+
+The breakout notebook finds support and resistance with `find_peaks` on daily
+swing highs and lows, merges levels within ~1 ATR, and uses them to trigger
+entries. Its stop is not placed at a support: it is `entry − R`, with R
+the smaller of the 95% VaR move and (half the average level gap + 0.5 × ADR).
+The `support` kind tests the natural extension: stop under the nearest
+support, with an ATR buffer. Two changes from the notebook make it tradeable:
+
+* **Causal levels.** The notebook ran `find_peaks` over the whole test
+  window, so a trade could "see" support that only formed later. Here a
+  swing low counts only once `support_pivot` later closes confirm it.
+* **Closes only.** The universe cache has no highs and lows, so pivots and
+  ATR come from closes. Intraday lows would give slightly lower levels.
+
+**It is the weakest per-position stop tested.** Higher Calmar in 0/8 paired
+cells on the plain book in both windows, and 0/8 and 4/8 on the residual
+book; median CAGR −21 to −34 pts in three of the four book-window pairs;
+turnover +28× to +50×. It fired 170–420 times per book in the extended window. The
+reason is structural: in a momentum uptrend the most recent swing low is a
+shallow pullback just under the price, so the stop sits inside ordinary
+noise. Only the loosest version (10-bar pivots, i.e. fewer, more
+significant lows) came close to neutral, and it still lost.
+
+Where a support stop *does* belong is the notebook's own setting: an
+event-driven breakout entered at a level, where "back below the level I
+bought the break of, less an ATR" is a precise statement that the trade
+failed. A ranking book that buys whatever ranks top-6 is not entered at a
+level, so the nearest support says nothing about whether the thesis broke.
 
 ## Caveats
 
@@ -143,6 +174,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | residual 1.5x resid sigma (cd 21) | 48.4%  | 49.0%      |     0.97 | -40.5%         |     1.19 | 34.0x           |      17 |
 | momentum | residual 2x resid sigma (cd 21)   | 52.5%  | 49.2%      |     1.02 | -40.9%         |     1.28 | 22.9x           |       6 |
 | momentum | residual 3x resid sigma (cd 21)   | 48.1%  | 49.2%      |     0.96 | -40.4%         |     1.19 | 21.1x           |       0 |
+| momentum | support low - 0x ATR (cd 21)      | 28.8%  | 42.3%      |     0.71 | -42.8%         |     0.67 | 78.9x           |     138 |
+| momentum | support low - 0.5x ATR (cd 21)    | 29.8%  | 43.1%      |     0.73 | -36.1%         |     0.83 | 67.2x           |      99 |
+| momentum | support low - 1x ATR (cd 21)      | 22.8%  | 44.7%      |     0.59 | -40.4%         |     0.56 | 56.8x           |      79 |
+| momentum | support low - 2x ATR (cd 21)      | 17.1%  | 46.2%      |     0.49 | -40.7%         |     0.42 | 54.1x           |      56 |
 | momentum | book dd 10% (cd 5)                | 21.0%  | 30.9%      |     0.64 | -18.5%         |     1.13 | 32.0x           |      10 |
 | momentum | book dd 13% (cd 5)                | 29.9%  | 33.5%      |     0.83 | -21.0%         |     1.43 | 26.6x           |       6 |
 | momentum | book dd 20% (cd 5)                | 53.9%  | 37.4%      |     1.23 | -22.0%         |     2.45 | 19.9x           |       2 |
@@ -162,11 +197,15 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | residual 1.5x resid sigma (cd 21) | 69.0%  | 38.7%      |     1.45 | -34.7%         |     1.99 | 20.9x           |      17 |
 | resmom   | residual 2x resid sigma (cd 21)   | 79.3%  | 39.8%      |     1.56 | -35.2%         |     2.25 | 15.8x           |       6 |
 | resmom   | residual 3x resid sigma (cd 21)   | 68.4%  | 39.6%      |     1.41 | -34.9%         |     1.96 | 14.5x           |       0 |
+| resmom   | support low - 0x ATR (cd 21)      | 13.3%  | 34.7%      |     0.42 | -34.8%         |     0.38 | 67.8x           |     132 |
+| resmom   | support low - 0.5x ATR (cd 21)    | 23.8%  | 35.5%      |     0.66 | -30.3%         |     0.78 | 55.7x           |      98 |
+| resmom   | support low - 1x ATR (cd 21)      | 30.2%  | 35.3%      |     0.81 | -31.3%         |     0.97 | 50.6x           |      79 |
+| resmom   | support low - 2x ATR (cd 21)      | 33.0%  | 37.2%      |     0.84 | -36.0%         |     0.92 | 43.6x           |      62 |
 | resmom   | book dd 10% (cd 5)                | 31.8%  | 30.6%      |     0.92 | -21.3%         |     1.49 | 28.9x           |       8 |
 | resmom   | book dd 13% (cd 5)                | 58.2%  | 33.5%      |     1.42 | -20.4%         |     2.86 | 21.5x           |       4 |
 | resmom   | book dd 20% (cd 5)                | 70.5%  | 35.8%      |     1.56 | -20.7%         |     3.4  | 14.5x           |       1 |
 
-### default: cooldown and refill
+### default: cooldown, refill and support-stop dials
 
 | Book     | Stop                                        | CAGR   | Ann. vol   |   Sharpe | Max drawdown   |   Calmar | Ann. turnover   |   Stops |
 |:---------|:--------------------------------------------|:-------|:-----------|---------:|:---------------|---------:|:----------------|--------:|
@@ -183,6 +222,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | residual 2x resid sigma (cd 21, slot->cash) | 49.7%  | 48.5%      |     0.99 | -40.0%         |     1.24 | 22.3x           |       6 |
 | momentum | residual 2x resid sigma (cd 63)             | 50.8%  | 49.1%      |     1    | -40.9%         |     1.24 | 22.9x           |       6 |
 | momentum | residual 2x resid sigma (cd 63, slot->cash) | 48.3%  | 48.4%      |     0.97 | -40.0%         |     1.21 | 22.3x           |       6 |
+| momentum | support low - 1x ATR, pivot 3 (cd 21)       | 40.3%  | 42.5%      |     0.92 | -36.8%         |     1.1  | 76.0x           |     113 |
+| momentum | support low - 1x ATR, pivot 10 (cd 21)      | 39.3%  | 46.2%      |     0.86 | -41.2%         |     0.95 | 35.0x           |      29 |
+| momentum | support low - 1x ATR, lookback 63 (cd 21)   | 23.2%  | 45.0%      |     0.6  | -40.5%         |     0.57 | 56.5x           |      77 |
+| momentum | support low - 1x ATR, lookback 252 (cd 21)  | 23.3%  | 44.7%      |     0.6  | -40.4%         |     0.58 | 57.2x           |      80 |
 | resmom   | no stop                                     | 68.4%  | 39.6%      |     1.41 | -34.9%         |     1.96 | 14.5x           |       0 |
 | resmom   | trailing 10% (cd 5)                         | 34.9%  | 33.7%      |     0.94 | -26.1%         |     1.34 | 42.0x           |      75 |
 | resmom   | trailing 10% (cd 5, slot->cash)             | 29.4%  | 29.7%      |     0.88 | -26.9%         |     1.09 | 40.2x           |      69 |
@@ -196,6 +239,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | residual 2x resid sigma (cd 21, slot->cash) | 74.7%  | 38.0%      |     1.55 | -34.4%         |     2.17 | 17.0x           |       6 |
 | resmom   | residual 2x resid sigma (cd 63)             | 74.8%  | 39.7%      |     1.51 | -35.0%         |     2.14 | 18.4x           |       6 |
 | resmom   | residual 2x resid sigma (cd 63, slot->cash) | 67.0%  | 36.7%      |     1.47 | -31.7%         |     2.12 | 17.0x           |       6 |
+| resmom   | support low - 1x ATR, pivot 3 (cd 21)       | 30.3%  | 32.7%      |     0.85 | -24.9%         |     1.22 | 67.4x           |     124 |
+| resmom   | support low - 1x ATR, pivot 10 (cd 21)      | 65.2%  | 39.5%      |     1.36 | -33.8%         |     1.93 | 27.5x           |      32 |
+| resmom   | support low - 1x ATR, lookback 63 (cd 21)   | 33.3%  | 35.8%      |     0.87 | -31.3%         |     1.06 | 47.3x           |      74 |
+| resmom   | support low - 1x ATR, lookback 252 (cd 21)  | 25.1%  | 35.0%      |     0.7  | -31.3%         |     0.8  | 52.0x           |      80 |
 
 ### default: paired across 8 (n_hold, exit_rank) cells
 
@@ -209,6 +256,9 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | chandelier 6x ATR20 (cd 21)     |       8 | 7/8            | +2.3%           | 3/8             | -7.0%          | -3.4%         | +20.9x             |
 | momentum | residual 1x resid sigma (cd 21) |       8 | 4/8            | -0.2%           | 3/8             | -11.9%         | -4.4%         | +25.9x             |
 | momentum | residual 2x resid sigma (cd 21) |       8 | 3/8            | +0.0%           | 4/8             | -0.3%          | -0.2%         | +1.1x              |
+| momentum | support low - 0.5x ATR (cd 21)  |       8 | 8/8            | +1.8%           | 0/8             | -28.8%         | -6.4%         | +44.9x             |
+| momentum | support low - 1x ATR (cd 21)    |       8 | 3/8            | -0.6%           | 0/8             | -28.5%         | -5.1%         | +36.3x             |
+| momentum | support low - 2x ATR (cd 21)    |       8 | 4/8            | +0.3%           | 1/8             | -28.9%         | -3.6%         | +31.3x             |
 | momentum | book dd 13% (cd 5)              |       8 | 8/8            | +19.1%          | 6/8             | -17.5%         | -16.0%        | +7.4x              |
 | momentum | book dd 20% (cd 5)              |       8 | 8/8            | +16.3%          | 8/8             | +0.6%          | -12.0%        | +1.2x              |
 | resmom   | fixed 10% (cd 21)               |       8 | 7/8            | +5.7%           | 5/8             | -9.1%          | -3.9%         | +11.2x             |
@@ -219,6 +269,9 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | chandelier 6x ATR20 (cd 21)     |       8 | 6/8            | +1.8%           | 2/8             | -9.9%          | -1.7%         | +15.8x             |
 | resmom   | residual 1x resid sigma (cd 21) |       8 | 6/8            | +2.5%           | 4/8             | -8.1%          | -3.0%         | +20.1x             |
 | resmom   | residual 2x resid sigma (cd 21) |       8 | 2/8            | -0.0%           | 6/8             | +4.8%          | -0.4%         | +1.5x              |
+| resmom   | support low - 0.5x ATR (cd 21)  |       8 | 3/8            | -1.3%           | 0/8             | -33.8%         | -4.3%         | +38.4x             |
+| resmom   | support low - 1x ATR (cd 21)    |       8 | 4/8            | +0.1%           | 0/8             | -33.1%         | -4.6%         | +33.5x             |
+| resmom   | support low - 2x ATR (cd 21)    |       8 | 2/8            | -1.7%           | 0/8             | -32.9%         | -2.9%         | +27.9x             |
 | resmom   | book dd 13% (cd 5)              |       8 | 7/8            | +11.9%          | 4/8             | -19.3%         | -6.6%         | +8.8x              |
 | resmom   | book dd 20% (cd 5)              |       8 | 7/8            | +7.3%           | 5/8             | -7.7%          | -3.8%         | +3.8x              |
 
@@ -242,6 +295,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | residual 1.5x resid sigma (cd 21) | 29.3%  | 40.1%      |     0.75 | -40.5%         |     0.72 | 38.1x           |      50 |
 | momentum | residual 2x resid sigma (cd 21)   | 34.4%  | 40.0%      |     0.85 | -40.9%         |     0.84 | 29.1x           |      19 |
 | momentum | residual 3x resid sigma (cd 21)   | 33.1%  | 40.0%      |     0.82 | -40.4%         |     0.82 | 26.3x           |       2 |
+| momentum | support low - 0x ATR (cd 21)      | 14.6%  | 34.5%      |     0.46 | -42.8%         |     0.34 | 84.5x           |     421 |
+| momentum | support low - 0.5x ATR (cd 21)    | 14.4%  | 35.3%      |     0.46 | -38.8%         |     0.37 | 78.0x           |     333 |
+| momentum | support low - 1x ATR (cd 21)      | 13.8%  | 36.5%      |     0.44 | -44.7%         |     0.31 | 66.9x           |     257 |
+| momentum | support low - 2x ATR (cd 21)      | 12.6%  | 37.3%      |     0.41 | -43.7%         |     0.29 | 58.5x           |     172 |
 | momentum | book dd 10% (cd 5)                | 9.7%   | 25.3%      |     0.35 | -31.0%         |     0.31 | 24.8x           |      19 |
 | momentum | book dd 13% (cd 5)                | 18.6%  | 27.9%      |     0.62 | -23.2%         |     0.8  | 21.0x           |      11 |
 | momentum | book dd 20% (cd 5)                | 31.9%  | 31.0%      |     0.93 | -27.3%         |     1.17 | 18.0x           |       4 |
@@ -261,11 +318,15 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | residual 1.5x resid sigma (cd 21) | 26.6%  | 31.2%      |     0.8  | -34.7%         |     0.77 | 24.3x           |      80 |
 | resmom   | residual 2x resid sigma (cd 21)   | 26.3%  | 31.0%      |     0.79 | -35.2%         |     0.75 | 16.8x           |      32 |
 | resmom   | residual 3x resid sigma (cd 21)   | 21.2%  | 30.6%      |     0.66 | -34.9%         |     0.61 | 14.0x           |       3 |
+| resmom   | support low - 0x ATR (cd 21)      | 3.0%   | 27.8%      |     0.12 | -34.8%         |     0.09 | 68.8x           |     417 |
+| resmom   | support low - 0.5x ATR (cd 21)    | 8.3%   | 28.4%      |     0.3  | -30.3%         |     0.27 | 57.5x           |     325 |
+| resmom   | support low - 1x ATR (cd 21)      | 17.5%  | 28.7%      |     0.58 | -31.3%         |     0.56 | 50.2x           |     259 |
+| resmom   | support low - 2x ATR (cd 21)      | 16.9%  | 29.8%      |     0.55 | -36.0%         |     0.47 | 39.6x           |     184 |
 | resmom   | book dd 10% (cd 5)                | 5.4%   | 20.9%      |     0.18 | -30.4%         |     0.18 | 19.2x           |      14 |
 | resmom   | book dd 13% (cd 5)                | 14.2%  | 23.3%      |     0.53 | -19.3%         |     0.74 | 16.0x           |       9 |
 | resmom   | book dd 20% (cd 5)                | 13.8%  | 26.4%      |     0.48 | -38.1%         |     0.36 | 17.4x           |       8 |
 
-### extended: cooldown and refill
+### extended: cooldown, refill and support-stop dials
 
 | Book     | Stop                                        | CAGR   | Ann. vol   |   Sharpe | Max drawdown   |   Calmar | Ann. turnover   |   Stops |
 |:---------|:--------------------------------------------|:-------|:-----------|---------:|:---------------|---------:|:----------------|--------:|
@@ -282,6 +343,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | residual 2x resid sigma (cd 21, slot->cash) | 33.7%  | 39.2%      |     0.84 | -40.0%         |     0.84 | 27.0x           |      19 |
 | momentum | residual 2x resid sigma (cd 63)             | 35.0%  | 40.0%      |     0.86 | -40.9%         |     0.86 | 29.5x           |      19 |
 | momentum | residual 2x resid sigma (cd 63, slot->cash) | 33.7%  | 39.1%      |     0.85 | -40.0%         |     0.84 | 26.8x           |      19 |
+| momentum | support low - 1x ATR, pivot 3 (cd 21)       | 12.0%  | 35.0%      |     0.39 | -37.7%         |     0.32 | 85.6x           |     391 |
+| momentum | support low - 1x ATR, pivot 10 (cd 21)      | 29.9%  | 37.8%      |     0.79 | -41.2%         |     0.73 | 45.3x           |     113 |
+| momentum | support low - 1x ATR, lookback 63 (cd 21)   | 13.3%  | 36.6%      |     0.43 | -44.8%         |     0.3  | 66.3x           |     242 |
+| momentum | support low - 1x ATR, lookback 252 (cd 21)  | 13.5%  | 36.6%      |     0.43 | -44.7%         |     0.3  | 70.3x           |     282 |
 | resmom   | no stop                                     | 20.3%  | 30.7%      |     0.64 | -34.9%         |     0.58 | 14.0x           |       0 |
 | resmom   | trailing 10% (cd 5)                         | 12.9%  | 27.5%      |     0.45 | -34.0%         |     0.38 | 32.1x           |     162 |
 | resmom   | trailing 10% (cd 5, slot->cash)             | 5.4%   | 24.1%      |     0.19 | -26.9%         |     0.2  | 32.8x           |     153 |
@@ -295,6 +360,10 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | residual 2x resid sigma (cd 21, slot->cash) | 21.1%  | 29.1%      |     0.68 | -34.4%         |     0.61 | 16.8x           |      31 |
 | resmom   | residual 2x resid sigma (cd 63)             | 24.3%  | 31.1%      |     0.74 | -35.0%         |     0.7  | 18.2x           |      31 |
 | resmom   | residual 2x resid sigma (cd 63, slot->cash) | 16.8%  | 28.2%      |     0.56 | -31.7%         |     0.53 | 17.0x           |      30 |
+| resmom   | support low - 1x ATR, pivot 3 (cd 21)       | 0.0%   | 27.8%      |     0.01 | -45.3%         |     0    | 75.4x           |     426 |
+| resmom   | support low - 1x ATR, pivot 10 (cd 21)      | 27.3%  | 29.7%      |     0.84 | -33.8%         |     0.81 | 29.6x           |     120 |
+| resmom   | support low - 1x ATR, lookback 63 (cd 21)   | 14.9%  | 29.0%      |     0.5  | -31.3%         |     0.48 | 47.8x           |     242 |
+| resmom   | support low - 1x ATR, lookback 252 (cd 21)  | 12.6%  | 28.4%      |     0.43 | -31.3%         |     0.4  | 52.5x           |     284 |
 
 ### extended: paired across 8 (n_hold, exit_rank) cells
 
@@ -308,6 +377,9 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | momentum | chandelier 6x ATR20 (cd 21)     |       8 | 5/8            | +1.1%           | 0/8             | -17.7%         | -2.4%         | +25.0x             |
 | momentum | residual 1x resid sigma (cd 21) |       8 | 2/8            | -1.3%           | 0/8             | -18.3%         | -2.4%         | +26.3x             |
 | momentum | residual 2x resid sigma (cd 21) |       8 | 4/8            | +0.2%           | 4/8             | -1.1%          | -0.1%         | +2.3x              |
+| momentum | support low - 0.5x ATR (cd 21)  |       8 | 6/8            | +1.2%           | 0/8             | -23.8%         | -5.3%         | +49.9x             |
+| momentum | support low - 1x ATR (cd 21)    |       8 | 2/8            | -2.1%           | 0/8             | -23.4%         | -4.0%         | +38.6x             |
+| momentum | support low - 2x ATR (cd 21)    |       8 | 2/8            | -1.5%           | 0/8             | -21.5%         | -3.0%         | +30.7x             |
 | momentum | book dd 13% (cd 5)              |       8 | 8/8            | +14.6%          | 4/8             | -13.9%         | -12.4%        | -1.3x              |
 | momentum | book dd 20% (cd 5)              |       8 | 8/8            | +12.7%          | 7/8             | -5.4%          | -9.2%         | -3.4x              |
 | resmom   | fixed 10% (cd 21)               |       8 | 7/8            | +4.5%           | 7/8             | +2.1%          | -2.5%         | +9.6x              |
@@ -318,5 +390,8 @@ sig = residual_momentum(uni, boxx, qqq, stop=StopLossParams(kind="fixed", stop_p
 | resmom   | chandelier 6x ATR20 (cd 21)     |       8 | 2/8            | -2.7%           | 4/8             | +0.3%          | -0.3%         | +22.3x             |
 | resmom   | residual 1x resid sigma (cd 21) |       8 | 4/8            | -1.5%           | 5/8             | +0.8%          | -1.0%         | +24.0x             |
 | resmom   | residual 2x resid sigma (cd 21) |       8 | 4/8            | +0.6%           | 6/8             | +3.0%          | -0.0%         | +3.4x              |
+| resmom   | support low - 0.5x ATR (cd 21)  |       8 | 3/8            | -1.0%           | 0/8             | -8.9%          | -2.4%         | +44.6x             |
+| resmom   | support low - 1x ATR (cd 21)    |       8 | 6/8            | +1.7%           | 4/8             | -0.6%          | -2.0%         | +38.3x             |
+| resmom   | support low - 2x ATR (cd 21)    |       8 | 3/8            | -1.3%           | 2/8             | -2.4%          | -1.3%         | +27.5x             |
 | resmom   | book dd 13% (cd 5)              |       8 | 6/8            | +8.8%           | 2/8             | -8.7%          | -7.5%         | +2.0x              |
 | resmom   | book dd 20% (cd 5)              |       8 | 1/8            | -5.9%           | 0/8             | -9.5%          | -4.3%         | +3.9x              |
