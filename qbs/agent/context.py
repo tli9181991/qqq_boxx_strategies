@@ -408,15 +408,69 @@ def stock_context(
     return ctx
 
 
-def context_block(market_ctx: Optional[Dict], stock_ctx: Optional[Dict]) -> str:
-    """Both contexts as the prompt carries them: labelled, compact JSON.
+def context_block(market_ctx: Optional[Dict],
+                  stock_ctx: Optional[Dict] = None) -> str:
+    """The context as the prompt carries it: labelled, compact JSON.
 
-    A missing block is stated rather than omitted, so the model says the
-    market (or the stock) is unavailable instead of assuming it.
+    The market block is always there, and a missing one is stated rather
+    than omitted, so the model says the market is unavailable instead of
+    assuming it. The stock block is optional: the chat fetches one per
+    stock the user names, through `stock_data`, rather than carrying one.
     """
+    blocks = [("MARKET_CONTEXT", market_ctx)]
+    if stock_ctx is not None:
+        blocks.append(("STOCK_CONTEXT", stock_ctx))
     parts = []
-    for name, ctx in (("MARKET_CONTEXT", market_ctx), ("STOCK_CONTEXT", stock_ctx)):
+    for name, ctx in blocks:
         body = (to_json(ctx, compact=True) if ctx else
                 '{"error":"not available in this run"}')
         parts.append(f"{name}\n```json\n{body}\n```")
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------
+# The focus list: which names the chat will discuss
+# --------------------------------------------------------------------------
+
+# Word for word what the chat says about a name outside the focus list. A
+# constant so the tool, the prompt and the tests cannot drift apart.
+NOT_IN_FOCUS_MESSAGE = ("The stock is not in our focused list, please add it "
+                        "to watchlist for analysis.")
+
+
+def normalise_ticker(raw: str) -> str:
+    """`$mrvl`, ` MRVL ` and `mrvl` are one name. Yahoo's class-share
+    spelling (BRK-B) is used, since that is how the caches store it."""
+    t = (raw or "").strip().upper().lstrip("$").replace(".", "-")
+    return t.split()[0] if t else ""
+
+
+def focus_lookup(book: Book, ticker: str, watchlist: Sequence[str] = (),
+                 build=None) -> Dict:
+    """The stock context for a name the dashboard covers, or a refusal.
+
+    The focus list is what the dashboard's tables are built from: the
+    Nasdaq-100 constituents in the ranking universe, and the watchlist.
+    Anything else gets `in_focus_list: False` and `NOT_IN_FOCUS_MESSAGE`,
+    and no context -- the dashboard has computed nothing for it, and a
+    context assembled from elsewhere would not be the dashboard's numbers.
+
+    A watched name whose prices could not be loaded is reported as such:
+    telling someone to add a name that is already on their watchlist is the
+    wrong remedy.
+
+    `build(ticker)` makes the context (the dashboard passes a cached one);
+    by default `stock_context(book, ticker, watchlist=watchlist)`.
+    """
+    t = normalise_ticker(ticker)
+    watched = {normalise_ticker(w) for w in watchlist}
+    if not t or not book.has(t):
+        if t in watched:
+            return {"ticker": t, "in_focus_list": True, "error":
+                    f"{t} is on the watchlist but no prices could be loaded "
+                    "for it, so the dashboard has no data on it yet."}
+        return {"ticker": t, "in_focus_list": False,
+                "message": NOT_IN_FOCUS_MESSAGE}
+    ctx = (build(t) if build is not None else
+           stock_context(book, t, watchlist=watchlist))
+    return {"in_focus_list": True, **ctx}

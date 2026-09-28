@@ -107,6 +107,7 @@ def build_tools(
     ohlc_loader: Optional[Callable[[str], Optional[pd.DataFrame]]] = None,
     news_hours: int = 12,
     toolset: str = "all",
+    stock_lookup: Optional[Callable[[str], Dict]] = None,
 ) -> List:
     """The tool set. `book` is loaded from the cache when not supplied.
 
@@ -127,13 +128,43 @@ def build_tools(
     arrive pre-computed in the prompt (`qbs.agent.context`), so the model
     gets only what the dashboard does not hold -- `fundamentals`,
     `ticker_headlines` and `search_news`. No price data is loaded for it.
+
+    `stock_lookup(ticker)` adds `stock_data` to that set: the dashboard's
+    context for whichever stock the user names (see
+    `qbs.agent.context.focus_lookup`), so the chat is not tied to one name.
     """
     tool = _require_langchain()
     if toolset not in ("all", "context"):
         raise ValueError(f"toolset must be 'all' or 'context', not {toolset!r}")
     research = _research_tools(tool, offline_fundamentals, allow_web)
     if toolset == "context":
-        return research
+        if stock_lookup is None:
+            return research
+        from .context import NOT_IN_FOCUS_MESSAGE, to_json
+
+        @tool
+        def stock_data(ticker: str) -> str:
+            """The dashboard's computed data for ONE stock, by ticker symbol
+            (e.g. "MRVL", "TSM"): membership, normal and residual momentum
+            (score, rank, held), trend against the EMAs, returns against
+            QQQ/SPY and the market, support/resistance, volume and the last
+            five sessions.
+
+            Call it whenever the user names a stock, including a switch to a
+            new one ("how about TSM?"). Only Nasdaq-100 constituents and the
+            watchlist are covered; for anything else it says so.
+            """
+            try:
+                ctx = stock_lookup(ticker)
+            except Exception as exc:   # noqa: BLE001
+                return (f"stock_data failed for {ticker.upper()}: "
+                        f"{type(exc).__name__}: {exc}")
+            if not ctx.get("in_focus_list", True):
+                return (f"NOT IN FOCUS LIST: {ctx.get('ticker', ticker)}. "
+                        f"Reply to the user with exactly: {NOT_IN_FOCUS_MESSAGE}")
+            return "STOCK_CONTEXT\n" + to_json(ctx, compact=True)
+
+        return [stock_data] + research
     book = book if book is not None else ev.load_book(offline=True)
     market = market if market is not None else mk.market_from_book(book, spy=spy)
     if spy is None:

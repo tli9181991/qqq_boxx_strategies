@@ -1373,8 +1373,8 @@ from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
                            load_env, news_analysis_disabled,
                            news_read_disabled, retired_vars_in_use)
 from qbs.agent.evidence import Book
-from qbs.agent.context import (context_block, market_context,
-                               momentum_ranks, stock_context)
+from qbs.agent.context import (context_block, focus_lookup,
+                               market_context, momentum_ranks, stock_context)
 from qbs.agent.market import Market
 
 
@@ -2422,13 +2422,14 @@ with tab_analyst:
     st.caption(f"🔑 `.env`: {env_load.summary()}")
 
     st.caption(
-        "The analyst is handed two pre-computed contexts with each message: "
-        "the Market overview (breadth, index stretch, leaders, the checklist, "
-        "sector leadership) and the charted name (membership, normal and "
-        "residual momentum, trend, levels, volume). Its only tools are company "
-        "fundamentals from yfinance and news search. It is told that every figure "
-        "must come from the contexts or a tool call; both are folded under "
-        "each answer so you can check the figures against their source."
+        "The analyst is handed the Market overview (breadth, index stretch, "
+        "leaders, the checklist, sector leadership) with each message, and "
+        "fetches the dashboard's data for whichever stock you name — "
+        "membership, normal and residual momentum, trend, levels, volume. It "
+        "covers the Nasdaq-100 and your watchlist; anything else, add to the "
+        "watchlist first. Its other tools are company fundamentals from "
+        "yfinance and news search. Every figure must come from the market "
+        "context or a tool call; both are folded under each answer."
     )
 
     a_cols = st.columns([1.35, 1])
@@ -2499,20 +2500,21 @@ with tab_analyst:
         with st.container(height=520, border=True):
             if not st.session_state["chat"]:
                 st.caption(
-                    "Ask about the name on the left, the current books, "
-                    "breadth, or the backtest. Follow-ups work — the "
-                    "conversation is sent with each message, so "
-                    "\u201cwhat about its fundamentals?\u201d knows what "
-                    "\u201cit\u201d is.")
+                    "Name the stock you want to discuss — \u201ctell me "
+                    "about MRVL\u201d, then \u201chow about TSM?\u201d. "
+                    "The analyst reads that stock's dashboard data; it "
+                    "covers the Nasdaq-100 and your watchlist. Follow-ups "
+                    "work — \u201cwhat about its fundamentals?\u201d knows "
+                    "what \u201cit\u201d is. Market-wide questions work "
+                    "too.")
             for turn in st.session_state["chat"]:
                 with st.chat_message(turn["role"]):
                     st.markdown(turn["content"])
                     ctx = turn.get("context") or {}
-                    for label, key in (("Market context", "market"),
-                                       ("Stock context", "stock")):
-                        if ctx.get(key):
-                            with st.expander(f"📋 {label} (given to the model)"):
-                                st.json(ctx[key], expanded=True)
+                    if ctx.get("market"):
+                        with st.expander("📋 Market context (given to the "
+                                         "model)"):
+                            st.json(ctx["market"], expanded=True)
                     for i, call in enumerate(turn.get("tool_calls", []), 1):
                         args = ", ".join(f"{k}={v!r}"
                                          for k, v in call["args"].items())
@@ -2521,7 +2523,7 @@ with tab_analyst:
                                     language="text")
 
         prompt = st.chat_input(
-            f"Ask about {chart_ticker}…" if chart_ticker else "Ask the analyst…",
+            "Ask about a stock, e.g. \u201ctell me about MRVL\u201d…",
             key="chat_in", disabled=bool(blocker))
         if blocker:
             st.caption("💬 The chat needs the analyst configured — see above.")
@@ -2534,15 +2536,17 @@ with tab_analyst:
                       "change it.")
 
         if prompt:
-            # Everything the dashboard already computed goes to the model up
-            # front, as two JSON aggregates (qbs.agent.context): the market,
-            # and the name on the chart. The model's only tools are the ones
-            # that reach outside the dashboard -- fundamentals and news -- so
-            # "why do its two momentum ranks differ?" costs no tool call.
+            # The market goes to the model up front, as one JSON aggregate
+            # (qbs.agent.context). A stock does not: the user names the one
+            # they want, and the model fetches it through `stock_data`, which
+            # builds the same JSON for any name the dashboard covers -- the
+            # Nasdaq-100 constituents and the watchlist -- and refuses the
+            # rest with a fixed message. The chart on the left no longer
+            # decides what the conversation is about.
             #
-            # Cut at the date the chart on the left is drawn to (the latest
-            # bar -- see `asof_analyst`). The watchlist's outsiders ride along
-            # as `extra`, so a watched name outside the index gets a context
+            # Cut at the date the chart is drawn to (the latest bar -- see
+            # `asof_analyst`). The watchlist's outsiders ride along as
+            # `extra`, so a watched name outside the index gets a context
             # built the way the panel profiles it.
             book = Book(universe=uni.loc[:asof_analyst],
                         prices=px.loc[:asof_analyst], cfg=cfg,
@@ -2558,43 +2562,39 @@ with tab_analyst:
                 qqq_ohlc=QQQ_OHLC, spy_ohlc=SPY_OHLC,
                 index_fallback=m_uni is uni, breadth=breadth_m,
                 checklist=list(auto.values()))
-            with st.spinner("Building the dashboard context…"):
+            with st.spinner("Building the market context…"):
                 mctx = market_context_for(market, universe_label, BAR_EPOCH,
                                           m_uni.shape[1])
-                sctx = None
-                if chart_ticker:
-                    sctx = stock_context(
-                        book, chart_ticker, market=market,
-                        watchlist=WATCHLIST,
-                        ohlc=ohlc_for(chart_ticker, download_start,
-                                      bool(online), BAR_EPOCH),
-                        spy=SPY_CLOSE,
-                        ranks=stock_ranks(book, chart_ticker, int(n_hold),
-                                          int(exit_rank), int(n_resid),
-                                          BAR_EPOCH),
-                        # The books as the picks tab built them, with the
-                        # sidebar's slots -- not a second, default-sized run.
-                        held={"normal": names_on("momentum", LAST_BAR),
-                              "residual": names_on("resmom", LAST_BAR)},
-                        momentum=MomentumParams(n_hold=int(n_hold),
-                                                exit_rank=int(exit_rank)),
-                        residual=ResidualMomentumParams(
-                            n_hold=int(n_resid),
-                            exit_rank=int(n_resid) + RESID_BAND))
-            # The selected ticker rides along in the question too, so "is it
-            # extended?" means the name on screen rather than whatever was
-            # mentioned last.
-            asked = (f"[the chart on screen is showing {chart_ticker}] {prompt}"
-                     if chart_ticker else prompt)
+            # The books as the picks tab built them, with the sidebar's
+            # slots -- not a second, default-sized run.
+            held_now = {"normal": names_on("momentum", LAST_BAR),
+                        "residual": names_on("resmom", LAST_BAR)}
+            mom_p = MomentumParams(n_hold=int(n_hold), exit_rank=int(exit_rank))
+            res_p = ResidualMomentumParams(n_hold=int(n_resid),
+                                           exit_rank=int(n_resid) + RESID_BAND)
+
+            def _build_stock(t: str) -> dict:
+                return stock_context(
+                    book, t, market=market, watchlist=WATCHLIST,
+                    ohlc=ohlc_for(t, download_start, bool(online), BAR_EPOCH),
+                    spy=SPY_CLOSE,
+                    ranks=stock_ranks(book, t, int(n_hold), int(exit_rank),
+                                      int(n_resid), BAR_EPOCH),
+                    held=held_now, momentum=mom_p, residual=res_p)
+
+            def _lookup(t: str) -> dict:
+                return focus_lookup(book, t, watchlist=WATCHLIST,
+                                    build=_build_stock)
+
             history = [{"role": t["role"], "content": t["content"]}
                        for t in st.session_state["chat"]]
             st.session_state["chat"].append({"role": "user", "content": prompt})
 
             with st.spinner(f"Asking {model_name}…"):
                 answer = analyse(
-                    asked, model=model_name.strip() or None, history=history,
+                    prompt, model=model_name.strip() or None, history=history,
                     thinking_budget=int(thinking),
-                    context=context_block(mctx, sctx),
+                    context=context_block(mctx), stock_lookup=_lookup,
                     allow_web=bool(allow_web),
                     offline_fundamentals=not live_fundamentals)
 
@@ -2603,20 +2603,20 @@ with tab_analyst:
             elif answer.error:
                 text = f"🚫 **Could not answer.** {answer.text}"
             else:
-                # No tool call is normal now: the numbers came in the
-                # context, which is kept with the answer so each figure can
-                # be checked against what the model was actually given.
+                # The market context is kept with the answer, and each
+                # stock's data is in its `stock_data` call, so every figure
+                # can be checked against what the model was actually given.
                 text = answer.text
             st.session_state["chat"].append(
                 {"role": "assistant", "content": text,
                  "tool_calls": answer.tool_calls,
-                 "context": {"market": mctx, "stock": sctx}})
+                 "context": {"market": mctx}})
             st.rerun()
 
         st.caption(
-            "Every number should appear in the contexts or the tool calls "
-            "folded under the answer. One that does not is a fabrication. The "
-            "contexts are rebuilt for the name on the chart with every "
-            "message; only the last 20 turns are re-sent, and tool output is "
-            "never replayed."
+            "Every number should appear in the market context or the tool "
+            "calls folded under the answer — each stock's data is its "
+            "`stock_data` call. One that does not is a fabrication. Only the "
+            "last 20 turns are re-sent, and tool output is never replayed: "
+            "the analyst fetches a stock again when it needs it."
         )
