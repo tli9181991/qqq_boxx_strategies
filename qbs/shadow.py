@@ -300,3 +300,34 @@ def watchlist_residual_rows(
         sc = placed.get(t, float("nan"))
         out[t] = (_rank_in(base, t, sc), sc)
     return out
+
+
+def watchlist_stop_levels(
+    watch: pd.DataFrame,
+    asof: Optional[pd.Timestamp] = None,
+    pcts: Sequence[float] = (0.13, 0.20),
+    window: int = 63,
+) -> Dict[str, Dict]:
+    """Stop prices per watched name, at the book-stop distances.
+
+    The book's drawdown stops (13% and 20%, `docs/STOP_LOSS.md`) are measured
+    on the whole book. This applies the same distances to one name: the
+    highest close over the trailing `window` sessions to `asof`, times
+    `1 - pct`. It is a reference level for reading a chart, not a stop the
+    book runs -- nothing here reaches an order.
+
+    Returns `{symbol: {"last", "high", "stops": {pct: price}, "room": {pct:
+    last / stop - 1}}}`. A name with no close on or before `asof` is absent.
+    """
+    out: Dict[str, Dict] = {}
+    frame = watch if asof is None else watch.loc[:asof]
+    for t in frame.columns:
+        s = frame[t].dropna()
+        if s.empty:
+            continue
+        last = float(s.iloc[-1])
+        high = float(s.tail(window).max())
+        stops = {p: high * (1.0 - p) for p in pcts}
+        out[t] = dict(last=last, high=high, stops=stops,
+                      room={p: last / v - 1.0 for p, v in stops.items()})
+    return out

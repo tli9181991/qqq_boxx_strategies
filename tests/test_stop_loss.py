@@ -131,3 +131,19 @@ def test_stop_params_validate():
                 dict(cooldown_days=-1)):
         with pytest.raises(ValueError):
             StopLossParams(**bad)
+
+
+def test_watchlist_stop_levels():
+    from qbs.shadow import watchlist_stop_levels
+    idx = pd.bdate_range("2024-01-01", periods=100)
+    a = pd.Series(np.linspace(50, 100, 100), index=idx)       # at its high
+    b = a.copy()
+    b.iloc[-1] = 75.0                                        # 25% off a 99.5 high
+    lv = watchlist_stop_levels(pd.DataFrame({"A": a, "B": b, "C": np.nan}))
+    assert "C" not in lv
+    assert lv["A"]["stops"][0.13] == pytest.approx(100 * 0.87)
+    assert lv["A"]["room"][0.20] == pytest.approx(1 / 0.80 - 1)
+    assert lv["B"]["room"][0.20] < 0, "25% off the high is past the 20% stop"
+    # `asof` cuts the history: nothing after it may set the high.
+    cut = watchlist_stop_levels(pd.DataFrame({"A": a}), asof=idx[49])
+    assert cut["A"]["high"] == pytest.approx(a.iloc[49])
