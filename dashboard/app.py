@@ -90,6 +90,8 @@ PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
 # names it picks are less alike, so ten slots of it is not ten times the same
 # bet the way ten momentum slots would be. See docs/RESIDUAL_MOMENTUM.md.
 RESID_N_HOLD = 10
+# How many of the NDX momentum ranking the picks tab lists (held or not).
+MOM_TOP_LIST = 10
 # The band, kept as a WIDTH rather than an absolute rank. `exit_rank` is how
 # far a held name may slip before it is sold, and the sweep that validated it
 # varied the pair together -- carrying the number 10 over to a ten-name book
@@ -293,7 +295,8 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
     out: Dict[str, pd.DataFrame] = {}
 
     mom = cross_sectional_momentum(
-        _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
+        _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
+        record_ranks=MOM_TOP_LIST)
 
     # Same universe, same safe asset, same slot machinery, same absolute
     # filter against BOXX -- only the score it sorts on differs. That is the
@@ -317,6 +320,7 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
     for key, sig in (("momentum", mom), ("resmom", res), ("finviz", fin)):
         ev = sig.events
         ranks = getattr(sig, "held_ranks", None) or {}
+        top = getattr(sig, "rank_log", None) or {}
         rows = []
         for d, names in sig.holdings_log.items():
             day = ev[ev["date"] == d] if not ev.empty else ev
@@ -329,6 +333,9 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
                 # are not the same list.
                 "ranks": ", ".join("" if pd.isna(r.get(t, np.nan))
                                    else f"{r[t]:.0f}" for t in names),
+                # The ranking's leaders that day, best first, held or not:
+                # names past the absolute filter, as the book chose from.
+                "top": ", ".join(t for t, _, _ in top.get(d, [])),
                 "n": len(names),
                 "buys": ", ".join(day.loc[day["action"] == "buy", "asset"]) if len(day) else "",
                 "sells": ", ".join(day.loc[day["action"] == "sell", "asset"]) if len(day) else "",
@@ -1548,7 +1555,30 @@ with tab_picks:
                     + f"Filter: close > ${p_scr.min_price:.0f} · "
                     f"quarterly gain > {p_scr.min_quarter_return:.0%} · "
                     + vol_note))
-            if names:
+            top = ([t for t in str(row.get("top", "")).split(", ") if t]
+                   if key == "momentum" and row is not None else [])
+            if top:
+                # The ranking's top 10, the held names marked. A held name
+                # the band kept below the top 10 is added under them, so the
+                # book is always fully listed.
+                held_rank = dict(zip(names, [
+                    x for x in str(row.get("ranks", "")).split(", ")] + [""] * len(names)))
+                extra = [t for t in names if t not in top]
+                listed = top + extra
+                rk = [str(i + 1) for i in range(len(top))] + [
+                    held_rank.get(t) or "—" for t in extra]
+                held = [t in picks[key] for t in listed]
+                tf = pd.DataFrame({"Rank": rk, "Ticker": listed,
+                                   "Held": ["✅" if h else "" for h in held]})
+                st.dataframe(
+                    tf.style.apply(lambda _c: [f"background-color: {UP}" if h
+                                               else "" for h in held],
+                                   subset=["Ticker"]),
+                    hide_index=True, width="stretch",
+                    height=min(460, 38 + 35 * len(tf)))
+                st.caption(f"Top {len(top)} of the ranking · ✅ = held "
+                           f"({len(names)} of {int(n_hold)} slots)")
+            elif names:
                 st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
                              width="stretch",
                              height=min(420, 38 + 35 * len(names)))
