@@ -1375,6 +1375,8 @@ from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
 from qbs.agent.evidence import Book
 from qbs.agent.context import (context_block, focus_lookup,
                                market_context, momentum_ranks, stock_context)
+from qbs.agent.mcp_client import shared_client
+from qbs.agent.tools import resolve_mcp_url
 from qbs.agent.market import Market
 
 
@@ -2562,9 +2564,26 @@ with tab_analyst:
                 qqq_ohlc=QQQ_OHLC, spy_ohlc=SPY_OHLC,
                 index_fallback=m_uni is uni, breadth=breadth_m,
                 checklist=list(auto.values()))
-            with st.spinner("Building the market context…"):
-                mctx = market_context_for(market, universe_label, BAR_EPOCH,
-                                          m_uni.shape[1])
+            # With QBS_MCP_URL set the chat's tools come from that MCP server
+            # (qbs.agent.tools), so the market block must too: a prompt
+            # holding this process's numbers next to tools answering from the
+            # server's cache would hand the model two sources to reconcile.
+            mcp_url = resolve_mcp_url()
+            if mcp_url:
+                with st.spinner("Reading the market from the MCP server…"):
+                    try:
+                        mctx = shared_client(mcp_url).call_json(
+                            "market_snapshot")
+                    except Exception as exc:  # noqa: BLE001
+                        mctx = f"{type(exc).__name__}: {exc}"
+                if not isinstance(mctx, dict):
+                    st.error(f"**MCP server unavailable** ({mcp_url}): {mctx}",
+                             icon="🚫")
+                    st.stop()
+            else:
+                with st.spinner("Building the market context…"):
+                    mctx = market_context_for(market, universe_label,
+                                              BAR_EPOCH, m_uni.shape[1])
             # The books as the picks tab built them, with the sidebar's
             # slots -- not a second, default-sized run.
             held_now = {"normal": names_on("momentum", LAST_BAR),
@@ -2613,6 +2632,11 @@ with tab_analyst:
                  "context": {"market": mctx}})
             st.rerun()
 
+        if resolve_mcp_url():
+            st.caption(
+                f"🔌 Data from the MCP server at `{resolve_mcp_url()}` "
+                "(QBS_MCP_URL): its own cache and default slots, not this "
+                "page's sidebar settings.")
         st.caption(
             "Every number should appear in the market context or the tool "
             "calls folded under the answer — each stock's data is its "

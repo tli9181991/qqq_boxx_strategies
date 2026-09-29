@@ -851,9 +851,11 @@ qbs/
     evidence.py     the lab's own numbers as text, each with its caveat attached
     fundamentals.py yfinance company data, cached      (no LangChain import)
     news.py         web search + Yahoo headlines       (no LangChain import)
-    tools.py        the three above, as LangChain tools
     analyst.py      a Gemini agent that may call them
-    mcp_server.py   the same reports as an MCP server, for Claude
+    toolkit.py      the tools, defined once for every caller below
+    tools.py        ... wrapped for LangChain (in-process, or from a server)
+    mcp_server.py   ... served over MCP, stdio or HTTP
+    mcp_client.py   ... called from a notebook, a script or the analyst
 run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
@@ -867,6 +869,8 @@ tests/test_qbs.py 166 tests: indicators, engine, momentum, circuit-breaker,
 tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
                   precedence, the kill switch, its tools, and one real agent
                   run driven by a scripted model (no key, no network)
+tests/test_mcp.py the shared toolkit, the MCP server's token gate, and real
+                  client <-> server round trips over stdio and HTTP
 
 patreon_pipeline/ nothing to do with the strategy. A Gmail-triggered Patreon
                   downloader that transcribes with Whisper and uploads both the
@@ -1546,9 +1550,20 @@ model is instructed not to issue buy/sell calls or position sizes.
 ## Analysing with Claude: the MCP server
 
 The dashboard's numbers as [MCP](https://modelcontextprotocol.io) tools, so Claude
-Desktop, Claude Code or any other MCP client can read them and do the analysis. It is
-the Gemini analyst's tool layer served over a different protocol: **no LangChain, no
-Gemini key**, and every figure still comes from this package.
+Desktop, Claude Code, a notebook or the Gemini analyst can read them. **The tools are
+defined once**, in `qbs/agent/toolkit.py`:
+
+```
+                     qbs/agent/toolkit.py  (the tools, plain functions)
+                    /            |                      \
+      mcp_server.py          tools.py                mcp_client.py
+   (stdio or HTTP)      (LangChain, in-process)   (notebooks; the analyst
+   Claude Desktop/Code   the Gemini analyst        when QBS_MCP_URL is set)
+```
+
+Change a tool there and Claude, the dashboard's chat, the CLI and every notebook see
+the change together. The server needs **no LangChain and no Gemini key**, and every
+figure still comes from this package.
 
 ```bash
 pip install -r requirements.txt -r requirements-mcp.txt
@@ -1606,8 +1621,9 @@ What to know:
 - **It reads the cache and never downloads prices.** The data is loaded on first use
   and kept for the session; refresh it with the dashboard or `run_backtest.py`, then
   call `reload_data`. Every report states how many sessions stale it is.
-- **The market tools read the Nasdaq-100 ranking universe**, not the dashboard's
-  ~2,400-name Finviz universe, and say so in their first line — as the CLI does.
+- **The market tools read the dashboard's ~2,400-name US universe from its cache**
+  (written when the dashboard's Market tab loads it). With no such cache they fall
+  back to the Nasdaq-100 constituents and say so in every market report.
 - **The focus list is the dashboard's**: Nasdaq-100 constituents plus
   `QBS_DASH_WATCHLIST` (from the environment or `.env`). A watchlist name outside the
   index needs cached prices, which the dashboard writes when it first loads it.
@@ -1617,6 +1633,57 @@ What to know:
 - **stdout is the protocol.** The data layer prints cache warnings, so each tool runs
   with stdout sent to stderr; a stray line on stdout would corrupt the stdio stream.
   Anything you add to a tool gets the same treatment by going through `build_tools`.
+
+### One server, many clients: HTTP mode
+
+Over stdio, each Claude app starts its own server. Run one over **HTTP** instead and
+anything can share it: notebooks on another machine, the dashboard's chat, the CLI. The
+data is loaded once, on the machine that keeps it fresh.
+
+```bash
+# once: make a token and put it in .env as QBS_MCP_TOKEN=...
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+python -m qbs.agent.mcp_server --http                   # localhost only, no token needed
+python -m qbs.agent.mcp_server --http --host 0.0.0.0    # the network: needs QBS_MCP_TOKEN
+```
+
+It serves `http://<host>:8765/mcp` (`--port` to change it). **Bound to anything but
+localhost it refuses to start without `QBS_MCP_TOKEN`**. The tools are read-only, but
+without a token anyone who can reach the port could call them. Clients send the token as
+`Authorization: Bearer <token>`. That is authentication, not encryption: keep it on a
+network you trust, or put it behind a tunnel or reverse proxy that adds TLS.
+
+### From a notebook
+
+```python
+from qbs.agent.mcp_client import connect
+
+qbs = connect("http://minipc.local:8765/mcp", token="...")   # or QBS_MCP_URL / QBS_MCP_TOKEN
+print(qbs.current_picks())                        # every tool is a method
+ctx = qbs.call_json("stock_data", ticker="MU")    # JSON tools come back as dicts
+tools = qbs.langchain_tools()                     # for an agent of your own
+```
+
+With no URL at all, `connect()` starts a private server from the local checkout.
+The client runs its own event loop on a thread, so it works inside Jupyter (where
+`asyncio.run` does not). [`notebooks/mcp_client_example.ipynb`](notebooks/mcp_client_example.ipynb)
+walks through it: the reports, a pandas table built from `stock_data`, the backtest, and
+an agent over the same tools.
+
+### The Gemini analyst over the server
+
+Set `QBS_MCP_URL` (and `QBS_MCP_TOKEN`) in `.env` and the analyst takes its tools from
+the server instead of running them in-process. That applies to the CLI and to the
+dashboard's chat. The chat then reads the market block in its prompt from the server's
+`market_snapshot` too, so the prompt and the tools never come from two different sources.
+`python -m qbs.agent --check` says which source is in use and whether the server
+answers.
+
+The trade-off: the server answers from **its own cache and default settings**. The
+dashboard sidebar's slot counts (`n_hold`, the exit rank, the residual book's size) do
+not reach it, and the chat says so under the input box. Leave `QBS_MCP_URL` unset and
+the chat runs the same toolkit in-process on the page's own frames, sidebar included.
 
 ---
 
