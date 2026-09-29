@@ -1136,7 +1136,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 default_ticker: Optional[str] = None,
                 extra: Optional[pd.DataFrame] = None,
                 ticker_help: str = "Today's picks come first, then the rest "
-                                   "of the universe."):
+                                   "of the universe.",
+                labels: Optional[Dict[str, str]] = None):
     """The price / levels / momentum panel, so two tabs can show one panel.
 
     Extracted rather than copied: it is ~180 lines of chart, level and gate
@@ -1146,6 +1147,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 
     `options` is the ticker list for the combo box, already in the order the
     caller wants it -- this function does not decide what is interesting.
+    `labels` maps a ticker to the text the box shows for it (the analyst tab
+    tags sector leaders); the value selected is still the bare ticker.
 
     `extra` carries prices for names that are NOT in `uni` -- the watchlist's
     non-constituents. One such name is joined into the universe frame for the
@@ -1176,7 +1179,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     c1, c2, c3 = st.columns([2, 1, 1])
     ticker = c1.selectbox(
         "Ticker", options, index=index, key=f"{key_prefix}_ticker",
-        help=ticker_help)
+        help=ticker_help,
+        format_func=(lambda t: labels.get(t, t)) if labels else str)
 
     outsider = ticker not in uni.columns
     if outsider:
@@ -1380,7 +1384,7 @@ from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
                            load_env, news_analysis_disabled,
                            news_read_disabled, retired_vars_in_use)
 from qbs.agent.evidence import Book
-from qbs.agent.context import (context_block, focus_lookup,
+from qbs.agent.context import (context_block, focus_lookup, leader_focus,
                                market_context, momentum_ranks, stock_context)
 from qbs.agent.mcp_client import shared_client
 from qbs.agent.tools import resolve_mcp_url
@@ -1774,6 +1778,13 @@ with tab_picks:
 # Tab 2 -- market overview
 # ==========================================================================
 
+# The Market overview's "High-momentum names by sector" table, as it was
+# drawn, for the Analyst tab to offer and discuss. Set by the market tab
+# (which renders first); empty whenever that tab has no sector map to draw
+# it from, and then the Analyst tab simply lists no leaders.
+SECTOR_LEADERS = pd.DataFrame(columns=["sector", "symbol", "score",
+                                       "rank_in_sector", "n_sector"])
+
 with tab_market:
     freshness_banner()
 
@@ -2157,6 +2168,7 @@ with tab_market:
         lead_rows = sector_leaders(m_uni, mkt_sectors, asof=tbl.index[-1],
                                    volumes=m_vols,
                                    per_sector=int(per_sector))
+        SECTOR_LEADERS = lead_rows
         if lead_rows.empty:
             st.info("No leader on this date could be scored over the "
                     f"{momentum_label()} window — that needs more history "
@@ -2415,6 +2427,28 @@ with tab_analyst:
     screen_names = names_on("finviz", asof_analyst)
     momentum_names = names_on("momentum", asof_analyst)
 
+    # The Market overview's sector leaders -- the same rows, at the same
+    # "Names per sector", as its "High-momentum names by sector" table.
+    # Most sit outside the Nasdaq-100, so their closes come from the US
+    # universe the Overview read them from, put on the ranking universe's
+    # calendar the way that table does before ranking them. A constituent
+    # leader is read from `uni` like any other constituent.
+    LEADERS = leader_focus(SECTOR_LEADERS)
+    LEAD_PX = pd.DataFrame({
+        t: m_uni[t].reindex(uni.index).ffill() for t in LEADERS
+        if t not in uni.columns and t not in WATCH_FRAME.columns
+        and t in m_uni.columns})
+    LEAD_PX = LEAD_PX.loc[:, LEAD_PX.notna().any()] if not LEAD_PX.empty \
+        else LEAD_PX
+    # Every chartable name outside the universe frame: the watchlist's and
+    # the leaders'. A name on both is the watchlist's copy.
+    # Only non-empty frames go in: an empty watchlist frame carries no date
+    # index, and concatenating it would not leave the universe's calendar.
+    _parts = [f for f in (WATCH_FRAME, LEAD_PX) if not f.empty]
+    ANALYST_EXTRA = pd.concat(_parts, axis=1) if _parts else WATCH_FRAME
+    ANALYST_OUTSIDERS = [t for t in ANALYST_EXTRA.columns
+                         if t not in uni.columns]
+
     if chat_off:
         # A chat switched off on purpose is not a misconfiguration, and the
         # "install this, paste a key there" advice below would send someone to
@@ -2458,7 +2492,8 @@ with tab_analyst:
         "leaders, the checklist, sector leadership) with each message, and "
         "fetches the dashboard's data for whichever stock you name — "
         "membership, normal and residual momentum, trend, levels, volume. It "
-        "covers the Nasdaq-100 and your watchlist; anything else, add to the "
+        "covers the Nasdaq-100, your watchlist and the Market overview's "
+        "sector leaders; anything else, add to the "
         "watchlist first. Its other tools are company fundamentals from "
         "yfinance and news search. Every figure must come from the market "
         "context or a tool call; both are folded under each answer."
@@ -2474,19 +2509,37 @@ with tab_analyst:
         # you went out of your way to watch is the one you came here to ask
         # about, and it would otherwise be buried in ~100 constituents.
         watched = [t for t in WATCH_FRAME.columns]
+        # The sector leaders next, in the Overview table's order (largest
+        # sector first, strongest first inside it) -- a list somebody else
+        # curated, so it follows the one you typed.
+        leads = [t for t in LEADERS if t not in watched
+                 and (t in uni.columns or t in ANALYST_EXTRA.columns)]
+        taken = set(watched) | set(leads)
         hi = [t for t in screen_names
-              if t in uni.columns and t not in watched]
+              if t in uni.columns and t not in taken]
         mom = [t for t in momentum_names
-               if t in uni.columns and t not in watched and t not in hi]
+               if t in uni.columns and t not in taken and t not in hi]
         rest = [t for t in uni.columns
-                if t not in watched and t not in hi and t not in mom]
-        a_options = watched + hi + mom + rest
+                if t not in taken and t not in hi and t not in mom]
+        a_options = watched + leads + hi + mom + rest
+        a_labels = {t: f"{t} · {LEADERS[t]['sector']} leader "
+                       f"#{LEADERS[t]['rank_in_sector']}"
+                    for t in LEADERS}
         bits = []
         if watched:
             bits.append(f"**{len(watched)} watched** "
                         + (f"({len(WATCH_EXTRA)} outside the index) "
                            if WATCH_EXTRA else "")
                         + "first")
+        if leads:
+            n_out = sum(t not in uni.columns for t in leads)
+            bits.append(f"**{len(leads)} sector leader"
+                        f"{'s' if len(leads) != 1 else ''}** from the Market "
+                        "overview"
+                        + (f" ({n_out} outside the index)" if n_out else ""))
+        elif LEADERS:
+            bits.append("the Market overview's sector leaders (already "
+                        "listed above)")
         bits.append(f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''}")
         bits.append(f"{len(mom)} from the momentum book")
         bits.append(f"then the rest of the {len(a_options)} names")
@@ -2499,12 +2552,14 @@ with tab_analyst:
             # WATCH_FRAME, not the raw download: it is already on the
             # universe's calendar, so a name that does not trade on exactly
             # the same days joins without punching holes in the series.
-            extra=WATCH_FRAME,
-            ticker_help="Your watchlist first, then today's high-momentum "
-                        "screen, then the momentum book, then the rest of "
-                        "the universe. A watched name outside the index is "
-                        "charted from its own prices and interpolated into "
-                        "the constituents' ranking.")
+            extra=ANALYST_EXTRA,
+            labels=a_labels,
+            ticker_help="Your watchlist first, then the Market overview's "
+                        "sector leaders, then today's high-momentum screen, "
+                        "then the momentum book, then the rest of the "
+                        "universe. A name outside the index is charted from "
+                        "its own prices and interpolated into the "
+                        "constituents' ranking.")
 
     # ---- right: the chat -------------------------------------------------
     with a_cols[1]:
@@ -2535,7 +2590,8 @@ with tab_analyst:
                     "Name the stock you want to discuss — \u201ctell me "
                     "about MRVL\u201d, then \u201chow about TSM?\u201d. "
                     "The analyst reads that stock's dashboard data; it "
-                    "covers the Nasdaq-100 and your watchlist. Follow-ups "
+                    "covers the Nasdaq-100, your watchlist and the "
+                    "Market overview's sector leaders. Follow-ups "
                     "work — \u201cwhat about its fundamentals?\u201d knows "
                     "what \u201cit\u201d is. Market-wide questions work "
                     "too.")
@@ -2583,8 +2639,9 @@ with tab_analyst:
             book = Book(universe=uni.loc[:asof_analyst],
                         prices=px.loc[:asof_analyst], cfg=cfg,
                         note=UNIVERSE_NOTE,
-                        extra=(WATCH_FRAME[WATCH_EXTRA].loc[:asof_analyst]
-                               if WATCH_EXTRA else None))
+                        extra=(ANALYST_EXTRA[ANALYST_OUTSIDERS]
+                               .loc[:asof_analyst]
+                               if ANALYST_OUTSIDERS else None))
             # The Market overview tab's own frames and results -- the US
             # universe when it loaded, the Nasdaq-100 fallback when not --
             # so "the market" means the same thing in the chat as on the tab.
@@ -2629,11 +2686,12 @@ with tab_analyst:
                     spy=SPY_CLOSE,
                     ranks=stock_ranks(book, t, int(n_hold), int(exit_rank),
                                       int(n_resid), BAR_EPOCH),
-                    held=held_now, momentum=mom_p, residual=res_p)
+                    held=held_now, momentum=mom_p, residual=res_p,
+                    leaders=LEADERS)
 
             def _lookup(t: str) -> dict:
                 return focus_lookup(book, t, watchlist=WATCHLIST,
-                                    build=_build_stock)
+                                    build=_build_stock, leaders=LEADERS)
 
             history = [{"role": t["role"], "content": t["content"]}
                        for t in st.session_state["chat"]]

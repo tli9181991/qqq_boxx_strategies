@@ -1278,9 +1278,11 @@ python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
 ```
 
 Or use the dashboard's **🤖 Analyst** tab: the same price/levels/momentum panel the
-picks tab shows on the left, and a **chat** on the right. The combo box lists the
-high-momentum names first, then the momentum book, then the rest of the universe, and
-the selected ticker rides along with each message — so *"is it extended?"* means the
+picks tab shows on the left, and a **chat** on the right. The combo box lists your
+watchlist first, then the **Market overview's sector leaders** (the rows of its
+"High-momentum names by sector" table, at its "Names per sector" setting, labelled
+e.g. `ZETA · Energy leader #1`), then the high-momentum screen, then the momentum book,
+then the rest of the universe. The selected ticker rides along with each message — so *"is it extended?"* means the
 name on screen rather than whatever was mentioned last.
 
 The chat is a conversation, not a series of one-shot questions: the transcript is
@@ -1476,10 +1478,17 @@ fundamentals / news tools ──────────────────
   QQQ/SPY, market percentile, nearest levels, volume. A watchlist name outside the
   index is `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx`
   and `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
-- **The focus list is the dashboard's tables** — the Nasdaq-100 constituents and the
-  watchlist. Any other name gets, word for word: *"The stock is not in our focused
-  list, please add it to watchlist for analysis."* A watched name whose prices could
-  not be loaded is told so instead.
+  A sector leader outside the index reads the same way under
+  `"sector_leader_outside_ndx"`, and any leader, constituent or not, carries a
+  `sector_leader` block: its sector and its rank among that sector's leaders.
+- **The focus list is the dashboard's tables** — the Nasdaq-100 constituents, the
+  watchlist, and the Market overview's sector leaders. A leader outside the index is
+  charted and ranked from the US universe's closes, the same prices the Overview picked
+  it from, placed among the constituents the way that table places it. Any other name
+  gets, word for word: *"The stock is not in our focused list, please add it to
+  watchlist for analysis."* A watched name whose prices could not be loaded is told so
+  instead. With the US universe off there are no sectors, so there are no leaders to
+  add.
 - **Other tools: `fundamentals`, `ticker_headlines`, `search_news`**, used only when
   the question needs them. "Tell me about AMD" is answered from the dashboard's data;
   "is AMD's rise about earnings or AI news?" calls fundamentals and news.
@@ -1624,9 +1633,11 @@ What to know:
 - **The market tools read the dashboard's ~2,400-name US universe from its cache**
   (written when the dashboard's Market tab loads it). With no such cache they fall
   back to the Nasdaq-100 constituents and say so in every market report.
-- **The focus list is the dashboard's**: Nasdaq-100 constituents plus
-  `QBS_DASH_WATCHLIST` (from the environment or `.env`). A watchlist name outside the
-  index needs cached prices, which the dashboard writes when it first loads it.
+- **The focus list is the dashboard's**: Nasdaq-100 constituents, `QBS_DASH_WATCHLIST`
+  (from the environment or `.env`), and the Market overview's sector leaders, the
+  strongest 5 per sector (the Overview's default) computed from the cached US universe.
+  `list_universe` prints them by sector. A watchlist name outside the index needs cached
+  prices, which the dashboard writes when it first loads it.
 - **`QBS_MCP_NO_WEB=1`** removes the three web tools entirely, and `fundamentals`
   then serves only its cache.
 - **Nothing writes.** No tool changes a parameter or places an order.
