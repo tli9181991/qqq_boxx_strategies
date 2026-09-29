@@ -47,6 +47,7 @@ download while you iterate on the other three.
 Optional extras, each in its own requirements file so the backtest never depends on
 them: `requirements-dashboard.txt` (Streamlit),
 `requirements-agent.txt` ([the LLM analyst](#the-llm-analyst)),
+`requirements-mcp.txt` ([the MCP server for Claude](#analysing-with-claude-the-mcp-server)),
 `requirements-live.txt` (IB trading).
 
 ---
@@ -852,6 +853,7 @@ qbs/
     news.py         web search + Yahoo headlines       (no LangChain import)
     tools.py        the three above, as LangChain tools
     analyst.py      a Gemini agent that may call them
+    mcp_server.py   the same reports as an MCP server, for Claude
 run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
@@ -1538,6 +1540,83 @@ When an answer looks wrong, diff it against the report rather than re-prompting.
 A research note from a capable but unaccountable junior. The numbers in it are
 checkable against the tool traces; check them. Nothing here constitutes advice, and the
 model is instructed not to issue buy/sell calls or position sizes.
+
+---
+
+## Analysing with Claude: the MCP server
+
+The dashboard's numbers as [MCP](https://modelcontextprotocol.io) tools, so Claude
+Desktop, Claude Code or any other MCP client can read them and do the analysis. It is
+the Gemini analyst's tool layer served over a different protocol: **no LangChain, no
+Gemini key**, and every figure still comes from this package.
+
+```bash
+pip install -r requirements.txt -r requirements-mcp.txt
+python run_backtest.py                       # build the price cache first
+python -m qbs.agent.mcp_server --check       # loads the data once and prints a summary
+```
+
+**Claude Code** picks it up from the repo's `.mcp.json` when started in this directory
+(it asks you to approve the project server once). To add it by hand:
+
+```bash
+claude mcp add qbs-dashboard -- python -m qbs.agent.mcp_server
+```
+
+**Claude Desktop** — Settings → Developer → Edit Config, then add the server to
+`claude_desktop_config.json` and restart the app. Desktop does not start the server in
+the repo, so use the absolute path of the Python that has the requirements installed
+and put the repo on `PYTHONPATH` (the caches are found relative to the package, not
+the working directory):
+
+```json
+{
+  "mcpServers": {
+    "qbs-dashboard": {
+      "command": "/path/to/venv/bin/python",
+      "args": ["-m", "qbs.agent.mcp_server"],
+      "env": {
+        "PYTHONPATH": "/path/to/qqq_boxx_strategies",
+        "QBS_DASH_WATCHLIST": "TSM GOOGL"
+      }
+    }
+  }
+}
+```
+
+Then ask things like *"What does the momentum book hold today, and why isn't NVDA in
+it?"* or *"Is MRVL's move its own or the market's?"*.
+
+| Tool | Answers |
+|---|---|
+| `current_picks` | what the momentum book and the screen hold on the latest bar, and their overlap |
+| `stock_data` | the dashboard's JSON for one name: normal **and residual** momentum, trend, levels, volume |
+| `name_momentum` | returns with universe percentiles, and every strategy gate with ✅/❌ |
+| `price_action` | the price panel: returns vs QQQ/SPY, EMAs, range, ATR, beta, levels, last N sessions |
+| `market_overview` / `market_snapshot` | the Market overview tab, as text / as the chat's JSON block |
+| `sector_leadership`, `stock_vs_market` | where the leaders sit; whether a move is the stock's own |
+| `strategy_performance` | the backtest table with its caveats (runs from the cache on first call) |
+| `list_universe` | every ticker available, and the date prices run to |
+| `fundamentals` | yfinance snapshot of today — never an explanation for a past signal |
+| `search_news`, `ticker_headlines`, `market_news` | the web and the News tab's headlines |
+| `reload_data` | re-read the cache after the dashboard or `run_backtest.py` refreshed it |
+
+What to know:
+
+- **It reads the cache and never downloads prices.** The data is loaded on first use
+  and kept for the session; refresh it with the dashboard or `run_backtest.py`, then
+  call `reload_data`. Every report states how many sessions stale it is.
+- **The market tools read the Nasdaq-100 ranking universe**, not the dashboard's
+  ~2,400-name Finviz universe, and say so in their first line — as the CLI does.
+- **The focus list is the dashboard's**: Nasdaq-100 constituents plus
+  `QBS_DASH_WATCHLIST` (from the environment or `.env`). A watchlist name outside the
+  index needs cached prices, which the dashboard writes when it first loads it.
+- **`QBS_MCP_NO_WEB=1`** removes the three web tools entirely, and `fundamentals`
+  then serves only its cache.
+- **Nothing writes.** No tool changes a parameter or places an order.
+- **stdout is the protocol.** The data layer prints cache warnings, so each tool runs
+  with stdout sent to stderr; a stray line on stdout would corrupt the stdio stream.
+  Anything you add to a tool gets the same treatment by going through `build_tools`.
 
 ---
 

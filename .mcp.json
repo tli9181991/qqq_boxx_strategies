@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "qbs-dashboard": {
+      "command": "python",
+      "args": ["-m", "qbs.agent.mcp_server"]
+    }
+  }
+}
