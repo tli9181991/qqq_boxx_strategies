@@ -268,3 +268,20 @@ def test_http_round_trip_with_a_token():
     finally:
         proc.terminate()
         proc.wait(timeout=10)
+
+
+def test_a_client_hanging_up_is_not_reported_as_a_crash():
+    """Windows logs an abrupt disconnect as a traceback; the server drops
+    exactly that case and passes everything else through."""
+    seen = []
+
+    class Loop:
+        def default_exception_handler(self, context):
+            seen.append(context)
+
+    ms._ignore_disconnects(Loop(), {"exception": ConnectionResetError(10054)})
+    ms._ignore_disconnects(Loop(), {"exception": ConnectionAbortedError()})
+    assert seen == []
+    other = {"exception": ValueError("real"), "message": "boom"}
+    ms._ignore_disconnects(Loop(), other)
+    assert seen == [other]

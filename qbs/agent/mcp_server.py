@@ -41,6 +41,7 @@ Environment
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hmac
 import inspect
 import os
@@ -168,8 +169,34 @@ def serve_http(host: str = "127.0.0.1", port: int = DEFAULT_PORT,
     print(f"qbs MCP server on http://{shown}:{port}/mcp "
           f"({'token required' if token else 'no token, localhost only'})",
           file=sys.stderr)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port,
+                                           log_level="warning"))
+
+    async def _serve() -> None:
+        asyncio.get_running_loop().set_exception_handler(_ignore_disconnects)
+        await server.serve()
+
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        pass
     return 0
+
+
+def _ignore_disconnects(loop, context) -> None:
+    """Drop the traceback Windows prints when a client hangs up abruptly.
+
+    Windows' proactor event loop reports a connection the other side reset
+    -- a notebook kernel restarted, a client never closed -- as an
+    "Exception in callback _ProactorBasePipeTransport._call_connection_lost"
+    with a ConnectionResetError (python/cpython#83413). Nothing is wrong and
+    the server carries on, but a traceback per disconnect reads as a crash.
+    Everything else goes to the default handler unchanged.
+    """
+    if isinstance(context.get("exception"), (ConnectionResetError,
+                                             ConnectionAbortedError)):
+        return
+    loop.default_exception_handler(context)
 
 
 def _check() -> int:
