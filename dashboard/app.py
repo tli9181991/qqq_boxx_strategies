@@ -1263,7 +1263,7 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
             layers.append(rules)
         st.altair_chart(
             alt.layer(*layers).resolve_scale(color="independent")
-            .properties(height=430), use_container_width=True)
+            .properties(height=430), width="stretch")
         if bars is None:
             st.caption(
                 "📉 Close line, not candles — no Open/High/Low for "
@@ -1918,7 +1918,7 @@ with tab_market:
                  alt.Tooltip("value:Q", title="Count")],
     ).properties(height=260)
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=MUTED).encode(y="y:Q")
-    st.altair_chart(chart + zero, use_container_width=True)
+    st.altair_chart(chart + zero, width="stretch")
 
     # ---- the daily monitor table -----------------------------------------
     st.markdown("#### Daily monitor")
@@ -2099,7 +2099,7 @@ with tab_market:
             tooltip=[alt.Tooltip("date:T", title="Date"),
                      alt.Tooltip("pct:Q", title="%", format=".1f")],
         ).properties(height=240),
-        use_container_width=True)
+        width="stretch")
 
     # ---- sector concentration --------------------------------------------
     st.markdown("##### Sector composition")
