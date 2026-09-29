@@ -227,6 +227,12 @@ Reading a stock_data result:
   constituent. Its "placement_rank_against_ndx" is where it WOULD rank among
   the constituents, and no book can hold it. Never call it a constituent or
   a holding.
+- "membership" "sector_leader_outside_ndx" is the same kind of outsider,
+  found by the Market overview's leader rule rather than put on the
+  watchlist: the same placement reading, and no book can hold it.
+- "sector_leader", when present, is the name's place among its sector's
+  momentum leaders in the Market overview ("rank_in_sector" of
+  "leaders_in_sector"). A constituent can be a leader too.
 - "normal_momentum" is the book's trailing-return rank; "residual_momentum"
   ranks the same universe on the drift the market (QQQ) does not explain,
   as a t-statistic. A name ranked much better on normal than on residual

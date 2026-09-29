@@ -264,9 +264,16 @@ def stock_context(
     held: Optional[Dict[str, List[str]]] = None,
     momentum: Optional[MomentumParams] = None,
     residual: Optional[ResidualMomentumParams] = None,
+    leaders: Optional[Dict[str, Dict]] = None,
 ) -> Dict:
     """One chartable name: membership, both books' momentum, trend,
-    relative performance, levels and volume."""
+    relative performance, levels and volume.
+
+    `leaders` is `leader_focus` output: the Market overview's sector
+    leaders. A leader gets a `sector_leader` block, and one outside the
+    index is `sector_leader_outside_ndx` rather than a watchlist name --
+    nobody typed it in, the leader rule found it.
+    """
     t = ticker.upper().strip()
     mp = momentum or MomentumParams()
     rp = residual or ResidualMomentumParams()
@@ -278,6 +285,15 @@ def stock_context(
     asof = close.index[-1]
     last = float(close.iloc[-1])
     watched = t in {w.upper() for w in watchlist}
+    leader = (leaders or {}).get(t)
+    if not outsider:
+        membership = "Nasdaq-100"
+    elif leader is not None and not watched:
+        membership = "sector_leader_outside_ndx"
+    else:
+        # Before sector leaders, every outsider with prices was a watched
+        # name; a caller that passes no leaders keeps that reading.
+        membership = "watchlist_outside_ndx"
 
     ranks = ranks if ranks is not None else momentum_ranks(book, t, mp, rp)
     held = held if held is not None else current_holdings(book, mp, rp)
@@ -287,10 +303,18 @@ def stock_context(
         "analysis_date": _today(),
         "data_as_of": f"{asof:%Y-%m-%d}",
         "sessions_behind": int(sessions_behind(asof)),
-        "membership": "watchlist_outside_ndx" if outsider else "Nasdaq-100",
-        "watchlist": watched or outsider,
-        "sector": (market.sectors.get(t) if market is not None
-                   and market.sectors else None),
+        "membership": membership,
+        "watchlist": watched or membership == "watchlist_outside_ndx",
+        "sector": ((market.sectors.get(t) if market is not None
+                    and market.sectors else None)
+                   or (leader or {}).get("sector")),
+        "sector_leader": (None if leader is None else {
+            "sector": leader.get("sector"),
+            "rank_in_sector": leader.get("rank_in_sector"),
+            "leaders_in_sector": leader.get("leaders_in_sector"),
+            "score": _num(leader.get("score"), 4),
+            "score_unit": "trailing return (fraction), the ranker's window",
+        }),
         "normal_momentum": _book_block(
             "normal", outsider, ranks.get("normal"), held.get("normal", []),
             t, mp.n_hold, mp.exit_rank, momentum_label(mp)),
@@ -445,12 +469,29 @@ def normalise_ticker(raw: str) -> str:
     return t.split()[0] if t else ""
 
 
+def leader_focus(rows: Optional[pd.DataFrame]) -> Dict[str, Dict]:
+    """`qbs.breadth.sector_leaders` output as `{ticker: info}`, in the
+    table's own order (largest sector first, strongest first inside it).
+
+    This is what puts the Market overview's sector leaders in the focus
+    list: the dashboard passes the rows its Overview tab shows, and the MCP
+    server computes the same table from the same cache.
+    """
+    if rows is None or rows.empty:
+        return {}
+    return {normalise_ticker(r.symbol): {
+                "sector": r.sector, "rank_in_sector": int(r.rank_in_sector),
+                "leaders_in_sector": int(r.n_sector), "score": float(r.score)}
+            for r in rows.itertuples()}
+
+
 def focus_lookup(book: Book, ticker: str, watchlist: Sequence[str] = (),
-                 build=None) -> Dict:
+                 build=None, leaders: Optional[Dict[str, Dict]] = None) -> Dict:
     """The stock context for a name the dashboard covers, or a refusal.
 
     The focus list is what the dashboard's tables are built from: the
-    Nasdaq-100 constituents in the ranking universe, and the watchlist.
+    Nasdaq-100 constituents in the ranking universe, the watchlist, and the
+    Market overview's sector leaders (`leaders`, from `leader_focus`).
     Anything else gets `in_focus_list: False` and `NOT_IN_FOCUS_MESSAGE`,
     and no context -- the dashboard has computed nothing for it, and a
     context assembled from elsewhere would not be the dashboard's numbers.
@@ -460,7 +501,8 @@ def focus_lookup(book: Book, ticker: str, watchlist: Sequence[str] = (),
     wrong remedy.
 
     `build(ticker)` makes the context (the dashboard passes a cached one);
-    by default `stock_context(book, ticker, watchlist=watchlist)`.
+    by default `stock_context(book, ticker, watchlist=watchlist,
+    leaders=leaders)`.
     """
     t = normalise_ticker(ticker)
     watched = {normalise_ticker(w) for w in watchlist}
@@ -469,8 +511,13 @@ def focus_lookup(book: Book, ticker: str, watchlist: Sequence[str] = (),
             return {"ticker": t, "in_focus_list": True, "error":
                     f"{t} is on the watchlist but no prices could be loaded "
                     "for it, so the dashboard has no data on it yet."}
+        if t in (leaders or {}):
+            return {"ticker": t, "in_focus_list": True, "error":
+                    f"{t} is a sector leader in the Market overview but its "
+                    "prices could not be joined to the ranking universe, so "
+                    "the dashboard has no data on it yet."}
         return {"ticker": t, "in_focus_list": False,
                 "message": NOT_IN_FOCUS_MESSAGE}
     ctx = (build(t) if build is not None else
-           stock_context(book, t, watchlist=watchlist))
+           stock_context(book, t, watchlist=watchlist, leaders=leaders))
     return {"in_focus_list": True, **ctx}

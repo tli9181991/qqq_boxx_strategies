@@ -89,6 +89,12 @@ class Data:
 
     `stock_lookup(ticker)` replaces how `stock_data` builds its answer: the
     dashboard passes one that uses its sidebar's slots and its cached ranks.
+
+    `leaders` are the Market overview's sector leaders (the strongest
+    `leaders_per_sector` per sector, as its "High-momentum names by sector"
+    table draws them). They join the focus list beside the constituents and
+    the watchlist. Computed from the US universe when it loaded; there are
+    none on the Nasdaq-100 fallback, which carries no sectors.
     """
 
     def __init__(self, book: Optional[ev.Book] = None,
@@ -105,7 +111,8 @@ class Data:
                  run_backtest: bool = True,
                  n_hold: int = 6,
                  offline_fundamentals: bool = False,
-                 news_hours: int = 12):
+                 news_hours: int = 12,
+                 leaders_per_sector: int = 5):
         self._lock = threading.RLock()
         self._given = dict(book=book, market=market, spy=spy,
                            results=results, rf=rf)
@@ -124,6 +131,7 @@ class Data:
         self.offline_fundamentals = offline_fundamentals
         self.news_hours = news_hours
         self.market_note = ""
+        self.leaders_per_sector = leaders_per_sector
         self._ohlc_loader = ohlc_loader
         self.reset(keep_given=True)
 
@@ -136,6 +144,7 @@ class Data:
             self._spy = g.get("spy")
             self._results, self._rf = g.get("results"), g.get("rf")
             self._spy_loaded = self._spy is not None
+            self._leaders: Optional[Dict[str, Dict]] = None
 
     @property
     def book(self) -> ev.Book:
@@ -186,6 +195,40 @@ class Data:
                 self._market = (self._us_market() if self.us_market else None) \
                     or mk.market_from_book(self.book, spy=self.spy)
             return self._market
+
+    @property
+    def leaders(self) -> Dict[str, Dict]:
+        """`{ticker: info}` for the Market overview's sector leaders, in its
+        table's order. Loading them also joins each leader outside the
+        index into `book.extra`, on the universe's calendar, so every tool
+        that reads the book can chart and place it."""
+        with self._lock:
+            if self._leaders is None:
+                self._leaders = {}
+                market = self.market
+                if market.index_fallback or not market.sectors:
+                    return self._leaders
+                from ..breadth import sector_leaders
+                from .context import leader_focus
+                rows = sector_leaders(market.closes, market.sectors,
+                                      asof=market.asof, volumes=market.volumes,
+                                      per_sector=self.leaders_per_sector)
+                self._leaders = leader_focus(rows)
+                self._join_leader_prices(market)
+            return self._leaders
+
+    def _join_leader_prices(self, market: mk.Market) -> None:
+        book = self.book
+        have = set(book.universe.columns) | set(
+            book.extra.columns if book.extra is not None else ())
+        add = {t: market.closes[t].reindex(book.universe.index).ffill()
+               for t in self._leaders
+               if t not in have and t in market.closes.columns}
+        add = {t: v for t, v in add.items() if v.notna().any()}
+        if add:
+            new = pd.DataFrame(add)
+            book.extra = (new if book.extra is None
+                          else pd.concat([book.extra, new], axis=1))
 
     def _us_market(self) -> Optional[mk.Market]:
         """The dashboard's US universe from its cache, or None with the
@@ -266,20 +309,24 @@ def build_tools(data: Data, allow_web: bool = True,
         last five sessions.
 
         Call it whenever the user names a stock, including a switch to a
-        new one ("how about TSM?"). Only Nasdaq-100 constituents and the
-        watchlist are covered; for anything else it says so.
+        new one ("how about TSM?"). Covers Nasdaq-100 constituents, the
+        watchlist and the Market overview's sector leaders; for anything
+        else it says so.
         """
         from .context import (NOT_IN_FOCUS_MESSAGE, focus_lookup,
                               normalise_ticker, stock_context, to_json)
         if data.stock_lookup is not None:
             ctx = data.stock_lookup(ticker)
         else:
+            leaders = data.leaders            # joins their prices first
             book = data.book
             ctx = focus_lookup(
                 book, normalise_ticker(ticker), watchlist=data.watchlist,
+                leaders=leaders,
                 build=lambda t: stock_context(book, t, market=data.market,
                                               ohlc=data.ohlc(t), spy=data.spy,
-                                              watchlist=data.watchlist))
+                                              watchlist=data.watchlist,
+                                              leaders=leaders))
         if not ctx.get("in_focus_list", True):
             return (f"NOT IN FOCUS LIST: {ctx.get('ticker', ticker)}. "
                     f"Reply to the user with exactly: {NOT_IN_FOCUS_MESSAGE}")
@@ -304,22 +351,37 @@ def build_tools(data: Data, allow_web: bool = True,
         against its 20-day average, and the last N sessions line by line.
 
         Call this first for any question about how a stock has been doing.
-        Works for watchlist names outside the index too.
+        Works for watchlist names and sector leaders outside the index too.
         """
+        data.leaders                          # joins their prices first
         t = ticker.upper().strip()
         return sk.price_action_report(data.book, t,
                                       sessions=max(1, min(int(sessions), 60)),
                                       ohlc=data.ohlc(t), spy=data.spy)
 
     def list_universe() -> str:
-        """Every ticker available in the cached universe, and the date it
-        runs to. Call this when unsure whether a symbol can be analysed."""
+        """Every ticker available in the cached universe, the dashboard
+        watchlist and the Market overview's sector leaders, and the date
+        prices run to. Call this when unsure whether a symbol can be
+        analysed."""
+        leaders = data.leaders
         book = data.book
         cols = sorted(book.universe.columns)
         wl = (f"\nDashboard watchlist ({WATCHLIST_VAR}): {', '.join(data.watchlist)}"
               if data.watchlist else "")
+        if leaders:
+            by_sector: Dict[str, List[str]] = {}
+            for t, info in leaders.items():
+                by_sector.setdefault(info["sector"], []).append(t)
+            ld = ("\nSector leaders (Market overview, strongest "
+                  f"{data.leaders_per_sector} per sector):\n"
+                  + "\n".join(f"  {sec}: {', '.join(ts)}"
+                              for sec, ts in by_sector.items()))
+        else:
+            ld = ("\nSector leaders: none -- " + (data.market_note or
+                  "the market universe carries no sectors"))
         return (f"{len(cols)} names, prices through {book.asof:%Y-%m-%d}:\n"
-                + ", ".join(cols) + wl)
+                + ", ".join(cols) + wl + ld)
 
     def _fallback_line() -> str:
         return (f"\n(US universe unavailable: {data.market_note}; this is the "

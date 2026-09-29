@@ -285,3 +285,116 @@ def test_a_client_hanging_up_is_not_reported_as_a_crash():
     other = {"exception": ValueError("real"), "message": "boom"}
     ms._ignore_disconnects(Loop(), other)
     assert seen == [other]
+
+
+# --------------------------------------------------------------------------
+# The Market overview's sector leaders, in the focus list
+# --------------------------------------------------------------------------
+
+def _leader_market():
+    """A synthetic US market: the constituents in two sectors plus LEADX,
+    an outsider in its own sector that the leader rule has to pass."""
+    import numpy as np
+    import pandas as pd
+    from qbs.agent.market import Market
+
+    data = _data()
+    uni = data.book.universe
+    n = len(uni)
+    g = np.r_[np.linspace(0, 0.5, n - 80), 0.5 + np.linspace(0, 0.6, 80)]
+    closes = uni.copy()
+    closes["LEADX"] = pd.Series(10 * np.exp(g), index=uni.index)
+    sectors = {t: ("Tech" if i % 2 else "Health")
+               for i, t in enumerate(uni.columns)}
+    sectors["LEADX"] = "Energy"
+    return Market(closes=closes, sectors=sectors,
+                  qqq=data.book.prices["QQQ"], note="synthetic US")
+
+
+def _leader_data(**kw):
+    px = synthetic_prices()
+    uni = synthetic_universe(n=40).reindex(px.index).ffill()
+    book = ev.Book(universe=uni, prices=px, cfg=Config(), note="synthetic")
+    return tk.Data(book=book, market=_leader_market(),
+                   watchlist=kw.pop("watchlist", []),
+                   ohlc_loader=lambda t: None, leaders_per_sector=3, **kw)
+
+
+def test_leader_focus_keeps_the_overview_tables_order():
+    from qbs.agent.context import leader_focus
+    from qbs.breadth import sector_leaders
+    m = _leader_market()
+    rows = sector_leaders(m.closes, m.sectors, per_sector=3)
+    got = leader_focus(rows)
+    assert list(got) == list(rows["symbol"])
+    assert got["LEADX"] == {"sector": "Energy", "rank_in_sector": 1,
+                            "leaders_in_sector": 1,
+                            "score": pytest.approx(float(
+                                rows.set_index("symbol").loc["LEADX", "score"]))}
+    assert leader_focus(None) == {} and leader_focus(rows.iloc[:0]) == {}
+
+
+def test_a_leader_outside_the_index_is_in_focus_and_labelled_as_one():
+    data = _leader_data()
+    assert "LEADX" in data.leaders
+    ctx = tk.split_json(_tools(data)["stock_data"]("leadx"))
+    assert isinstance(ctx, dict), ctx
+    assert ctx["membership"] == "sector_leader_outside_ndx"
+    assert ctx["watchlist"] is False
+    assert ctx["sector"] == "Energy"
+    assert ctx["sector_leader"]["rank_in_sector"] == 1
+    # An outsider: placed against the constituents, never held.
+    assert "placement_rank_against_ndx" in ctx["normal_momentum"]
+    assert ctx["normal_momentum"]["currently_held"] is False
+
+
+def test_a_constituent_leader_keeps_its_membership():
+    data = _leader_data()
+    member = next(t for t in data.leaders if t in data.book.universe.columns)
+    ctx = tk.split_json(_tools(data)["stock_data"](member))
+    assert ctx["membership"] == "Nasdaq-100"
+    assert ctx["sector_leader"]["sector"] in ("Tech", "Health")
+
+
+def test_a_watched_leader_reads_as_the_watchlists():
+    """You typed it in: it is your watchlist name first."""
+    from qbs.agent.context import stock_context
+    data = _leader_data()
+    data.leaders                                   # joins LEADX's prices
+    ctx = stock_context(data.book, "LEADX", watchlist=["LEADX"],
+                        leaders=data.leaders, held={}, ranks={})
+    assert ctx["membership"] == "watchlist_outside_ndx"
+    assert ctx["watchlist"] is True and ctx["sector_leader"] is not None
+
+
+def test_a_non_leader_outsider_is_still_refused():
+    data = _leader_data()
+    out = _tools(data)["stock_data"]("ZZZZ")
+    assert "NOT IN FOCUS LIST" in out and NOT_IN_FOCUS_MESSAGE in out
+
+
+def test_a_leader_with_no_prices_says_so_rather_than_refusing():
+    from qbs.agent.context import focus_lookup
+    out = focus_lookup(_data().book, "NOPX",
+                       leaders={"NOPX": {"sector": "Energy"}})
+    assert out["in_focus_list"] is True and "sector leader" in out["error"]
+
+
+def test_the_leaders_are_listed_and_charted():
+    data = _leader_data()
+    tools = _tools(data)
+    listing = tools["list_universe"]()
+    assert "Sector leaders" in listing and "Energy: LEADX" in listing
+    assert "PRICE ACTION — LEADX" in tools["price_action"]("LEADX", 3)
+
+
+def test_no_leaders_on_the_index_fallback():
+    data = _data()                                 # no US market
+    assert data.leaders == {}
+    assert "Sector leaders: none" in _tools(data)["list_universe"]()
+
+
+def test_the_context_prompt_explains_the_leader_membership():
+    from qbs.agent.analyst import system_prompt
+    prompt = system_prompt(context="MARKET_CONTEXT\n{}")
+    assert "sector_leader_outside_ndx" in prompt and '"sector_leader"' in prompt
