@@ -81,6 +81,17 @@ def main(argv=None) -> int:
                     " (off)" if budget == 0 else "")
                  if budget is not None else " · no thinking budget sent"))
         print(f"summary model:   {DEFAULT_SUMMARY_MODEL} (news read, no thinking)")
+        from .tools import resolve_mcp_url
+        url = resolve_mcp_url()
+        if url:
+            try:
+                from .mcp_client import shared_client
+                n = len(shared_client(url).tool_names())
+                print(f"tools:           MCP server {url} ({n} tools)")
+            except Exception as exc:              # noqa: BLE001
+                print(f"tools:           MCP server {url} — UNREACHABLE: {exc}")
+        else:
+            print("tools:           in-process (set QBS_MCP_URL to use a server)")
         print(f"search backends: {', '.join(available_backends()) or 'none'}")
         # A key that is set but cannot be used is worse than one that is
         # missing: the search still works, so nothing looks wrong.
