@@ -4675,3 +4675,52 @@ def test_a_missing_fallback_package_is_named_not_traced(monkeypatch):
     monkeypatch.setattr(Q, "_tradingview_quotes", missing)
     _, err = Q.latest_quotes("finviz")
     assert "not installed (pip install tradingview-screener)" in err
+
+
+# --------------------------------------------------------------------------
+# Next-two-weeks decision table
+# --------------------------------------------------------------------------
+
+def _tw(pct_values, index_values=None, n_names=50):
+    from qbs.breadth import two_week_table
+    idx = pd.bdate_range(end="2026-09-29", periods=len(pct_values))
+    pct = pd.Series(pct_values, index=idx, dtype=float)
+    index = pd.Series(index_values if index_values is not None
+                      else np.linspace(100, 110, len(idx)), index=idx)
+    closes = pd.DataFrame(100.0, index=idx, columns=[f"T{i}" for i in range(n_names)])
+    return {r["key"]: r for r in two_week_table(closes, index, pct)}
+
+
+def test_two_week_recovery_is_a_bounce_back_above_30():
+    rows = _tw([50.0] * 20 + [25, 24, 26, 28, 33])
+    assert rows["recovery"]["answer"] is True
+    assert _tw([50.0] * 25)["recovery"]["answer"] is False, "never went under"
+
+
+def test_two_week_bear_counts_ten_sessions_and_projects_the_tenth():
+    rows = _tw([50.0] * 20 + [25.0] * 10)
+    assert rows["bear"]["answer"] is True
+    short = _tw([50.0] * 20 + [25.0] * 4)["bear"]
+    assert short["answer"] is False
+    # Four sessions under as of 2026-09-29 (Tue): six more weekdays is 2026-10-07.
+    assert "2026-10-07" in short["reading"]
+
+
+def test_two_week_false_high_needs_a_new_high_and_weak_breadth():
+    n = 300
+    closes_len = n
+    rows = _tw([25.0] * closes_len, index_values=np.linspace(100, 200, closes_len))
+    # No name at a new low in the flat fixture, so lows do not outnumber highs.
+    assert rows["false_high"]["answer"] is False
+    assert "252-day high" in rows["false_high"]["reading"]
+
+
+def test_two_week_false_high_fires_when_names_sit_at_new_lows():
+    from qbs.breadth import two_week_table
+    idx = pd.bdate_range(end="2026-09-29", periods=300)
+    pct = pd.Series(25.0, index=idx)
+    index = pd.Series(np.linspace(100, 200, 300), index=idx)        # new high today
+    falling = pd.DataFrame({f"T{i}": np.linspace(200, 100, 300) for i in range(20)},
+                           index=idx)                                # every name at a new low
+    row = {r["key"]: r for r in two_week_table(falling, index, pct)}["false_high"]
+    assert row["answer"] is True, row["reading"]
