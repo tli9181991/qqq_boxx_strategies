@@ -41,7 +41,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qbs.breadth import (BreadthParams, atr_class, bear_checklist,
+from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
+                         bear_checklist, two_week_table,
                          daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown,
@@ -479,6 +480,38 @@ CHECKLIST = [
          q="Have a large number of current positions simultaneously hit "
            "stop-loss levels? (Weighted double)",
          yes="Your own portfolio has confirmed the trend/risk."),
+]
+
+
+@st.cache_data(show_spinner=False)
+def build_two_week(_uni: pd.DataFrame, _index: pd.Series, _pct50: pd.Series,
+                   note: str, index_name: str, bar_epoch: str = ""):
+    """`two_week_table` behind a cache; `note`, the index and `bar_epoch` key it."""
+    return two_week_table(_uni, _index, _pct50, index_name=index_name)
+
+
+# The decision table for the next two weeks, translated from its source.
+# `key` rows are answered by `qbs.breadth.two_week_table`; "stops" reads the
+# checklist's own stop-loss box, so it is ticked once for both tables.
+TWO_WEEK = [
+    dict(key="recovery",
+         see="The S&P 50-day ratio climbs back above 30% within a few days, "
+             "and the index rebounds.",
+         means="A normal oversold bounce."),
+    dict(key="false_high",
+         see="The index makes a new high, but the S&P 50-day ratio is still "
+             "below 30% and new lows still outnumber new highs.",
+         means="Beware the 1999 / 2024 pattern: after the signal the index "
+               "makes a new high first, then falls."),
+    dict(key="bear",
+         see="The S&P 50-day ratio stays below 30% for 10 trading days in a "
+             "row (in the source's case, through the Oct 6 close).",
+         means="Historically a high chance of a big drop: 24 of 27 cases "
+               "ended in one."),
+    dict(key="stops",
+         see="A large number of positions hit their stops at the same time.",
+         means="The market is very likely unfavourable for trading — be "
+               "especially careful."),
 ]
 
 
@@ -2075,6 +2108,50 @@ with tab_market:
         "stop-losses are not in this data, so they are yours to tick."
         + (f" {unknown} row{'s' if unknown != 1 else ''} could not be "
            "answered for lack of history." if unknown else "")))
+
+    # ---- decision table: the next two weeks ------------------------------
+    st.markdown("#### Decision table: the next two weeks")
+    tw_index, tw_name = ((SPY_CLOSE, "SPY") if SPY_CLOSE is not None
+                         else (px["QQQ"], "QQQ"))
+    tw = {r["key"]: r for r in build_two_week(
+        m_uni, tw_index, breadth.table["pct_above_slow"], universe_label,
+        tw_name, bar_epoch=BAR_EPOCH)}
+    tw_rows, tw_ans = [], []
+    for item in TWO_WEEK:
+        if item["key"] == "stops":
+            ans = manual.get("stops", False)
+            reading = ("ticked in the checklist above" if ans else
+                       "not ticked — use the stop-loss box in the checklist above")
+        else:
+            r = tw.get(item["key"], {})
+            ans, reading = r.get("answer"), r.get("reading", "—")
+        tw_ans.append(ans)
+        tw_rows.append({"What you see": item["see"], "What it means": item["means"],
+                        "Now": "—" if ans is None else ("Yes" if ans else "No"),
+                        "Reading": reading})
+    # Row 1 is the benign reading, so its Yes is green; the rest are warnings.
+    tw_tint = [(UP if i == 0 else DN) if a else "" for i, a in enumerate(tw_ans)]
+    st.dataframe(
+        pd.DataFrame(tw_rows).style.apply(
+            lambda _c: [f"background-color: {t}" if t else "" for t in tw_tint],
+            subset=["Now"]),
+        hide_index=True, width="stretch",
+        column_config={"What you see": st.column_config.TextColumn(width="large"),
+                       "What it means": st.column_config.TextColumn(width="medium"),
+                       "Reading": st.column_config.TextColumn(width="medium")},
+        height=45 + 35 * len(tw_rows))
+    _tw = TwoWeekRules()
+    st.caption(md(
+        f"The **\"S&P 50-day ratio\"** is read here as the **% > 50D** column "
+        f"above — the same {m_uni.shape[1]:,} names, not the S&P 500 members, "
+        f"which this package does not list — and the index is **{tw_name}**"
+        + ("" if tw_name == "SPY" else " (SPY has no data this session)")
+        + f". Row 1 is Yes when the ratio is back at {_tw.level:.0f}% or more "
+        f"after being under it in the last {_tw.recovery_days} sessions, with "
+        f"{tw_name} up over them. Row 2 asks only on a {tw_name} 52-week-high "
+        f"close. Row 3 counts consecutive sessions under {_tw.level:.0f}% and, "
+        f"while the streak is short of {_tw.bear_days}, projects the session it "
+        "would reach it on — the live version of the source's \"Oct 6\"."))
 
     # ---- momentum leaders -------------------------------------------------
     st.divider()
