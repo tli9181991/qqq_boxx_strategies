@@ -84,6 +84,12 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
 PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
               "light_red": DN, "dark_red": DN_STRONG, "none": ""}
 
+# The daily monitor's % > 50D column. Under 30% is the line the checklist and
+# the two-week table read, so it gets a red strong enough to see at a glance
+# (the shared CELL "low" pink all but vanished under white text on the dark
+# theme); at or under 20% it deepens to the strong red.
+SLOW_BELOW_30, SLOW_BELOW_20 = "#d9534f", DN_STRONG
+
 # How many slots the residual book runs here. The research default is six,
 # the same as its total-return sibling, because the point of that comparison
 # is that ONLY the score differs. This dashboard runs it deeper on purpose:
@@ -2000,7 +2006,11 @@ with tab_market:
             return [f"background-color: {PULSE_CELL[ma_fast_cell(v, i)]}"
                     for i, v in enumerate(col)]
         if name == "% > 50D":
-            return [f"background-color: {CELL[ma_class(v, 'slow')]}" for v in col]
+            return [f"background-color: "
+                    + (SLOW_BELOW_20 if pd.notna(v) and v <= 20 else
+                       SLOW_BELOW_30 if pd.notna(v) and v < 30 else
+                       CELL[ma_class(v, 'slow')])
+                    for v in col]
         if name in ("SPY ATR", "QQQ ATR"):
             return [f"background-color: {CELL[atr_class(v)]}" for v in col]
         return ["" for _ in col]
@@ -2038,7 +2048,8 @@ with tab_market:
         f"**% > 20D** is shaded on the **last {_bp.ma_fast_recent} sessions "
         f"only** — green above {_bp.ma_fast_green:.0f}%, red at or below. It "
         "reads the tape now, and a shaded year of it is wallpaper. "
-        "% > 50D keeps the full-history scale: red below 20%, green above 80%. "
+        "% > 50D keeps the full-history scale: red under 30% (the "
+        "checklist's line), dark red at 20% or below, green above 80%. "
         "ATR shades red beyond ±5. The bar chart above keeps the plain "
         "up-is-green convention, since a signed bar already shows direction."
     )
