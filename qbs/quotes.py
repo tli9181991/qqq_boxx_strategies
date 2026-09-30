@@ -54,7 +54,7 @@ import numpy as np
 import pandas as pd
 
 from .data import MARKET_TZ, last_market_close, normalise_symbols
-from .universe_source import resolve_source
+from .universe_source import SOURCES, resolve_source
 
 FILL_VAR = "QBS_FILL_LAST_BAR"
 
@@ -63,19 +63,48 @@ def latest_quotes(source: Optional[str] = None,
                   **kwargs) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """`(quotes, error)` -- last price and volume per ticker, from the screener.
 
-    Indexed by ticker, columns `close` and `volume`. Returns `(None, reason)`
-    rather than raising: this is a top-up on data that already loaded, and a
-    failure to improve it must never take down what was already there.
+    Indexed by ticker, columns `close` and `volume`; `quotes.attrs["source"]`
+    names the screener that answered. Returns `(None, reason)` rather than
+    raising: this is a top-up on data that already loaded, and a failure to
+    improve it must never take down what was already there.
+
+    The configured source is asked first and the other one if it fails. The
+    two carry the same number -- the session's last price -- and Finviz in
+    particular blocks by IP (a Cloudflare 403) for hours at a time, so a
+    fallback is the difference between a filled bar and none. The universe
+    LIST is a different matter and does not fall back: the two disagree on
+    the last hundred names, and a breadth count that steps when the source
+    changed reads as a market event.
     """
-    name = resolve_source(source)
-    try:
-        frame = (_tradingview_quotes(**kwargs) if name == "tradingview"
-                 else _finviz_quotes(**kwargs))
-    except Exception as exc:  # noqa: BLE001
-        return None, f"{name}: {type(exc).__name__}: {exc}"
-    if frame is None or frame.empty:
-        return None, f"{name}: the screener returned no quotes"
-    return frame, None
+    first = resolve_source(source)
+    order = [first] + [s for s in SOURCES if s != first]
+    reasons = []
+    for name in order:
+        try:
+            frame = (_tradingview_quotes(**kwargs) if name == "tradingview"
+                     else _finviz_quotes(**kwargs))
+        except ImportError:
+            # Optional on purpose (see requirements-dashboard.txt), so say
+            # which package, not a traceback's worth of import machinery.
+            pkg = "tradingview-screener" if name == "tradingview" else "finvizfinance"
+            reasons.append(f"{name}: not installed (pip install {pkg})")
+            continue
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"{name}: {type(exc).__name__}: {_short(exc)}")
+            continue
+        if frame is None or frame.empty:
+            reasons.append(f"{name}: the screener returned no quotes")
+            continue
+        frame.attrs["source"] = name
+        return frame, None
+    return None, "; ".join(reasons)
+
+
+def _short(exc: Exception, limit: int = 160) -> str:
+    """The first sentence of an error, capped: a Cloudflare page or a proxy
+    traceback is paragraphs long and the banner only needs what failed."""
+    text = str(exc).strip().split("\n")[0]
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _tradingview_quotes(limit: int = 20_000, **_) -> pd.DataFrame:

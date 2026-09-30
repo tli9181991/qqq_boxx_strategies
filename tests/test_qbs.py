@@ -4614,3 +4614,64 @@ def test_spy_atr_is_filled_from_its_own_bars():
     assert t["qqq_atr"].isna().all(), "and QQQ stays empty when not given"
     with_close = daily_breadth(px, spy=s, spy_ohlc=ohlc).table["spy_atr"]
     pd.testing.assert_series_equal(with_close, t["spy_atr"])
+
+
+# --------------------------------------------------------------------------
+# Screener fallback and empty rows
+# --------------------------------------------------------------------------
+
+def test_quotes_fall_back_to_the_other_screener(monkeypatch):
+    """Finviz blocking the IP must not cost the top-up when TradingView answers."""
+    import qbs.quotes as Q
+
+    def blocked(**_):
+        raise RuntimeError("finviz blocked the request (Cloudflare challenge / 403)\nlong page")
+    good = pd.DataFrame({"close": [10.0], "volume": [1e6]}, index=["AAA"])
+    monkeypatch.setattr(Q, "_finviz_quotes", blocked)
+    monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: good.copy())
+    q, err = Q.latest_quotes("finviz")
+    assert err is None and q.attrs["source"] == "tradingview"
+
+    monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: pd.DataFrame())
+    q, err = Q.latest_quotes("finviz")
+    assert q is None and "finviz" in err and "tradingview" in err
+    assert "long page" not in err, "only the first line of a long error"
+
+
+def test_an_empty_row_is_not_reported_as_a_torn_bar():
+    """yfinance lists a session it has not published with nothing under it."""
+    from qbs.data import drop_partial_bars
+    px = _wide()
+    nxt = px.index[-1] + pd.Timedelta(days=1)
+    empty = px.copy()
+    empty.loc[nxt] = np.nan
+    out, dropped, _ = drop_partial_bars(empty)
+    assert dropped == [] and out.index[-1] == px.index[-1]
+
+
+def test_an_incremental_update_never_writes_an_empty_row():
+    from qbs.incremental import refresh_incremental
+    truth = _truth()
+    ghost = truth.index[-1] + pd.offsets.BDay(1)
+    served = truth.reindex(truth.index.append(pd.DatetimeIndex([ghost])))
+
+    def download(names, start):
+        c = served.loc[pd.Timestamp(start):, list(names)]
+        return c, None, []
+    closes, _, _, _ = refresh_incremental(truth.iloc[:-2], None, set(),
+                                          list(truth.columns), "2000-01-01", download)
+    assert ghost not in closes.index and closes.index[-1] == truth.index[-1]
+
+
+def test_a_missing_fallback_package_is_named_not_traced(monkeypatch):
+    import qbs.quotes as Q
+
+    def blocked(**_):
+        raise RuntimeError("403")
+
+    def missing(**_):
+        raise ModuleNotFoundError("No module named 'tradingview_screener'")
+    monkeypatch.setattr(Q, "_finviz_quotes", blocked)
+    monkeypatch.setattr(Q, "_tradingview_quotes", missing)
+    _, err = Q.latest_quotes("finviz")
+    assert "not installed (pip install tradingview-screener)" in err

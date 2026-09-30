@@ -158,7 +158,10 @@ def _top_up_front_bar(closes, volumes, online: bool, persist=None):
         return closes, volumes, None
     quotes, err = latest_quotes()
     if quotes is None:
-        return closes, volumes, f"could not top up the newest bar — {err}"
+        return closes, volumes, (
+            f"could not top up the newest bar from either screener ({err}). "
+            "The session arrives when yfinance publishes it — usually within a "
+            "few hours of the close — and a reload after that picks it up")
     closes, volumes, report = fill_last_bar(closes, volumes, quotes)
     if persist and report.get("tickers"):
         names, session = report["tickers"], report["session"]
@@ -166,7 +169,7 @@ def _top_up_front_bar(closes, volumes, online: bool, persist=None):
                if "volume" in quotes.columns else None)
         persist_fill(persist[0], session, closes.loc[session, names],
                      persist[1], vol)
-    return closes, volumes, fill_note(report)
+    return closes, volumes, fill_note(report, quotes.attrs.get("source"))
 
 
 def _read_cache(download_start: str, fetch_members: bool = False):
