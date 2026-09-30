@@ -319,6 +319,10 @@ def load_universe_prices(
     px, vol, failed = _download_universe(tickers, start, end, batch_size)
     if px is None:
         raise RuntimeError("no price data returned for any ticker in the universe")
+    # A date with no price under it is not a session (see refresh_incremental).
+    px = px.dropna(how="all")
+    if vol is not None:
+        vol = vol.reindex(px.index)
 
     if verbose:
         print(f"[universe] {px.shape[1]} tickers, {len(px)} rows, "

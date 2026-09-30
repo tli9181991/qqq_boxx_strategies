@@ -672,6 +672,10 @@ def load_universe_bars(
             return c, v, (f"no price data returned for any of {len(tickers)} tickers "
                           f"(every batch failed; last reason: {last_error})")
         clear_marks(c_path)
+    # A date with no price under it is not a session (see refresh_incremental).
+    cdf = cdf.dropna(how="all")
+    if vdf is not None:
+        vdf = vdf.reindex(cdf.index)
 
     # The cache keeps what arrived; the caller gets what is whole. Writing
     # the trimmed frame would throw away the dozen names that DID report,
