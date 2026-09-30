@@ -1099,7 +1099,9 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
 
     uvol = load_universe_volumes(list(names))
     rows, missing = [], []
-    day_cols = ["Hammer D0", "Hammer D-1", "Hammer D-2"]
+    # One column per merged-candle length, all ending on the latest session:
+    # the last day alone, the last two merged, the last three merged.
+    day_cols = ["Hammer 1-day", "Hammer 2-day", "Hammer 3-day"]
     verdicts: Dict[str, list] = {c: [] for c in day_cols}
     for t in names:
         ohlc = ohlc_for(t, download_start, bool(online), BAR_EPOCH)
@@ -1130,13 +1132,12 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 row[c] = "—"
                 verdicts[c].append(None)
         else:
-            hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
-            for i, c in enumerate(day_cols):
-                if i >= len(hf):
+            for span, c in enumerate(day_cols, start=1):
+                if len(bars) < span:
                     row[c] = "—"
                     verdicts[c].append(None)
                     continue
-                b = hf.iloc[i]
+                b = hammer_frame(bars, rules, span=span).iloc[-1]
                 share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
                 if b["hammer"]:
                     row[c], v = f"🔨 {share}", "hammer"
@@ -1716,15 +1717,21 @@ with tab_picks:
             "two; *Avg $ vol* is close × shares over the same window. "
             "*Bar* is the date of the last candle read, which can trail the "
             "slider when a name's OHLC is behind the ranking cache. "
-            "**Hammer D0 / D-1 / D-2** are the last three candles, newest "
-            "first, each showing the lower shadow as a share of the day's "
-            "range. A candle is a hammer **shape** when: body ≤ "
+            "**Hammer 1-day / 2-day / 3-day** read the candle of the last "
+            "session alone, then the last **two** and last **three** sessions "
+            "merged into one candle — first session's open, last session's "
+            "close, the highest high and lowest low between them — the way a "
+            "chart is read when a sell-off one day is bought back the next. "
+            "Each shows the lower shadow as a share of that candle's range. A "
+            "candle is a hammer **shape** when: body ≤ "
             f"{HR.max_body:.0%} of the range · lower shadow ≥ "
             f"{HR.min_lower_to_body:g}× the body **and** ≥ {HR.min_lower:.0%} "
             f"of the range · upper shadow ≤ {HR.max_upper:.0%} of the range · "
-            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR "
-            "(a tiny range says nothing). 🔨 is that shape **after a "
-            f"{HR.trend_days}-session decline** — the reversal pattern. ⚠️ is "
+            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR, "
+            "× √2 and × √3 for the merged candles (a tiny range says "
+            f"nothing). 🔨 is that shape **after a {HR.trend_days}-session "
+            "decline** into the candle's first session — the reversal "
+            "pattern. ⚠️ is "
             "the same shape after a rise, a *hanging man*, which reads the "
             "other way. ◐ is the shape with a flat prior trend. "
             "Descriptive only — nothing here changes a ranking or a holding."

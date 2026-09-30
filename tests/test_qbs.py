@@ -4724,3 +4724,23 @@ def test_two_week_false_high_fires_when_names_sit_at_new_lows():
                            index=idx)                                # every name at a new low
     row = {r["key"]: r for r in two_week_table(falling, index, pct)}["false_high"]
     assert row["answer"] is True, row["reading"]
+
+
+def test_a_two_day_merge_finds_the_hammer_neither_day_shows():
+    """Down hard one day, bought back the next: two ordinary candles, one hammer."""
+    from qbs.candles import hammer_frame
+
+    def pair(c):
+        # Day 1 opens at c and closes near its low; day 2 opens low and
+        # closes back near c. Neither is a hammer alone.
+        return [[c, c + 0.2, c - 3.8, c - 3.5], [c - 3.5, c + 0.1, c - 3.6, c - 0.2]]
+    rows, c = [], 100.0
+    for _ in range(20):
+        o, c = c, c - 0.5
+        rows.append([o, max(o, c) + 0.5, min(o, c) - 0.5, c])
+    rows += pair(c)
+    idx = pd.bdate_range("2026-01-01", periods=len(rows))
+    bars = pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=idx)
+    one, two = hammer_frame(bars).iloc[-1], hammer_frame(bars, span=2).iloc[-1]
+    assert not one["shape"] and not hammer_frame(bars).iloc[-2]["shape"]
+    assert two["hammer"], two.to_dict()
