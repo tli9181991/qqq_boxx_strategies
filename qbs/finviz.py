@@ -65,6 +65,134 @@ CACHE_DIR = os.path.join(
 UNIVERSE_CSV = os.path.join(CACHE_DIR, "finviz_universe.csv")
 BARS_DIR = os.path.join(CACHE_DIR, "universe")
 FETCH_STAMP = os.path.join(BARS_DIR, "us_last_fetch.txt")
+BLOCK_STAMP = os.path.join(BARS_DIR, "finviz_blocked_until.txt")
+
+
+# --------------------------------------------------------------------------
+# Request pacing and the cool-down after a block
+# --------------------------------------------------------------------------
+# One screener pull is ~130 pages of 20 rows. Finviz sits behind Cloudflare,
+# which answers sustained crawling with a challenge page ("Slow down your
+# request rate") and, if the crawling carries on, a longer IP ban. So every
+# screener call here goes through `screener_pull`, which:
+#
+# * waits QBS_FINVIZ_SLEEP seconds between pages (default 3, never under 1),
+#   jittered 80-140% so the pages do not arrive on a metronome, and
+# * after a block, refuses to ask Finviz again for QBS_FINVIZ_COOLDOWN_HOURS
+#   (default 6), recorded on disk so an app restart does not reset it.
+#   Retrying into a block is exactly what turns a warning into a ban.
+
+SLEEP_VAR = "QBS_FINVIZ_SLEEP"
+DEFAULT_SLEEP = 3.0
+COOLDOWN_VAR = "QBS_FINVIZ_COOLDOWN_HOURS"
+DEFAULT_COOLDOWN_HOURS = 6.0
+
+
+class FinvizCoolingDown(RuntimeError):
+    """Finviz blocked us recently; no request was sent."""
+
+
+def _env_float(var: str, default: float, low: float,
+               environ: Optional[Dict[str, str]] = None) -> float:
+    env = os.environ if environ is None else environ
+    try:
+        return max(low, float((env.get(var) or "").strip() or default))
+    except ValueError:
+        return default
+
+
+def finviz_pace(environ: Optional[Dict[str, str]] = None) -> float:
+    """Seconds between screener pages: QBS_FINVIZ_SLEEP, default 3, at least 1."""
+    return _env_float(SLEEP_VAR, DEFAULT_SLEEP, 1.0, environ)
+
+
+def blocked_until(path: Optional[str] = None,
+                  now: Optional[pd.Timestamp] = None) -> Optional[pd.Timestamp]:
+    """When the cool-down ends (UTC), or None when Finviz may be asked."""
+    path = path or BLOCK_STAMP
+    try:
+        with open(path) as fh:
+            until = pd.Timestamp(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    until = until.tz_localize("UTC") if until.tzinfo is None else until.tz_convert("UTC")
+    now = pd.Timestamp.now("UTC") if now is None else pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    return until if until > now else None
+
+
+def note_blocked(path: Optional[str] = None, now: Optional[pd.Timestamp] = None,
+                 environ: Optional[Dict[str, str]] = None) -> pd.Timestamp:
+    """Start the cool-down; returns when it ends. Never raises."""
+    path = path or BLOCK_STAMP
+    hours = _env_float(COOLDOWN_VAR, DEFAULT_COOLDOWN_HOURS, 0.0, environ)
+    now = pd.Timestamp.now("UTC") if now is None else pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    until = now + pd.Timedelta(hours=hours)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(until.isoformat())
+    except OSError:
+        pass
+    return until
+
+
+def _is_block(exc: BaseException) -> bool:
+    """A Cloudflare wall / rate limit, as opposed to any other failure."""
+    if type(exc).__name__ == "FinvizBlockedError":
+        return True
+    text = str(exc).lower()
+    return any(k in text for k in ("403", "429", "rate-limit", "rate limit",
+                                   "slow down", "cloudflare"))
+
+
+def cooldown_note(until: pd.Timestamp) -> str:
+    hh, mm, tz, _ = fetch_schedule()
+    return (f"Finviz blocked a request earlier, so it is not being asked again "
+            f"until {until.tz_convert(tz):%m-%d %H:%M} {tz} — retrying into a "
+            "block is what turns a warning into a ban")
+
+
+def screener_pull(filters_dict: Dict[str, str], sleep_sec: Optional[float] = None,
+                  block_path: Optional[str] = None) -> pd.DataFrame:
+    """The Finviz Overview screener, paced and guarded. Raises on failure.
+
+    Raises `FinvizCoolingDown` without sending anything while a cool-down is
+    running; starts one when Finviz answers with a block.
+    """
+    until = blocked_until(block_path)
+    if until is not None:
+        raise FinvizCoolingDown(cooldown_note(until))
+
+    import random
+    import time
+
+    from finvizfinance.screener.overview import Overview
+    try:
+        # Only for the jitter. A library version that moves this module still
+        # gets the plain fixed pace, which is the part that matters.
+        from finvizfinance.screener import base as fz_base
+    except ImportError:
+        fz_base = None
+
+    pace = finviz_pace() if sleep_sec is None else max(1.0, float(sleep_sec))
+    view = Overview()
+    view.set_filter(filters_dict=filters_dict)
+    # The library sleeps a fixed `sleep_sec` between pages through its own
+    # module-level `sleep`; swapped for the duration of this call to add jitter.
+    original = getattr(fz_base, "sleep", None) if fz_base is not None else None
+    if original is not None:
+        fz_base.sleep = lambda s: time.sleep(s * random.uniform(0.8, 1.4))
+    try:
+        return view.screener_view(order="Ticker", verbose=0, sleep_sec=pace)
+    except Exception as exc:
+        if _is_block(exc):
+            note_blocked(block_path)
+        raise
+    finally:
+        if original is not None:
+            fz_base.sleep = original
 
 
 # --------------------------------------------------------------------------
@@ -265,7 +393,7 @@ def fetch_us_universe(
     offline: bool = False,
     cache_path: str = UNIVERSE_CSV,
     max_age_days: int = 1,
-    sleep_sec: int = 1,
+    sleep_sec: Optional[float] = None,
     verbose: bool = True,
 ) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """`(universe, error)` -- Ticker / Sector / Industry / Country for the US market.
@@ -304,7 +432,7 @@ def fetch_us_universe(
 
     try:
         try:
-            from finvizfinance.screener.overview import Overview
+            import finvizfinance  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "finvizfinance is not installed in the environment running this "
@@ -313,13 +441,15 @@ def fetch_us_universe(
                 f"has to be the same interpreter running Streamlit). [{exc}]"
             ) from exc
 
-        view = Overview()
-        view.set_filter(filters_dict=filters.as_dict())
-        df = view.screener_view(order="Ticker", verbose=0, sleep_sec=sleep_sec)
+        df = screener_pull(filters.as_dict(), sleep_sec)
         if df is None or df.empty:
             raise RuntimeError("screener returned no rows")
 
-        keep = [c for c in ("Ticker", "Company", "Sector", "Industry", "Country")
+        # Price and Volume are kept: pulled after a close they ARE that
+        # session's closes, so `qbs.quotes` can top up a late yfinance bar
+        # from this file instead of crawling the same 130 pages again.
+        keep = [c for c in ("Ticker", "Company", "Sector", "Industry", "Country",
+                            "Price", "Volume")
                 if c in df.columns]
         if "Ticker" not in keep:
             raise RuntimeError(f"no Ticker column in {list(df.columns)[:8]}")
@@ -335,7 +465,8 @@ def fetch_us_universe(
                   if "Sector" in out.columns else f"[finviz] {len(out)} tickers")
         return out, None
     except Exception as exc:  # noqa: BLE001
-        reason = f"{type(exc).__name__}: {exc}"
+        reason = (str(exc) if isinstance(exc, FinvizCoolingDown)
+                  else f"{type(exc).__name__}: {exc}")
         if verbose:
             print(f"[finviz] universe fetch failed ({reason})")
         if cached is not None and not cached.empty:
