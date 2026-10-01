@@ -219,7 +219,6 @@ def _load_and_compute(cfg: Config, live: LiveConfig, refresh: bool = True,
         watch_names=live.watchlist if shadow else (),
         base_notional=live.notional,
         residual_notional=live.residual_notional,
-        compare_exit_drop=live.compare_exit_drop if shadow else 0,
     )
     return px, book
 
@@ -241,11 +240,8 @@ def _write_csv_logs(live: LiveConfig, book=None) -> None:
         if book is not None and book.watchlist:
             st.append_watchlist_csv(live.watchlist_csv_path,
                                     f"{book.asof:%Y-%m-%d}", book.watchlist)
-        # Written when there is a second sleeve to compare against: the live
-        # residual sleeve, or the paper exit-drop one.
         if (book is not None and book.strategy_daily_returns
-                and (live.residual_notional > 0
-                     or "momentum6_exitdrop" in book.strategy_daily_returns)):
+                and live.residual_notional > 0):
             st.upsert_strategy_comparison_csv(
                 live.strategy_comparison_csv_path, f"{book.asof:%Y-%m-%d}", book)
         store.export_trade_csv(live.db_path, live.trade_csv_path)
@@ -658,9 +654,7 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
     if comparison:
         labels = {"momentum": "momentum book (as traded, vol-scaled)",
                   "momentum6": "momentum top 6 (equal slots)",
-                  "resmom": "residual top 6 (equal slots)",
-                  "momentum6_exitdrop": (f"momentum top 6, exit entry rank "
-                                         f"+{live.compare_exit_drop} (paper)")}
+                  "resmom": "residual top 6 (equal slots)"}
         print("STRATEGY COMPARISON (model return after configured costs)")
         for row in comparison:
             print(f"  {labels.get(row['strategy'], row['strategy']):<40} "
@@ -671,10 +665,6 @@ def phase_report(live: LiveConfig, days: int = 10) -> int:
             edge = by["resmom"]["return"] - by["momentum6"]["return"]
             print(f"  residual six vs momentum six: {edge:+.2%} "
                   f"({'residual' if edge > 0 else 'momentum'} ahead)")
-        if "momentum6" in by and "momentum6_exitdrop" in by:
-            edge = by["momentum6_exitdrop"]["return"] - by["momentum6"]["return"]
-            print(f"  exit entry+{live.compare_exit_drop} vs fixed band: {edge:+.2%} "
-                  f"({'entry-rank exit' if edge > 0 else 'fixed band'} ahead)")
         print()
 
     nav = store.nav_history(live.db_path, limit=days)
