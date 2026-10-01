@@ -77,6 +77,25 @@ def latest_quotes(source: Optional[str] = None,
     changed reads as a market event.
     """
     first = resolve_source(source)
+    session = last_market_close().tz_localize(None).normalize()
+
+    # 1. Already answered this session, in this process: the picks tab and the
+    #    market tab both top up, and must not crawl the screener twice. A
+    #    failure is remembered for a while too, so a block is not re-asked on
+    #    the very next rerun.
+    memo = _QUOTE_MEMO.get((first, session))
+    if memo is not None:
+        frame, err, at = memo
+        if frame is not None or (pd.Timestamp.now("UTC") - at) < FAILURE_MEMO:
+            return (frame.copy() if frame is not None else None), err
+
+    # 2. The universe list pulled after the close already holds every close.
+    frame = _universe_quotes() if first == "finviz" else None
+    if frame is not None:
+        frame.attrs["source"] = "finviz"
+        _QUOTE_MEMO[(first, session)] = (frame, None, pd.Timestamp.now("UTC"))
+        return frame.copy(), None
+
     order = [first] + [s for s in SOURCES if s != first]
     reasons = []
     for name in order:
@@ -90,14 +109,62 @@ def latest_quotes(source: Optional[str] = None,
             reasons.append(f"{name}: not installed (pip install {pkg})")
             continue
         except Exception as exc:  # noqa: BLE001
-            reasons.append(f"{name}: {type(exc).__name__}: {_short(exc)}")
+            from .finviz import FinvizCoolingDown
+            reasons.append(f"{name}: {exc}" if isinstance(exc, FinvizCoolingDown)
+                           else f"{name}: {type(exc).__name__}: {_short(exc)}")
             continue
         if frame is None or frame.empty:
             reasons.append(f"{name}: the screener returned no quotes")
             continue
         frame.attrs["source"] = name
-        return frame, None
-    return None, "; ".join(reasons)
+        _QUOTE_MEMO[(first, session)] = (frame, None, pd.Timestamp.now("UTC"))
+        return frame.copy(), None
+    err = "; ".join(reasons)
+    _QUOTE_MEMO[(first, session)] = (None, err, pd.Timestamp.now("UTC"))
+    return None, err
+
+
+# (source, session) -> (quotes or None, error, when). Process-wide on purpose:
+# Streamlit reruns the script in the same process, and this is what stops the
+# two tabs -- and the next rerun -- from each crawling the screener.
+_QUOTE_MEMO: Dict[Tuple[str, pd.Timestamp], Tuple] = {}
+# How long a failed attempt is reused before the screener is asked again.
+FAILURE_MEMO = pd.Timedelta(minutes=30)
+
+
+def clear_quote_memo() -> None:
+    _QUOTE_MEMO.clear()
+
+
+def _universe_quotes(path: Optional[str] = None,
+                     now: Optional[pd.Timestamp] = None) -> Optional[pd.DataFrame]:
+    """Closes from the cached Finviz universe list, when it was pulled after
+    the latest close; None otherwise.
+
+    `fetch_us_universe` keeps the screener's Price and Volume. Pulled after
+    the bell, Price IS the session's close -- the same number a second
+    130-page crawl would return -- so this is the top-up at zero requests.
+    Pulled before the close it is an intraday print, and is not used.
+    """
+    import os
+
+    from .finviz import UNIVERSE_CSV
+
+    path = path or UNIVERSE_CSV
+    try:
+        written = pd.Timestamp(os.path.getmtime(path), unit="s", tz="UTC")
+        if written < last_market_close(now).tz_convert("UTC"):
+            return None
+        df = pd.read_csv(path)
+    except (OSError, ValueError):
+        return None
+    if "Ticker" not in df.columns or "Price" not in df.columns:
+        return None
+    try:
+        out = _shape_quotes(df["Ticker"], df["Price"], df.get("Volume"))
+    except RuntimeError:
+        return None
+    return out if not out.empty else None
 
 
 def _short(exc: Exception, limit: int = 160) -> str:
@@ -127,14 +194,13 @@ def _tradingview_quotes(limit: int = 20_000, **_) -> pd.DataFrame:
     return _shape_quotes(sym, df.get("close"), df.get("volume"))
 
 
-def _finviz_quotes(sleep_sec: int = 1, **_) -> pd.DataFrame:
-    from finvizfinance.screener.overview import Overview
+def _finviz_quotes(sleep_sec: Optional[float] = None, **_) -> pd.DataFrame:
+    import finvizfinance  # noqa: F401 -- ImportError names the missing package
 
-    from .finviz import UniverseFilters
+    from .finviz import UniverseFilters, screener_pull
 
-    view = Overview()
-    view.set_filter(filters_dict=UniverseFilters().as_dict())
-    df = view.screener_view(order="Ticker", verbose=0, sleep_sec=sleep_sec)
+    # Paced (QBS_FINVIZ_SLEEP) and refused outright during a cool-down.
+    df = screener_pull(UniverseFilters().as_dict(), sleep_sec)
     if df is None or df.empty or "Ticker" not in df.columns:
         return pd.DataFrame()
     # The Overview table names them Price and Volume; both have moved before,

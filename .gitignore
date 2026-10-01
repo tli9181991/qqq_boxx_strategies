@@ -47,6 +47,7 @@ data/universe/us_volumes.csv
 # state -- committing it would hand every checkout someone else's "already
 # fetched today" and suppress the first fetch on a fresh clone.
 data/universe/us_last_fetch.txt
+data/universe/finviz_blocked_until.txt
 
 # Fundamentals snapshots fetched by the analyst. Deliberately untracked: each
 # file is a picture of ONE day's ratios with no history in it, so a committed

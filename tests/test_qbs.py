@@ -4627,12 +4627,15 @@ def test_quotes_fall_back_to_the_other_screener(monkeypatch):
     def blocked(**_):
         raise RuntimeError("finviz blocked the request (Cloudflare challenge / 403)\nlong page")
     good = pd.DataFrame({"close": [10.0], "volume": [1e6]}, index=["AAA"])
+    monkeypatch.setattr(Q, "_universe_quotes", lambda *a, **k: None)
+    Q.clear_quote_memo()
     monkeypatch.setattr(Q, "_finviz_quotes", blocked)
     monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: good.copy())
     q, err = Q.latest_quotes("finviz")
     assert err is None and q.attrs["source"] == "tradingview"
 
     monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: pd.DataFrame())
+    Q.clear_quote_memo()
     q, err = Q.latest_quotes("finviz")
     assert q is None and "finviz" in err and "tradingview" in err
     assert "long page" not in err, "only the first line of a long error"
@@ -4673,6 +4676,8 @@ def test_a_missing_fallback_package_is_named_not_traced(monkeypatch):
         raise ModuleNotFoundError("No module named 'tradingview_screener'")
     monkeypatch.setattr(Q, "_finviz_quotes", blocked)
     monkeypatch.setattr(Q, "_tradingview_quotes", missing)
+    monkeypatch.setattr(Q, "_universe_quotes", lambda *a, **k: None)
+    Q.clear_quote_memo()
     _, err = Q.latest_quotes("finviz")
     assert "not installed (pip install tradingview-screener)" in err
 
@@ -4744,3 +4749,92 @@ def test_a_two_day_merge_finds_the_hammer_neither_day_shows():
     one, two = hammer_frame(bars).iloc[-1], hammer_frame(bars, span=2).iloc[-1]
     assert not one["shape"] and not hammer_frame(bars).iloc[-2]["shape"]
     assert two["hammer"], two.to_dict()
+
+
+
+# --------------------------------------------------------------------------
+# Finviz pacing, cool-down and request reuse
+# --------------------------------------------------------------------------
+
+def test_finviz_pace_defaults_to_three_seconds_and_never_under_one():
+    from qbs.finviz import finviz_pace
+    assert finviz_pace({}) == 3.0
+    assert finviz_pace({"QBS_FINVIZ_SLEEP": "5"}) == 5.0
+    assert finviz_pace({"QBS_FINVIZ_SLEEP": "0.2"}) == 1.0
+    assert finviz_pace({"QBS_FINVIZ_SLEEP": "fast"}) == 3.0
+
+
+def test_a_block_starts_a_cooldown_that_sends_nothing(tmp_path, monkeypatch):
+    import finvizfinance.screener.overview as ov
+    from qbs.finviz import FinvizCoolingDown, blocked_until, screener_pull
+
+    stamp = str(tmp_path / "blocked.txt")
+    calls = []
+
+    class Blocked:
+        def set_filter(self, **_):
+            pass
+
+        def screener_view(self, **kw):
+            calls.append(kw)
+            raise RuntimeError("finviz blocked the request (Cloudflare challenge / 403)")
+    monkeypatch.setattr(ov, "Overview", Blocked)
+    with pytest.raises(RuntimeError):
+        screener_pull({}, block_path=stamp)
+    assert len(calls) == 1 and calls[0]["sleep_sec"] == 3.0
+    assert blocked_until(stamp) is not None, "the block must start a cool-down"
+    with pytest.raises(FinvizCoolingDown):
+        screener_pull({}, block_path=stamp)
+    assert len(calls) == 1, "nothing may be sent while cooling down"
+
+
+def test_an_ordinary_failure_does_not_start_a_cooldown(tmp_path, monkeypatch):
+    import finvizfinance.screener.overview as ov
+    from qbs.finviz import blocked_until, screener_pull
+
+    class Broken:
+        def set_filter(self, **_):
+            pass
+
+        def screener_view(self, **_):
+            raise ValueError("table layout changed")
+    monkeypatch.setattr(ov, "Overview", Broken)
+    stamp = str(tmp_path / "blocked.txt")
+    with pytest.raises(ValueError):
+        screener_pull({}, block_path=stamp)
+    assert blocked_until(stamp) is None
+
+
+def test_the_universe_pull_after_the_close_is_the_top_up(tmp_path):
+    import os
+    from qbs.data import last_market_close
+    from qbs.quotes import _universe_quotes
+
+    path = str(tmp_path / "finviz_universe.csv")
+    pd.DataFrame({"Ticker": ["AAA", "BBB"], "Sector": ["Tech", "Tech"],
+                  "Price": [10.5, 20.25], "Volume": [1e6, 2e6]}).to_csv(path, index=False)
+    close = last_market_close()
+    after = (close + pd.Timedelta(hours=2)).timestamp()
+    os.utime(path, (after, after))
+    q = _universe_quotes(path, now=close + pd.Timedelta(hours=3))
+    assert q is not None and q.at["AAA", "close"] == 10.5
+    before = (close - pd.Timedelta(hours=2)).timestamp()
+    os.utime(path, (before, before))
+    assert _universe_quotes(path, now=close + pd.Timedelta(hours=3)) is None, \
+        "a list pulled before the bell holds intraday prices"
+
+
+def test_two_tabs_share_one_screener_pull(monkeypatch):
+    import qbs.quotes as Q
+    calls = []
+
+    def once(**_):
+        calls.append(1)
+        return pd.DataFrame({"close": [10.0], "volume": [1e6]}, index=["AAA"])
+    monkeypatch.setattr(Q, "_universe_quotes", lambda *a, **k: None)
+    monkeypatch.setattr(Q, "_finviz_quotes", once)
+    Q.clear_quote_memo()
+    a, _ = Q.latest_quotes("finviz")
+    b, _ = Q.latest_quotes("finviz")
+    assert len(calls) == 1 and a.equals(b)
+    Q.clear_quote_memo()
