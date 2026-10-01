@@ -145,9 +145,9 @@ class MomentumParams:
     # `exit_rank` is then unused. Measured over 2022-2026 at 8 it beat the
     # fixed band of 8 in six of six (n_hold, window) cells at about half the
     # turnover, and roughly tied a fixed band of n_hold + 8 -- most of the
-    # gain is the wider band, not the per-name line. Logged beside the live
-    # book by the preflight comparison (`LiveConfig.compare_exit_drop`)
-    # rather than traded; see docs/TOP20_SELECTION.md.
+    # gain is the wider band, not the per-name line. Not used by the live
+    # app; compare it against the live book with scripts/exit_drop_sim.py
+    # after preflight. See docs/TOP20_SELECTION.md.
     exit_drop: int | None = None
 
     def __post_init__(self):

@@ -81,9 +81,16 @@ CAGR in 6 of 6 cells at about half the turnover, and beat a fixed exit of
 `n_hold + 8` on CAGR in 4 of 6; the fixed exit had the lower turnover in all
 6. Most of the gain is the wider band. Drops of 4 and 12 were worse than 8.
 
-It is logged, not traded: preflight scores it daily into
-`var/strategy_comparison.csv` as `momentum6_exitdrop`, beside `momentum6`
-(`QBS_COMPARE_EXIT_DROP`, see `deploy/docker/README.md`).
+It is not traded and the live app does not use it. To compare it against
+the live rule on real data, run the sandbox script after preflight. It reads
+the price cache preflight refreshed (`data/`), is read-only, and prints both
+books' holdings today, their net return since a start date, and the
+full-history backtest:
+
+```bash
+python scripts/exit_drop_sim.py --since 2026-10-01   # compounding from that date
+python scripts/exit_drop_sim.py --days 21            # or the last 21 sessions
+```
 
 ## BE and TSM
 

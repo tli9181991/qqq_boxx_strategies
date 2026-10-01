@@ -318,7 +318,6 @@ def compute_targets(
     watch_names: Sequence[str] = (),
     base_notional: float = 1.0,
     residual_notional: float = 0.0,
-    compare_exit_drop: int = 0,
 ) -> TargetBook:
     """Run the real strategy over the real history and return today's last row.
 
@@ -482,20 +481,6 @@ def compute_targets(
     sleeves = {"momentum": vt, "momentum6": mom}
     if residual_sig is not None:
         sleeves["resmom"] = residual_sig
-    if compare_exit_drop > 0:
-        # Paper only: the same ranking and slots as "momentum6", with each
-        # name sold once it falls `compare_exit_drop` places below the rank it
-        # was bought at. Nothing reads it but the comparison log, and a
-        # failure here costs a log line, never the signal.
-        try:
-            from dataclasses import replace as _replace
-            sleeves["momentum6_exitdrop"] = cross_sectional_momentum(
-                uni, prices[safe],
-                _replace(cfg.momentum, exit_drop=int(compare_exit_drop)),
-                eligible=leaders, name="momentum6_exitdrop")
-        except Exception as exc:          # noqa: BLE001
-            log.warning("exit-drop comparison could not be scored (%s: %s); the "
-                        "live book is unaffected", type(exc).__name__, exc)
     daily_returns: Dict[str, Dict[str, Dict]] = {}
     for key, signal in sleeves.items():
         series = _net_returns(signal).tail(RETURN_BACKFILL_SESSIONS)
@@ -585,8 +570,6 @@ def compute_targets(
                            **({"resmom": residual_held} if residual_weights else {})},
         strategy_notionals={"momentum": base_notional,
                             "momentum6": residual_notional or base_notional,
-                            **({"momentum6_exitdrop": residual_notional or base_notional}
-                               if "momentum6_exitdrop" in daily_returns else {}),
                             **({"resmom": funded} if residual_weights else {})},
         strategy_daily_returns=daily_returns,
     )
