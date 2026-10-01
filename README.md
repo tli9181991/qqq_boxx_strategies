@@ -47,6 +47,7 @@ download while you iterate on the other three.
 Optional extras, each in its own requirements file so the backtest never depends on
 them: `requirements-dashboard.txt` (Streamlit),
 `requirements-agent.txt` ([the LLM analyst](#the-llm-analyst)),
+`requirements-mcp.txt` ([the MCP server for Claude](#analysing-with-claude-the-mcp-server)),
 `requirements-live.txt` (IB trading).
 
 ---
@@ -850,8 +851,11 @@ qbs/
     evidence.py     the lab's own numbers as text, each with its caveat attached
     fundamentals.py yfinance company data, cached      (no LangChain import)
     news.py         web search + Yahoo headlines       (no LangChain import)
-    tools.py        the three above, as LangChain tools
     analyst.py      a Gemini agent that may call them
+    toolkit.py      the tools, defined once for every caller below
+    tools.py        ... wrapped for LangChain (in-process, or from a server)
+    mcp_server.py   ... served over MCP, stdio or HTTP
+    mcp_client.py   ... called from a notebook, a script or the analyst
 run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
@@ -865,6 +869,8 @@ tests/test_qbs.py 166 tests: indicators, engine, momentum, circuit-breaker,
 tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
                   precedence, the kill switch, its tools, and one real agent
                   run driven by a scripted model (no key, no network)
+tests/test_mcp.py the shared toolkit, the MCP server's token gate, and real
+                  client <-> server round trips over stdio and HTTP
 
 patreon_pipeline/ nothing to do with the strategy. A Gmail-triggered Patreon
                   downloader that transcribes with Whisper and uploads both the
@@ -1272,9 +1278,11 @@ python -m qbs.agent --report name --ticker MU      # no LLM, no key, no network
 ```
 
 Or use the dashboard's **🤖 Analyst** tab: the same price/levels/momentum panel the
-picks tab shows on the left, and a **chat** on the right. The combo box lists the
-high-momentum names first, then the momentum book, then the rest of the universe, and
-the selected ticker rides along with each message — so *"is it extended?"* means the
+picks tab shows on the left, and a **chat** on the right. The combo box lists your
+watchlist first, then the **Market overview's sector leaders** (the rows of its
+"High-momentum names by sector" table, at its "Names per sector" setting, labelled
+e.g. `ZETA · Energy leader #1`), then the high-momentum screen, then the momentum book,
+then the rest of the universe. The selected ticker rides along with each message — so *"is it extended?"* means the
 name on screen rather than whatever was mentioned last.
 
 The chat is a conversation, not a series of one-shot questions: the transcript is
@@ -1450,33 +1458,46 @@ any of these — a rerun alone will not pick it up.
 | `market_news` | the News tab's feed for the last N hours, plus that tab's cached model read |
 
 That is the full tool set, used by the CLI. **The dashboard's chat works differently:**
-what the dashboard has already computed goes to the model up front, as two JSON
-aggregates in the system prompt (`qbs/agent/context.py`):
+the user names the stock to discuss, and the dashboard's own numbers answer
+(`qbs/agent/context.py`):
 
 ```
-Market overview (~2,400 US names) ─→ MARKET_CONTEXT ─┐
-NDX + watchlist closes            ─→ STOCK_CONTEXT  ─┼─→ Gemini
-fundamentals / news tools         ───────────────────┘
+Market overview (~2,400 US names) ─→ MARKET_CONTEXT (in the prompt) ─┐
+"tell me about MRVL" ─→ stock_data("MRVL") ─→ STOCK_CONTEXT ─────────┼─→ Gemini
+fundamentals / news tools ───────────────────────────────────────────┘
 ```
 
-- **MARKET_CONTEXT** — breadth (4% movers, % above the 20/50-day, leaders), SPY/QQQ
-  stretch in ATR, the 5- and 20-session breadth trend, the checklist (score and which
-  rows fired), sector leadership, and the limits of the reading. Aggregates only; the
-  2,400-name frame never reaches the model. On the Nasdaq-100 fallback it says so.
-- **STOCK_CONTEXT** — only for the name on the chart, which is a Nasdaq-100 constituent
-  or a watchlist name: membership, **normal and residual momentum** (score, rank, held
-  by the book or not), trend vs the EMAs and SMA 200, returns vs QQQ/SPY, market
-  percentile, nearest levels, volume. A watchlist name outside the index is
-  `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx` and
-  `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
-- **Tools: only `fundamentals`, `ticker_headlines` and `search_news`.** "Why do AMD's
-  normal and residual momentum differ?" is answered from the context with no call;
+- **MARKET_CONTEXT** — sent with every message: breadth (4% movers, % above the
+  20/50-day, leaders), SPY/QQQ stretch in ATR, the 5- and 20-session breadth trend,
+  the checklist (score and which rows fired), sector leadership, and the limits of the
+  reading. Aggregates only; the 2,400-name frame never reaches the model. On the
+  Nasdaq-100 fallback it says so.
+- **`stock_data(ticker)`** — called for whichever stock the user names ("tell me
+  about MRVL", then "how about TSM?"): membership, **normal and residual momentum**
+  (score, rank, held by the book or not), trend vs the EMAs and SMA 200, returns vs
+  QQQ/SPY, market percentile, nearest levels, volume. A watchlist name outside the
+  index is `"membership": "watchlist_outside_ndx"` with a `placement_rank_against_ndx`
+  and `currently_held: false`, so it cannot be mistaken for a constituent or a holding.
+  A sector leader outside the index reads the same way under
+  `"sector_leader_outside_ndx"`, and any leader, constituent or not, carries a
+  `sector_leader` block: its sector and its rank among that sector's leaders.
+- **The focus list is the dashboard's tables** — the Nasdaq-100 constituents, the
+  watchlist, and the Market overview's sector leaders. A leader outside the index is
+  charted and ranked from the US universe's closes, the same prices the Overview picked
+  it from, placed among the constituents the way that table places it. Any other name
+  gets, word for word: *"The stock is not in our focused list, please add it to
+  watchlist for analysis."* A watched name whose prices could not be loaded is told so
+  instead. With the US universe off there are no sectors, so there are no leaders to
+  add.
+- **Other tools: `fundamentals`, `ticker_headlines`, `search_news`**, used only when
+  the question needs them. "Tell me about AMD" is answered from the dashboard's data;
   "is AMD's rise about earnings or AI news?" calls fundamentals and news.
 
-Both contexts are folded under every answer so each figure can be checked. The tab
-always reads the latest bar. **📊 Analyse &lt;ticker&gt;** asks for the full read, ending
-in a stance (constructive / neutral / cautious) with the evidence for and against it
-and what would change it — never a position size or a "buy now".
+The market context and every `stock_data` call are folded under each answer so each
+figure can be checked. The tab always reads the latest bar. **📊 Analyse
+&lt;ticker&gt;** asks for the full read of the charted name, ending in a stance
+(constructive / neutral / cautious) with the evidence for and against it and what
+would change it — never a position size or a "buy now".
 
 Without an LLM: `python -m qbs.agent --report context --ticker MU` prints the two
 blocks, and `--report price` / `--report market` what the full tools return.
@@ -1532,6 +1553,148 @@ When an answer looks wrong, diff it against the report rather than re-prompting.
 A research note from a capable but unaccountable junior. The numbers in it are
 checkable against the tool traces; check them. Nothing here constitutes advice, and the
 model is instructed not to issue buy/sell calls or position sizes.
+
+---
+
+## Analysing with Claude: the MCP server
+
+The dashboard's numbers as [MCP](https://modelcontextprotocol.io) tools, so Claude
+Desktop, Claude Code, a notebook or the Gemini analyst can read them. **The tools are
+defined once**, in `qbs/agent/toolkit.py`:
+
+```
+                     qbs/agent/toolkit.py  (the tools, plain functions)
+                    /            |                      \
+      mcp_server.py          tools.py                mcp_client.py
+   (stdio or HTTP)      (LangChain, in-process)   (notebooks; the analyst
+   Claude Desktop/Code   the Gemini analyst        when QBS_MCP_URL is set)
+```
+
+Change a tool there and Claude, the dashboard's chat, the CLI and every notebook see
+the change together. The server needs **no LangChain and no Gemini key**, and every
+figure still comes from this package.
+
+```bash
+pip install -r requirements.txt -r requirements-mcp.txt
+python run_backtest.py                       # build the price cache first
+python -m qbs.agent.mcp_server --check       # loads the data once and prints a summary
+```
+
+**Claude Code** picks it up from the repo's `.mcp.json` when started in this directory
+(it asks you to approve the project server once). To add it by hand:
+
+```bash
+claude mcp add qbs-dashboard -- python -m qbs.agent.mcp_server
+```
+
+**Claude Desktop** — Settings → Developer → Edit Config, then add the server to
+`claude_desktop_config.json` and restart the app. Desktop does not start the server in
+the repo, so use the absolute path of the Python that has the requirements installed
+and put the repo on `PYTHONPATH` (the caches are found relative to the package, not
+the working directory):
+
+```json
+{
+  "mcpServers": {
+    "qbs-dashboard": {
+      "command": "/path/to/venv/bin/python",
+      "args": ["-m", "qbs.agent.mcp_server"],
+      "env": {
+        "PYTHONPATH": "/path/to/qqq_boxx_strategies",
+        "QBS_DASH_WATCHLIST": "TSM GOOGL"
+      }
+    }
+  }
+}
+```
+
+Then ask things like *"What does the momentum book hold today, and why isn't NVDA in
+it?"* or *"Is MRVL's move its own or the market's?"*.
+
+| Tool | Answers |
+|---|---|
+| `current_picks` | what the momentum book and the screen hold on the latest bar, and their overlap |
+| `stock_data` | the dashboard's JSON for one name: normal **and residual** momentum, trend, levels, volume |
+| `name_momentum` | returns with universe percentiles, and every strategy gate with ✅/❌ |
+| `price_action` | the price panel: returns vs QQQ/SPY, EMAs, range, ATR, beta, levels, last N sessions |
+| `market_overview` / `market_snapshot` | the Market overview tab, as text / as the chat's JSON block |
+| `sector_leadership`, `stock_vs_market` | where the leaders sit; whether a move is the stock's own |
+| `strategy_performance` | the backtest table with its caveats (runs from the cache on first call) |
+| `list_universe` | every ticker available, and the date prices run to |
+| `fundamentals` | yfinance snapshot of today — never an explanation for a past signal |
+| `search_news`, `ticker_headlines`, `market_news` | the web and the News tab's headlines |
+| `reload_data` | re-read the cache after the dashboard or `run_backtest.py` refreshed it |
+
+What to know:
+
+- **It reads the cache and never downloads prices.** The data is loaded on first use
+  and kept for the session; refresh it with the dashboard or `run_backtest.py`, then
+  call `reload_data`. Every report states how many sessions stale it is.
+- **The market tools read the dashboard's ~2,400-name US universe from its cache**
+  (written when the dashboard's Market tab loads it). With no such cache they fall
+  back to the Nasdaq-100 constituents and say so in every market report.
+- **The focus list is the dashboard's**: Nasdaq-100 constituents, `QBS_DASH_WATCHLIST`
+  (from the environment or `.env`), and the Market overview's sector leaders, the
+  strongest 5 per sector (the Overview's default) computed from the cached US universe.
+  `list_universe` prints them by sector. A watchlist name outside the index needs cached
+  prices, which the dashboard writes when it first loads it.
+- **`QBS_MCP_NO_WEB=1`** removes the three web tools entirely, and `fundamentals`
+  then serves only its cache.
+- **Nothing writes.** No tool changes a parameter or places an order.
+- **stdout is the protocol.** The data layer prints cache warnings, so each tool runs
+  with stdout sent to stderr; a stray line on stdout would corrupt the stdio stream.
+  Anything you add to a tool gets the same treatment by going through `build_tools`.
+
+### One server, many clients: HTTP mode
+
+Over stdio, each Claude app starts its own server. Run one over **HTTP** instead and
+anything can share it: notebooks on another machine, the dashboard's chat, the CLI. The
+data is loaded once, on the machine that keeps it fresh.
+
+```bash
+# once: make a token and put it in .env as QBS_MCP_TOKEN=...
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
+python -m qbs.agent.mcp_server --http                   # localhost only, no token needed
+python -m qbs.agent.mcp_server --http --host 0.0.0.0    # the network: needs QBS_MCP_TOKEN
+```
+
+It serves `http://<host>:8765/mcp` (`--port` to change it). **Bound to anything but
+localhost it refuses to start without `QBS_MCP_TOKEN`**. The tools are read-only, but
+without a token anyone who can reach the port could call them. Clients send the token as
+`Authorization: Bearer <token>`. That is authentication, not encryption: keep it on a
+network you trust, or put it behind a tunnel or reverse proxy that adds TLS.
+
+### From a notebook
+
+```python
+from qbs.agent.mcp_client import connect
+
+qbs = connect("http://minipc.local:8765/mcp", token="...")   # or QBS_MCP_URL / QBS_MCP_TOKEN
+print(qbs.current_picks())                        # every tool is a method
+ctx = qbs.call_json("stock_data", ticker="MU")    # JSON tools come back as dicts
+tools = qbs.langchain_tools()                     # for an agent of your own
+```
+
+With no URL at all, `connect()` starts a private server from the local checkout.
+The client runs its own event loop on a thread, so it works inside Jupyter (where
+`asyncio.run` does not). [`notebooks/mcp_client_example.ipynb`](notebooks/mcp_client_example.ipynb)
+walks through it: the reports, a pandas table built from `stock_data`, the backtest, and
+an agent over the same tools.
+
+### The Gemini analyst over the server
+
+Set `QBS_MCP_URL` (and `QBS_MCP_TOKEN`) in `.env` and the analyst takes its tools from
+the server instead of running them in-process. That applies to the CLI and to the
+dashboard's chat. The chat then reads the market block in its prompt from the server's
+`market_snapshot` too, so the prompt and the tools never come from two different sources.
+`python -m qbs.agent --check` says which source is in use and whether the server
+answers.
+
+The trade-off: the server answers from **its own cache and default settings**. The
+dashboard sidebar's slot counts (`n_hold`, the exit rank, the residual book's size) do
+not reach it, and the chat says so under the input box. Leave `QBS_MCP_URL` unset and
+the chat runs the same toolkit in-process on the page's own frames, sidebar included.
 
 ---
 

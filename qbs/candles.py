@@ -50,8 +50,19 @@ class HammerRules:
 
 
 def hammer_frame(ohlc: pd.DataFrame,
-                 rules: Optional[HammerRules] = None) -> pd.DataFrame:
+                 rules: Optional[HammerRules] = None,
+                 span: int = 1) -> pd.DataFrame:
     """Per-session candle geometry and the hammer verdict.
+
+    `span` merges that many sessions into one candle ending on each date --
+    the way a chart reader squints at two or three bars together. The merged
+    candle opens at its first session's open, closes at its last session's
+    close, and spans their highest high and lowest low, so a sell-off on one
+    day bought back on the next reads as the long lower shadow it is. With a
+    merged candle the prior decline is measured into its FIRST session, the
+    ATR is the one known before that session, and the range floor grows with
+    the square root of `span`, since a k-day range is naturally wider than a
+    day's. `span=1` is the single-session candle, unchanged.
 
     Columns: `body`, `lower`, `upper` (shares of the range), `range_atr`
     (range over the prior ATR), `prior_ret` (the `trend_days` return into the
@@ -63,25 +74,33 @@ def hammer_frame(ohlc: pd.DataFrame,
     BEFORE the candle, so a bar is judged against what preceded it.
     """
     r = rules or HammerRules()
-    o, h, l, c = (ohlc[k].astype(float) for k in ("Open", "High", "Low", "Close"))
+    span = max(1, int(span))
+    do, dh, dl, c = (ohlc[k].astype(float) for k in ("Open", "High", "Low", "Close"))
+    # Daily true range and ATR first: they describe the sessions BEFORE the
+    # candle, whatever its length.
+    prev = c.shift(1)
+    tr = pd.concat([dh - dl, (dh - prev).abs(), (dl - prev).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(r.atr_window, min_periods=r.atr_window).mean().shift(span)
+    o = do.shift(span - 1)
+    h = dh.rolling(span, min_periods=span).max()
+    l = dl.rolling(span, min_periods=span).min()
     rng = (h - l).where(h > l)
     top, bot = np.maximum(o, c), np.minimum(o, c)
     body = (c - o).abs() / rng
     lower = (bot - l) / rng
     upper = (h - top) / rng
 
-    prev = c.shift(1)
-    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(r.atr_window, min_periods=r.atr_window).mean().shift(1)
     range_atr = (h - l) / atr
+    floor = r.min_range_atr * np.sqrt(span)
 
-    prior_ret = prev / c.shift(1 + r.trend_days) - 1.0
+    before = c.shift(span)               # the close before the candle's first session
+    prior_ret = before / c.shift(span + r.trend_days) - 1.0
 
     shape = ((body <= r.max_body)
              & (lower >= r.min_lower)
              & (lower >= r.min_lower_to_body * body)
              & (upper <= r.max_upper)
-             & (range_atr >= r.min_range_atr))
+             & (range_atr >= floor))
     shape = shape.fillna(False).astype(bool)
     return pd.DataFrame({
         "body": body, "lower": lower, "upper": upper,

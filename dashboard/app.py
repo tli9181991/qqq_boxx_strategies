@@ -41,7 +41,8 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qbs.breadth import (BreadthParams, atr_class, bear_checklist,
+from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
+                         bear_checklist, two_week_table,
                          daily_breadth, ma_class,
                          ma_fast_cell, momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown,
@@ -83,6 +84,12 @@ CELL = {"extreme_low": "#f6c9c9", "low": "#fbe6e6", "mid": "",
 PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
               "light_red": DN, "dark_red": DN_STRONG, "none": ""}
 
+# The daily monitor's % > 50D column. Under 30% is the line the checklist and
+# the two-week table read, so it gets a red strong enough to see at a glance
+# (the shared CELL "low" pink all but vanished under white text on the dark
+# theme); at or under 20% it deepens to the strong red.
+SLOW_BELOW_30, SLOW_BELOW_20 = "#d9534f", DN_STRONG
+
 # How many slots the residual book runs here. The research default is six,
 # the same as its total-return sibling, because the point of that comparison
 # is that ONLY the score differs. This dashboard runs it deeper on purpose:
@@ -90,6 +97,8 @@ PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
 # names it picks are less alike, so ten slots of it is not ten times the same
 # bet the way ten momentum slots would be. See docs/RESIDUAL_MOMENTUM.md.
 RESID_N_HOLD = 10
+# How many of the NDX momentum ranking the picks tab lists (held or not).
+MOM_TOP_LIST = 10
 # The band, kept as a WIDTH rather than an absolute rank. `exit_rank` is how
 # far a held name may slip before it is sold, and the sweep that validated it
 # varied the pair together -- carrying the number 10 over to a ten-name book
@@ -156,7 +165,10 @@ def _top_up_front_bar(closes, volumes, online: bool, persist=None):
         return closes, volumes, None
     quotes, err = latest_quotes()
     if quotes is None:
-        return closes, volumes, f"could not top up the newest bar — {err}"
+        return closes, volumes, (
+            f"could not top up the newest bar from either screener ({err}). "
+            "The session arrives when yfinance publishes it — usually within a "
+            "few hours of the close — and a reload after that picks it up")
     closes, volumes, report = fill_last_bar(closes, volumes, quotes)
     if persist and report.get("tickers"):
         names, session = report["tickers"], report["session"]
@@ -164,7 +176,7 @@ def _top_up_front_bar(closes, volumes, online: bool, persist=None):
                if "volume" in quotes.columns else None)
         persist_fill(persist[0], session, closes.loc[session, names],
                      persist[1], vol)
-    return closes, volumes, fill_note(report)
+    return closes, volumes, fill_note(report, quotes.attrs.get("source"))
 
 
 def _read_cache(download_start: str, fetch_members: bool = False):
@@ -293,7 +305,8 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
     out: Dict[str, pd.DataFrame] = {}
 
     mom = cross_sectional_momentum(
-        _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank))
+        _uni, _safe, MomentumParams(n_hold=n_hold, exit_rank=exit_rank),
+        record_ranks=MOM_TOP_LIST)
 
     # Same universe, same safe asset, same slot machinery, same absolute
     # filter against BOXX -- only the score it sorts on differs. That is the
@@ -316,12 +329,23 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
 
     for key, sig in (("momentum", mom), ("resmom", res), ("finviz", fin)):
         ev = sig.events
+        ranks = getattr(sig, "held_ranks", None) or {}
+        top = getattr(sig, "rank_log", None) or {}
         rows = []
         for d, names in sig.holdings_log.items():
             day = ev[ev["date"] == d] if not ev.empty else ev
+            r = ranks.get(d, {})
             rows.append({
                 "date": d,
                 "holdings": ", ".join(names),
+                # Each held name's rank that day, in the same order -- the
+                # band keeps names past the top n_hold, so "held" and "top"
+                # are not the same list.
+                "ranks": ", ".join("" if pd.isna(r.get(t, np.nan))
+                                   else f"{r[t]:.0f}" for t in names),
+                # The ranking's leaders that day, best first, held or not:
+                # names past the absolute filter, as the book chose from.
+                "top": ", ".join(t for t, _, _ in top.get(d, [])),
                 "n": len(names),
                 "buys": ", ".join(day.loc[day["action"] == "buy", "asset"]) if len(day) else "",
                 "sells": ", ".join(day.loc[day["action"] == "sell", "asset"]) if len(day) else "",
@@ -462,6 +486,38 @@ CHECKLIST = [
          q="Have a large number of current positions simultaneously hit "
            "stop-loss levels? (Weighted double)",
          yes="Your own portfolio has confirmed the trend/risk."),
+]
+
+
+@st.cache_data(show_spinner=False)
+def build_two_week(_uni: pd.DataFrame, _index: pd.Series, _pct50: pd.Series,
+                   note: str, index_name: str, bar_epoch: str = ""):
+    """`two_week_table` behind a cache; `note`, the index and `bar_epoch` key it."""
+    return two_week_table(_uni, _index, _pct50, index_name=index_name)
+
+
+# The decision table for the next two weeks, translated from its source.
+# `key` rows are answered by `qbs.breadth.two_week_table`; "stops" reads the
+# checklist's own stop-loss box, so it is ticked once for both tables.
+TWO_WEEK = [
+    dict(key="recovery",
+         see="The S&P 50-day ratio climbs back above 30% within a few days, "
+             "and the index rebounds.",
+         means="A normal oversold bounce."),
+    dict(key="false_high",
+         see="The index makes a new high, but the S&P 50-day ratio is still "
+             "below 30% and new lows still outnumber new highs.",
+         means="Beware the 1999 / 2024 pattern: after the signal the index "
+               "makes a new high first, then falls."),
+    dict(key="bear",
+         see="The S&P 50-day ratio stays below 30% for 10 trading days in a "
+             "row (in the source's case, through the Oct 6 close).",
+         means="Historically a high chance of a big drop: 24 of 27 cases "
+               "ended in one."),
+    dict(key="stops",
+         see="A large number of positions hit their stops at the same time.",
+         means="The market is very likely unfavourable for trading — be "
+               "especially careful."),
 ]
 
 
@@ -930,6 +986,26 @@ def names_on(key: str, when) -> list:
     return [t for t in str(raw).split(", ") if t]
 
 
+# How many of each book's names the volume & candles table lists.
+CANDLE_TOP_N = 6
+
+
+def top_held(key: str, when, n: int) -> list:
+    """The `n` best-ranked names `key`'s book held on `when`, best first.
+
+    From the ranks recorded beside the holdings; a name with no rank sorts
+    last rather than being dropped.
+    """
+    frame = selections.get(key)
+    if frame is None or when not in frame.index:
+        return []
+    names = [t for t in str(frame.loc[when, "holdings"]).split(", ") if t]
+    raw = str(frame.loc[when, "ranks"]) if "ranks" in frame.columns else ""
+    ranks = [float(x) if x else float("inf") for x in raw.split(", ")] if raw else []
+    ranks += [float("inf")] * (len(names) - len(ranks))
+    return [t for _, t in sorted(zip(ranks, names), key=lambda p: p[0])][:n]
+
+
 def rank_table(rows, n_hold: int, exit_rank: int,
                lead: Optional[Dict[str, Dict[str, str]]] = None,
                sort: bool = True,
@@ -1023,7 +1099,9 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
 
     uvol = load_universe_volumes(list(names))
     rows, missing = [], []
-    day_cols = ["Hammer D0", "Hammer D-1", "Hammer D-2"]
+    # One column per merged-candle length, all ending on the latest session:
+    # the last day alone, the last two merged, the last three merged.
+    day_cols = ["Hammer 1-day", "Hammer 2-day", "Hammer 3-day"]
     verdicts: Dict[str, list] = {c: [] for c in day_cols}
     for t in names:
         ohlc = ohlc_for(t, download_start, bool(online), BAR_EPOCH)
@@ -1054,13 +1132,12 @@ def candle_table(names, held_by: Dict[str, str], asof: pd.Timestamp,
                 row[c] = "—"
                 verdicts[c].append(None)
         else:
-            hf = hammer_frame(bars, rules).tail(3).iloc[::-1]
-            for i, c in enumerate(day_cols):
-                if i >= len(hf):
+            for span, c in enumerate(day_cols, start=1):
+                if len(bars) < span:
                     row[c] = "—"
                     verdicts[c].append(None)
                     continue
-                b = hf.iloc[i]
+                b = hammer_frame(bars, rules, span=span).iloc[-1]
                 share = "—" if pd.isna(b["lower"]) else f"{b['lower']:.0%}"
                 if b["hammer"]:
                     row[c], v = f"🔨 {share}", "hammer"
@@ -1102,7 +1179,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 default_ticker: Optional[str] = None,
                 extra: Optional[pd.DataFrame] = None,
                 ticker_help: str = "Today's picks come first, then the rest "
-                                   "of the universe."):
+                                   "of the universe.",
+                labels: Optional[Dict[str, str]] = None):
     """The price / levels / momentum panel, so two tabs can show one panel.
 
     Extracted rather than copied: it is ~180 lines of chart, level and gate
@@ -1112,6 +1190,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
 
     `options` is the ticker list for the combo box, already in the order the
     caller wants it -- this function does not decide what is interesting.
+    `labels` maps a ticker to the text the box shows for it (the analyst tab
+    tags sector leaders); the value selected is still the bare ticker.
 
     `extra` carries prices for names that are NOT in `uni` -- the watchlist's
     non-constituents. One such name is joined into the universe frame for the
@@ -1142,7 +1222,8 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     c1, c2, c3 = st.columns([2, 1, 1])
     ticker = c1.selectbox(
         "Ticker", options, index=index, key=f"{key_prefix}_ticker",
-        help=ticker_help)
+        help=ticker_help,
+        format_func=(lambda t: labels.get(t, t)) if labels else str)
 
     outsider = ticker not in uni.columns
     if outsider:
@@ -1229,7 +1310,7 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
             layers.append(rules)
         st.altair_chart(
             alt.layer(*layers).resolve_scale(color="independent")
-            .properties(height=430), use_container_width=True)
+            .properties(height=430), width="stretch")
         if bars is None:
             st.caption(
                 "📉 Close line, not candles — no Open/High/Low for "
@@ -1346,8 +1427,10 @@ from qbs.agent.env import (DISABLE_CHAT_VAR, DISABLE_NEWS_ANALYSIS_VAR,
                            load_env, news_analysis_disabled,
                            news_read_disabled, retired_vars_in_use)
 from qbs.agent.evidence import Book
-from qbs.agent.context import (context_block, market_context,
-                               momentum_ranks, stock_context)
+from qbs.agent.context import (context_block, focus_lookup, leader_focus,
+                               market_context, momentum_ranks, stock_context)
+from qbs.agent.mcp_client import shared_client
+from qbs.agent.tools import resolve_mcp_url
 from qbs.agent.market import Market
 
 
@@ -1519,7 +1602,30 @@ with tab_picks:
                     + f"Filter: close > ${p_scr.min_price:.0f} · "
                     f"quarterly gain > {p_scr.min_quarter_return:.0%} · "
                     + vol_note))
-            if names:
+            top = ([t for t in str(row.get("top", "")).split(", ") if t]
+                   if key == "momentum" and row is not None else [])
+            if top:
+                # The ranking's top 10, the held names marked. A held name
+                # the band kept below the top 10 is added under them, so the
+                # book is always fully listed.
+                held_rank = dict(zip(names, [
+                    x for x in str(row.get("ranks", "")).split(", ")] + [""] * len(names)))
+                extra = [t for t in names if t not in top]
+                listed = top + extra
+                rk = [str(i + 1) for i in range(len(top))] + [
+                    held_rank.get(t) or "—" for t in extra]
+                held = [t in picks[key] for t in listed]
+                tf = pd.DataFrame({"Rank": rk, "Ticker": listed,
+                                   "Held": ["✅" if h else "" for h in held]})
+                st.dataframe(
+                    tf.style.apply(lambda _c: [f"background-color: {UP}" if h
+                                               else "" for h in held],
+                                   subset=["Ticker"]),
+                    hide_index=True, width="stretch",
+                    height=min(460, 38 + 35 * len(tf)))
+                st.caption(f"Top {len(top)} of the ranking · ✅ = held "
+                           f"({len(names)} of {int(n_hold)} slots)")
+            elif names:
                 st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
                              width="stretch",
                              height=min(420, 38 + 35 * len(names)))
@@ -1566,11 +1672,11 @@ with tab_picks:
     st.divider()
     st.markdown("#### Volume & hammer candles")
     held_by: Dict[str, str] = {}
-    for key in books:
-        for t in sorted(picks[key]):
+    for key in ("momentum", "resmom"):
+        for t in top_held(key, asof, CANDLE_TOP_N):
             held_by[t] = (held_by[t] + ", " if t in held_by else "") + SHORT[key]
     for t in WATCHLIST:
-        held_by.setdefault(t, "watchlist")
+        held_by[t] = (held_by[t] + ", " if t in held_by else "") + "watchlist"
     cand_names = list(held_by)
     if not cand_names:
         st.caption("No held or watched names on this date.")
@@ -1603,20 +1709,29 @@ with tab_picks:
         st.dataframe(cstyle, hide_index=True, width="stretch",
                      height=min(620, 38 + 35 * len(ctab)))
         st.caption(md(
+            f"Listed: the **{CANDLE_TOP_N} best-ranked names** held by the "
+            f"{STRATEGY_LABELS['momentum']} and {STRATEGY_LABELS['resmom']} "
+            "books on this date, and the watchlist. "
             f"Last session's volume against the average of the **{int(vwin)} "
             "sessions before it** (the last one excluded), and the ratio of the "
             "two; *Avg $ vol* is close × shares over the same window. "
             "*Bar* is the date of the last candle read, which can trail the "
             "slider when a name's OHLC is behind the ranking cache. "
-            "**Hammer D0 / D-1 / D-2** are the last three candles, newest "
-            "first, each showing the lower shadow as a share of the day's "
-            "range. A candle is a hammer **shape** when: body ≤ "
+            "**Hammer 1-day / 2-day / 3-day** read the candle of the last "
+            "session alone, then the last **two** and last **three** sessions "
+            "merged into one candle — first session's open, last session's "
+            "close, the highest high and lowest low between them — the way a "
+            "chart is read when a sell-off one day is bought back the next. "
+            "Each shows the lower shadow as a share of that candle's range. A "
+            "candle is a hammer **shape** when: body ≤ "
             f"{HR.max_body:.0%} of the range · lower shadow ≥ "
             f"{HR.min_lower_to_body:g}× the body **and** ≥ {HR.min_lower:.0%} "
             f"of the range · upper shadow ≤ {HR.max_upper:.0%} of the range · "
-            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR "
-            "(a tiny range says nothing). 🔨 is that shape **after a "
-            f"{HR.trend_days}-session decline** — the reversal pattern. ⚠️ is "
+            f"range ≥ {HR.min_range_atr:g}× the prior {HR.atr_window}-day ATR, "
+            "× √2 and × √3 for the merged candles (a tiny range says "
+            f"nothing). 🔨 is that shape **after a {HR.trend_days}-session "
+            "decline** into the candle's first session — the reversal "
+            "pattern. ⚠️ is "
             "the same shape after a rise, a *hanging man*, which reads the "
             "other way. ◐ is the shape with a flat prior trend. "
             "Descriptive only — nothing here changes a ranking or a holding."
@@ -1698,7 +1813,7 @@ with tab_picks:
                      horizontal=True, key="hist")
     hist = selections[which].loc[selections[which].index <= asof].tail(120).iloc[::-1]
     show = hist.reset_index().rename(columns={
-        "date": "Date", "holdings": "Holdings", "n": "N",
+        "date": "Date", "holdings": "Holdings", "ranks": "Ranks", "n": "N",
         "buys": "Bought", "sells": "Sold"})
     show["Date"] = show["Date"].dt.strftime("%Y-%m-%d")
     st.dataframe(show, hide_index=True, width="stretch", height=460)
@@ -1711,6 +1826,13 @@ with tab_picks:
 # ==========================================================================
 # Tab 2 -- market overview
 # ==========================================================================
+
+# The Market overview's "High-momentum names by sector" table, as it was
+# drawn, for the Analyst tab to offer and discuss. Set by the market tab
+# (which renders first); empty whenever that tab has no sector map to draw
+# it from, and then the Analyst tab simply lists no leaders.
+SECTOR_LEADERS = pd.DataFrame(columns=["sector", "symbol", "score",
+                                       "rank_in_sector", "n_sector"])
 
 with tab_market:
     freshness_banner()
@@ -1856,7 +1978,7 @@ with tab_market:
                  alt.Tooltip("value:Q", title="Count")],
     ).properties(height=260)
     zero = alt.Chart(pd.DataFrame({"y": [0]})).mark_rule(color=MUTED).encode(y="y:Q")
-    st.altair_chart(chart + zero, use_container_width=True)
+    st.altair_chart(chart + zero, width="stretch")
 
     # ---- the daily monitor table -----------------------------------------
     st.markdown("#### Daily monitor")
@@ -1891,7 +2013,11 @@ with tab_market:
             return [f"background-color: {PULSE_CELL[ma_fast_cell(v, i)]}"
                     for i, v in enumerate(col)]
         if name == "% > 50D":
-            return [f"background-color: {CELL[ma_class(v, 'slow')]}" for v in col]
+            return [f"background-color: "
+                    + (SLOW_BELOW_20 if pd.notna(v) and v <= 20 else
+                       SLOW_BELOW_30 if pd.notna(v) and v < 30 else
+                       CELL[ma_class(v, 'slow')])
+                    for v in col]
         if name in ("SPY ATR", "QQQ ATR"):
             return [f"background-color: {CELL[atr_class(v)]}" for v in col]
         return ["" for _ in col]
@@ -1929,7 +2055,8 @@ with tab_market:
         f"**% > 20D** is shaded on the **last {_bp.ma_fast_recent} sessions "
         f"only** — green above {_bp.ma_fast_green:.0f}%, red at or below. It "
         "reads the tape now, and a shaded year of it is wallpaper. "
-        "% > 50D keeps the full-history scale: red below 20%, green above 80%. "
+        "% > 50D keeps the full-history scale: red under 30% (the "
+        "checklist's line), dark red at 20% or below, green above 80%. "
         "ATR shades red beyond ±5. The bar chart above keeps the plain "
         "up-is-green convention, since a signed bar already shows direction."
     )
@@ -2000,6 +2127,50 @@ with tab_market:
         + (f" {unknown} row{'s' if unknown != 1 else ''} could not be "
            "answered for lack of history." if unknown else "")))
 
+    # ---- decision table: the next two weeks ------------------------------
+    st.markdown("#### Decision table: the next two weeks")
+    tw_index, tw_name = ((SPY_CLOSE, "SPY") if SPY_CLOSE is not None
+                         else (px["QQQ"], "QQQ"))
+    tw = {r["key"]: r for r in build_two_week(
+        m_uni, tw_index, breadth.table["pct_above_slow"], universe_label,
+        tw_name, bar_epoch=BAR_EPOCH)}
+    tw_rows, tw_ans = [], []
+    for item in TWO_WEEK:
+        if item["key"] == "stops":
+            ans = manual.get("stops", False)
+            reading = ("ticked in the checklist above" if ans else
+                       "not ticked — use the stop-loss box in the checklist above")
+        else:
+            r = tw.get(item["key"], {})
+            ans, reading = r.get("answer"), r.get("reading", "—")
+        tw_ans.append(ans)
+        tw_rows.append({"What you see": item["see"], "What it means": item["means"],
+                        "Now": "—" if ans is None else ("Yes" if ans else "No"),
+                        "Reading": reading})
+    # Row 1 is the benign reading, so its Yes is green; the rest are warnings.
+    tw_tint = [(UP if i == 0 else DN) if a else "" for i, a in enumerate(tw_ans)]
+    st.dataframe(
+        pd.DataFrame(tw_rows).style.apply(
+            lambda _c: [f"background-color: {t}" if t else "" for t in tw_tint],
+            subset=["Now"]),
+        hide_index=True, width="stretch",
+        column_config={"What you see": st.column_config.TextColumn(width="large"),
+                       "What it means": st.column_config.TextColumn(width="medium"),
+                       "Reading": st.column_config.TextColumn(width="medium")},
+        height=45 + 35 * len(tw_rows))
+    _tw = TwoWeekRules()
+    st.caption(md(
+        f"The **\"S&P 50-day ratio\"** is read here as the **% > 50D** column "
+        f"above — the same {m_uni.shape[1]:,} names, not the S&P 500 members, "
+        f"which this package does not list — and the index is **{tw_name}**"
+        + ("" if tw_name == "SPY" else " (SPY has no data this session)")
+        + f". Row 1 is Yes when the ratio is back at {_tw.level:.0f}% or more "
+        f"after being under it in the last {_tw.recovery_days} sessions, with "
+        f"{tw_name} up over them. Row 2 asks only on a {tw_name} 52-week-high "
+        f"close. Row 3 counts consecutive sessions under {_tw.level:.0f}% and, "
+        f"while the streak is short of {_tw.bear_days}, projects the session it "
+        "would reach it on — the live version of the source's \"Oct 6\"."))
+
     # ---- momentum leaders -------------------------------------------------
     st.divider()
     st.markdown("#### Momentum leaders")
@@ -2037,7 +2208,7 @@ with tab_market:
             tooltip=[alt.Tooltip("date:T", title="Date"),
                      alt.Tooltip("pct:Q", title="%", format=".1f")],
         ).properties(height=240),
-        use_container_width=True)
+        width="stretch")
 
     # ---- sector concentration --------------------------------------------
     st.markdown("##### Sector composition")
@@ -2095,6 +2266,7 @@ with tab_market:
         lead_rows = sector_leaders(m_uni, mkt_sectors, asof=tbl.index[-1],
                                    volumes=m_vols,
                                    per_sector=int(per_sector))
+        SECTOR_LEADERS = lead_rows
         if lead_rows.empty:
             st.info("No leader on this date could be scored over the "
                     f"{momentum_label()} window — that needs more history "
@@ -2353,6 +2525,28 @@ with tab_analyst:
     screen_names = names_on("finviz", asof_analyst)
     momentum_names = names_on("momentum", asof_analyst)
 
+    # The Market overview's sector leaders -- the same rows, at the same
+    # "Names per sector", as its "High-momentum names by sector" table.
+    # Most sit outside the Nasdaq-100, so their closes come from the US
+    # universe the Overview read them from, put on the ranking universe's
+    # calendar the way that table does before ranking them. A constituent
+    # leader is read from `uni` like any other constituent.
+    LEADERS = leader_focus(SECTOR_LEADERS)
+    LEAD_PX = pd.DataFrame({
+        t: m_uni[t].reindex(uni.index).ffill() for t in LEADERS
+        if t not in uni.columns and t not in WATCH_FRAME.columns
+        and t in m_uni.columns})
+    LEAD_PX = LEAD_PX.loc[:, LEAD_PX.notna().any()] if not LEAD_PX.empty \
+        else LEAD_PX
+    # Every chartable name outside the universe frame: the watchlist's and
+    # the leaders'. A name on both is the watchlist's copy.
+    # Only non-empty frames go in: an empty watchlist frame carries no date
+    # index, and concatenating it would not leave the universe's calendar.
+    _parts = [f for f in (WATCH_FRAME, LEAD_PX) if not f.empty]
+    ANALYST_EXTRA = pd.concat(_parts, axis=1) if _parts else WATCH_FRAME
+    ANALYST_OUTSIDERS = [t for t in ANALYST_EXTRA.columns
+                         if t not in uni.columns]
+
     if chat_off:
         # A chat switched off on purpose is not a misconfiguration, and the
         # "install this, paste a key there" advice below would send someone to
@@ -2392,13 +2586,15 @@ with tab_analyst:
     st.caption(f"🔑 `.env`: {env_load.summary()}")
 
     st.caption(
-        "The analyst is handed two pre-computed contexts with each message: "
-        "the Market overview (breadth, index stretch, leaders, the checklist, "
-        "sector leadership) and the charted name (membership, normal and "
-        "residual momentum, trend, levels, volume). Its only tools are company "
-        "fundamentals from yfinance and news search. It is told that every figure "
-        "must come from the contexts or a tool call; both are folded under "
-        "each answer so you can check the figures against their source."
+        "The analyst is handed the Market overview (breadth, index stretch, "
+        "leaders, the checklist, sector leadership) with each message, and "
+        "fetches the dashboard's data for whichever stock you name — "
+        "membership, normal and residual momentum, trend, levels, volume. It "
+        "covers the Nasdaq-100, your watchlist and the Market overview's "
+        "sector leaders; anything else, add to the "
+        "watchlist first. Its other tools are company fundamentals from "
+        "yfinance and news search. Every figure must come from the market "
+        "context or a tool call; both are folded under each answer."
     )
 
     a_cols = st.columns([1.35, 1])
@@ -2411,19 +2607,37 @@ with tab_analyst:
         # you went out of your way to watch is the one you came here to ask
         # about, and it would otherwise be buried in ~100 constituents.
         watched = [t for t in WATCH_FRAME.columns]
+        # The sector leaders next, in the Overview table's order (largest
+        # sector first, strongest first inside it) -- a list somebody else
+        # curated, so it follows the one you typed.
+        leads = [t for t in LEADERS if t not in watched
+                 and (t in uni.columns or t in ANALYST_EXTRA.columns)]
+        taken = set(watched) | set(leads)
         hi = [t for t in screen_names
-              if t in uni.columns and t not in watched]
+              if t in uni.columns and t not in taken]
         mom = [t for t in momentum_names
-               if t in uni.columns and t not in watched and t not in hi]
+               if t in uni.columns and t not in taken and t not in hi]
         rest = [t for t in uni.columns
-                if t not in watched and t not in hi and t not in mom]
-        a_options = watched + hi + mom + rest
+                if t not in taken and t not in hi and t not in mom]
+        a_options = watched + leads + hi + mom + rest
+        a_labels = {t: f"{t} · {LEADERS[t]['sector']} leader "
+                       f"#{LEADERS[t]['rank_in_sector']}"
+                    for t in LEADERS}
         bits = []
         if watched:
             bits.append(f"**{len(watched)} watched** "
                         + (f"({len(WATCH_EXTRA)} outside the index) "
                            if WATCH_EXTRA else "")
                         + "first")
+        if leads:
+            n_out = sum(t not in uni.columns for t in leads)
+            bits.append(f"**{len(leads)} sector leader"
+                        f"{'s' if len(leads) != 1 else ''}** from the Market "
+                        "overview"
+                        + (f" ({n_out} outside the index)" if n_out else ""))
+        elif LEADERS:
+            bits.append("the Market overview's sector leaders (already "
+                        "listed above)")
         bits.append(f"{len(hi)} high-momentum name{'s' if len(hi) != 1 else ''}")
         bits.append(f"{len(mom)} from the momentum book")
         bits.append(f"then the rest of the {len(a_options)} names")
@@ -2436,12 +2650,14 @@ with tab_analyst:
             # WATCH_FRAME, not the raw download: it is already on the
             # universe's calendar, so a name that does not trade on exactly
             # the same days joins without punching holes in the series.
-            extra=WATCH_FRAME,
-            ticker_help="Your watchlist first, then today's high-momentum "
-                        "screen, then the momentum book, then the rest of "
-                        "the universe. A watched name outside the index is "
-                        "charted from its own prices and interpolated into "
-                        "the constituents' ranking.")
+            extra=ANALYST_EXTRA,
+            labels=a_labels,
+            ticker_help="Your watchlist first, then the Market overview's "
+                        "sector leaders, then today's high-momentum screen, "
+                        "then the momentum book, then the rest of the "
+                        "universe. A name outside the index is charted from "
+                        "its own prices and interpolated into the "
+                        "constituents' ranking.")
 
     # ---- right: the chat -------------------------------------------------
     with a_cols[1]:
@@ -2469,20 +2685,22 @@ with tab_analyst:
         with st.container(height=520, border=True):
             if not st.session_state["chat"]:
                 st.caption(
-                    "Ask about the name on the left, the current books, "
-                    "breadth, or the backtest. Follow-ups work — the "
-                    "conversation is sent with each message, so "
-                    "\u201cwhat about its fundamentals?\u201d knows what "
-                    "\u201cit\u201d is.")
+                    "Name the stock you want to discuss — \u201ctell me "
+                    "about MRVL\u201d, then \u201chow about TSM?\u201d. "
+                    "The analyst reads that stock's dashboard data; it "
+                    "covers the Nasdaq-100, your watchlist and the "
+                    "Market overview's sector leaders. Follow-ups "
+                    "work — \u201cwhat about its fundamentals?\u201d knows "
+                    "what \u201cit\u201d is. Market-wide questions work "
+                    "too.")
             for turn in st.session_state["chat"]:
                 with st.chat_message(turn["role"]):
                     st.markdown(turn["content"])
                     ctx = turn.get("context") or {}
-                    for label, key in (("Market context", "market"),
-                                       ("Stock context", "stock")):
-                        if ctx.get(key):
-                            with st.expander(f"📋 {label} (given to the model)"):
-                                st.json(ctx[key], expanded=True)
+                    if ctx.get("market"):
+                        with st.expander("📋 Market context (given to the "
+                                         "model)"):
+                            st.json(ctx["market"], expanded=True)
                     for i, call in enumerate(turn.get("tool_calls", []), 1):
                         args = ", ".join(f"{k}={v!r}"
                                          for k, v in call["args"].items())
@@ -2491,7 +2709,7 @@ with tab_analyst:
                                     language="text")
 
         prompt = st.chat_input(
-            f"Ask about {chart_ticker}…" if chart_ticker else "Ask the analyst…",
+            "Ask about a stock, e.g. \u201ctell me about MRVL\u201d…",
             key="chat_in", disabled=bool(blocker))
         if blocker:
             st.caption("💬 The chat needs the analyst configured — see above.")
@@ -2504,21 +2722,24 @@ with tab_analyst:
                       "change it.")
 
         if prompt:
-            # Everything the dashboard already computed goes to the model up
-            # front, as two JSON aggregates (qbs.agent.context): the market,
-            # and the name on the chart. The model's only tools are the ones
-            # that reach outside the dashboard -- fundamentals and news -- so
-            # "why do its two momentum ranks differ?" costs no tool call.
+            # The market goes to the model up front, as one JSON aggregate
+            # (qbs.agent.context). A stock does not: the user names the one
+            # they want, and the model fetches it through `stock_data`, which
+            # builds the same JSON for any name the dashboard covers -- the
+            # Nasdaq-100 constituents and the watchlist -- and refuses the
+            # rest with a fixed message. The chart on the left no longer
+            # decides what the conversation is about.
             #
-            # Cut at the date the chart on the left is drawn to (the latest
-            # bar -- see `asof_analyst`). The watchlist's outsiders ride along
-            # as `extra`, so a watched name outside the index gets a context
+            # Cut at the date the chart is drawn to (the latest bar -- see
+            # `asof_analyst`). The watchlist's outsiders ride along as
+            # `extra`, so a watched name outside the index gets a context
             # built the way the panel profiles it.
             book = Book(universe=uni.loc[:asof_analyst],
                         prices=px.loc[:asof_analyst], cfg=cfg,
                         note=UNIVERSE_NOTE,
-                        extra=(WATCH_FRAME[WATCH_EXTRA].loc[:asof_analyst]
-                               if WATCH_EXTRA else None))
+                        extra=(ANALYST_EXTRA[ANALYST_OUTSIDERS]
+                               .loc[:asof_analyst]
+                               if ANALYST_OUTSIDERS else None))
             # The Market overview tab's own frames and results -- the US
             # universe when it loaded, the Nasdaq-100 fallback when not --
             # so "the market" means the same thing in the chat as on the tab.
@@ -2528,43 +2749,57 @@ with tab_analyst:
                 qqq_ohlc=QQQ_OHLC, spy_ohlc=SPY_OHLC,
                 index_fallback=m_uni is uni, breadth=breadth_m,
                 checklist=list(auto.values()))
-            with st.spinner("Building the dashboard context…"):
-                mctx = market_context_for(market, universe_label, BAR_EPOCH,
-                                          m_uni.shape[1])
-                sctx = None
-                if chart_ticker:
-                    sctx = stock_context(
-                        book, chart_ticker, market=market,
-                        watchlist=WATCHLIST,
-                        ohlc=ohlc_for(chart_ticker, download_start,
-                                      bool(online), BAR_EPOCH),
-                        spy=SPY_CLOSE,
-                        ranks=stock_ranks(book, chart_ticker, int(n_hold),
-                                          int(exit_rank), int(n_resid),
-                                          BAR_EPOCH),
-                        # The books as the picks tab built them, with the
-                        # sidebar's slots -- not a second, default-sized run.
-                        held={"normal": names_on("momentum", LAST_BAR),
-                              "residual": names_on("resmom", LAST_BAR)},
-                        momentum=MomentumParams(n_hold=int(n_hold),
-                                                exit_rank=int(exit_rank)),
-                        residual=ResidualMomentumParams(
-                            n_hold=int(n_resid),
-                            exit_rank=int(n_resid) + RESID_BAND))
-            # The selected ticker rides along in the question too, so "is it
-            # extended?" means the name on screen rather than whatever was
-            # mentioned last.
-            asked = (f"[the chart on screen is showing {chart_ticker}] {prompt}"
-                     if chart_ticker else prompt)
+            # With QBS_MCP_URL set the chat's tools come from that MCP server
+            # (qbs.agent.tools), so the market block must too: a prompt
+            # holding this process's numbers next to tools answering from the
+            # server's cache would hand the model two sources to reconcile.
+            mcp_url = resolve_mcp_url()
+            if mcp_url:
+                with st.spinner("Reading the market from the MCP server…"):
+                    try:
+                        mctx = shared_client(mcp_url).call_json(
+                            "market_snapshot")
+                    except Exception as exc:  # noqa: BLE001
+                        mctx = f"{type(exc).__name__}: {exc}"
+                if not isinstance(mctx, dict):
+                    st.error(f"**MCP server unavailable** ({mcp_url}): {mctx}",
+                             icon="🚫")
+                    st.stop()
+            else:
+                with st.spinner("Building the market context…"):
+                    mctx = market_context_for(market, universe_label,
+                                              BAR_EPOCH, m_uni.shape[1])
+            # The books as the picks tab built them, with the sidebar's
+            # slots -- not a second, default-sized run.
+            held_now = {"normal": names_on("momentum", LAST_BAR),
+                        "residual": names_on("resmom", LAST_BAR)}
+            mom_p = MomentumParams(n_hold=int(n_hold), exit_rank=int(exit_rank))
+            res_p = ResidualMomentumParams(n_hold=int(n_resid),
+                                           exit_rank=int(n_resid) + RESID_BAND)
+
+            def _build_stock(t: str) -> dict:
+                return stock_context(
+                    book, t, market=market, watchlist=WATCHLIST,
+                    ohlc=ohlc_for(t, download_start, bool(online), BAR_EPOCH),
+                    spy=SPY_CLOSE,
+                    ranks=stock_ranks(book, t, int(n_hold), int(exit_rank),
+                                      int(n_resid), BAR_EPOCH),
+                    held=held_now, momentum=mom_p, residual=res_p,
+                    leaders=LEADERS)
+
+            def _lookup(t: str) -> dict:
+                return focus_lookup(book, t, watchlist=WATCHLIST,
+                                    build=_build_stock, leaders=LEADERS)
+
             history = [{"role": t["role"], "content": t["content"]}
                        for t in st.session_state["chat"]]
             st.session_state["chat"].append({"role": "user", "content": prompt})
 
             with st.spinner(f"Asking {model_name}…"):
                 answer = analyse(
-                    asked, model=model_name.strip() or None, history=history,
+                    prompt, model=model_name.strip() or None, history=history,
                     thinking_budget=int(thinking),
-                    context=context_block(mctx, sctx),
+                    context=context_block(mctx), stock_lookup=_lookup,
                     allow_web=bool(allow_web),
                     offline_fundamentals=not live_fundamentals)
 
@@ -2573,20 +2808,25 @@ with tab_analyst:
             elif answer.error:
                 text = f"🚫 **Could not answer.** {answer.text}"
             else:
-                # No tool call is normal now: the numbers came in the
-                # context, which is kept with the answer so each figure can
-                # be checked against what the model was actually given.
+                # The market context is kept with the answer, and each
+                # stock's data is in its `stock_data` call, so every figure
+                # can be checked against what the model was actually given.
                 text = answer.text
             st.session_state["chat"].append(
                 {"role": "assistant", "content": text,
                  "tool_calls": answer.tool_calls,
-                 "context": {"market": mctx, "stock": sctx}})
+                 "context": {"market": mctx}})
             st.rerun()
 
+        if resolve_mcp_url():
+            st.caption(
+                f"🔌 Data from the MCP server at `{resolve_mcp_url()}` "
+                "(QBS_MCP_URL): its own cache and default slots, not this "
+                "page's sidebar settings.")
         st.caption(
-            "Every number should appear in the contexts or the tool calls "
-            "folded under the answer. One that does not is a fabrication. The "
-            "contexts are rebuilt for the name on the chart with every "
-            "message; only the last 20 turns are re-sent, and tool output is "
-            "never replayed."
+            "Every number should appear in the market context or the tool "
+            "calls folded under the answer — each stock's data is its "
+            "`stock_data` call. One that does not is a fabrication. Only the "
+            "last 20 turns are re-sent, and tool output is never replayed: "
+            "the analyst fetches a stock again when it needs it."
         )

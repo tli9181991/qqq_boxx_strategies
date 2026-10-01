@@ -355,7 +355,18 @@ def drop_partial_bars(frame: pd.DataFrame, min_coverage: float = 0.5,
     """
     dropped: List[pd.Timestamp] = []
     coverage: Dict[pd.Timestamp, Tuple[int, int]] = {}
-    if frame is None or frame.empty or len(frame) < 2:
+    if frame is None or frame.empty:
+        return frame, dropped, coverage
+    # A row with NO prices at all is not a session the provider was halfway
+    # through publishing: it is a date a download put in the index with
+    # nothing under it (yfinance does this for a session it has not
+    # published yet). Removed silently -- reporting "0 of 98 names" as a
+    # torn bar sends somebody looking for a problem that is only "not out
+    # yet", which the freshness banner already says.
+    empty = frame.notna().sum(axis=1) == 0
+    if empty.any():
+        frame = frame.loc[~empty]
+    if len(frame) < 2:
         return frame, dropped, coverage
     # Filled in below so a caller can say 12-of-2610 rather than "a handful".
     # "A handful" is not a number anybody can act on: it cannot be told from

@@ -4614,3 +4614,133 @@ def test_spy_atr_is_filled_from_its_own_bars():
     assert t["qqq_atr"].isna().all(), "and QQQ stays empty when not given"
     with_close = daily_breadth(px, spy=s, spy_ohlc=ohlc).table["spy_atr"]
     pd.testing.assert_series_equal(with_close, t["spy_atr"])
+
+
+# --------------------------------------------------------------------------
+# Screener fallback and empty rows
+# --------------------------------------------------------------------------
+
+def test_quotes_fall_back_to_the_other_screener(monkeypatch):
+    """Finviz blocking the IP must not cost the top-up when TradingView answers."""
+    import qbs.quotes as Q
+
+    def blocked(**_):
+        raise RuntimeError("finviz blocked the request (Cloudflare challenge / 403)\nlong page")
+    good = pd.DataFrame({"close": [10.0], "volume": [1e6]}, index=["AAA"])
+    monkeypatch.setattr(Q, "_finviz_quotes", blocked)
+    monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: good.copy())
+    q, err = Q.latest_quotes("finviz")
+    assert err is None and q.attrs["source"] == "tradingview"
+
+    monkeypatch.setattr(Q, "_tradingview_quotes", lambda **_: pd.DataFrame())
+    q, err = Q.latest_quotes("finviz")
+    assert q is None and "finviz" in err and "tradingview" in err
+    assert "long page" not in err, "only the first line of a long error"
+
+
+def test_an_empty_row_is_not_reported_as_a_torn_bar():
+    """yfinance lists a session it has not published with nothing under it."""
+    from qbs.data import drop_partial_bars
+    px = _wide()
+    nxt = px.index[-1] + pd.Timedelta(days=1)
+    empty = px.copy()
+    empty.loc[nxt] = np.nan
+    out, dropped, _ = drop_partial_bars(empty)
+    assert dropped == [] and out.index[-1] == px.index[-1]
+
+
+def test_an_incremental_update_never_writes_an_empty_row():
+    from qbs.incremental import refresh_incremental
+    truth = _truth()
+    ghost = truth.index[-1] + pd.offsets.BDay(1)
+    served = truth.reindex(truth.index.append(pd.DatetimeIndex([ghost])))
+
+    def download(names, start):
+        c = served.loc[pd.Timestamp(start):, list(names)]
+        return c, None, []
+    closes, _, _, _ = refresh_incremental(truth.iloc[:-2], None, set(),
+                                          list(truth.columns), "2000-01-01", download)
+    assert ghost not in closes.index and closes.index[-1] == truth.index[-1]
+
+
+def test_a_missing_fallback_package_is_named_not_traced(monkeypatch):
+    import qbs.quotes as Q
+
+    def blocked(**_):
+        raise RuntimeError("403")
+
+    def missing(**_):
+        raise ModuleNotFoundError("No module named 'tradingview_screener'")
+    monkeypatch.setattr(Q, "_finviz_quotes", blocked)
+    monkeypatch.setattr(Q, "_tradingview_quotes", missing)
+    _, err = Q.latest_quotes("finviz")
+    assert "not installed (pip install tradingview-screener)" in err
+
+
+# --------------------------------------------------------------------------
+# Next-two-weeks decision table
+# --------------------------------------------------------------------------
+
+def _tw(pct_values, index_values=None, n_names=50):
+    from qbs.breadth import two_week_table
+    idx = pd.bdate_range(end="2026-09-29", periods=len(pct_values))
+    pct = pd.Series(pct_values, index=idx, dtype=float)
+    index = pd.Series(index_values if index_values is not None
+                      else np.linspace(100, 110, len(idx)), index=idx)
+    closes = pd.DataFrame(100.0, index=idx, columns=[f"T{i}" for i in range(n_names)])
+    return {r["key"]: r for r in two_week_table(closes, index, pct)}
+
+
+def test_two_week_recovery_is_a_bounce_back_above_30():
+    rows = _tw([50.0] * 20 + [25, 24, 26, 28, 33])
+    assert rows["recovery"]["answer"] is True
+    assert _tw([50.0] * 25)["recovery"]["answer"] is False, "never went under"
+
+
+def test_two_week_bear_counts_ten_sessions_and_projects_the_tenth():
+    rows = _tw([50.0] * 20 + [25.0] * 10)
+    assert rows["bear"]["answer"] is True
+    short = _tw([50.0] * 20 + [25.0] * 4)["bear"]
+    assert short["answer"] is False
+    # Four sessions under as of 2026-09-29 (Tue): six more weekdays is 2026-10-07.
+    assert "2026-10-07" in short["reading"]
+
+
+def test_two_week_false_high_needs_a_new_high_and_weak_breadth():
+    n = 300
+    closes_len = n
+    rows = _tw([25.0] * closes_len, index_values=np.linspace(100, 200, closes_len))
+    # No name at a new low in the flat fixture, so lows do not outnumber highs.
+    assert rows["false_high"]["answer"] is False
+    assert "252-day high" in rows["false_high"]["reading"]
+
+
+def test_two_week_false_high_fires_when_names_sit_at_new_lows():
+    from qbs.breadth import two_week_table
+    idx = pd.bdate_range(end="2026-09-29", periods=300)
+    pct = pd.Series(25.0, index=idx)
+    index = pd.Series(np.linspace(100, 200, 300), index=idx)        # new high today
+    falling = pd.DataFrame({f"T{i}": np.linspace(200, 100, 300) for i in range(20)},
+                           index=idx)                                # every name at a new low
+    row = {r["key"]: r for r in two_week_table(falling, index, pct)}["false_high"]
+    assert row["answer"] is True, row["reading"]
+
+
+def test_a_two_day_merge_finds_the_hammer_neither_day_shows():
+    """Down hard one day, bought back the next: two ordinary candles, one hammer."""
+    from qbs.candles import hammer_frame
+
+    def pair(c):
+        # Day 1 opens at c and closes near its low; day 2 opens low and
+        # closes back near c. Neither is a hammer alone.
+        return [[c, c + 0.2, c - 3.8, c - 3.5], [c - 3.5, c + 0.1, c - 3.6, c - 0.2]]
+    rows, c = [], 100.0
+    for _ in range(20):
+        o, c = c, c - 0.5
+        rows.append([o, max(o, c) + 0.5, min(o, c) - 0.5, c])
+    rows += pair(c)
+    idx = pd.bdate_range("2026-01-01", periods=len(rows))
+    bars = pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=idx)
+    one, two = hammer_frame(bars).iloc[-1], hammer_frame(bars, span=2).iloc[-1]
+    assert not one["shape"] and not hammer_frame(bars).iloc[-2]["shape"]
+    assert two["hammer"], two.to_dict()

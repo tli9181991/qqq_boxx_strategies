@@ -1,0 +1,20 @@
+# The MCP server (qbs/agent/mcp_server.py): the dashboard's data as tools for
+# Claude Desktop, Claude Code or any other MCP client.
+#
+#   pip install -r requirements.txt -r requirements-mcp.txt
+#   python -m qbs.agent.mcp_server --check
+#
+# No LangChain and no Gemini key: the client's model does the reading, and
+# every number still comes from this package.
+
+# The official Python SDK. The server runs on 1.x (FastMCP) and 2.x
+# (MCPServer) alike.
+mcp>=1.2
+
+# Web search for search_news / market_news, no API key required. Leave it out
+# (or set QBS_MCP_NO_WEB=1) and the server runs offline.
+ddgs>=9.0
+
+# Fundamentals. Already in requirements.txt; repeated so this file installs
+# standalone.
+yfinance>=0.2.40

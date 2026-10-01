@@ -888,6 +888,17 @@ class ChecklistRules:
     mli_low_window: int = 10            # ... and at their lowest in 10 sessions
 
 
+def _highs_lows(px: pd.DataFrame, window: int) -> Tuple[int, int, bool]:
+    """`(new_highs, new_lows, measurable)` on the last row: names closing at
+    their `window`-session high / low, among names with that much history."""
+    roll_hi = px.rolling(window, min_periods=window).max().iloc[-1]
+    roll_lo = px.rolling(window, min_periods=window).min().iloc[-1]
+    last = px.iloc[-1]
+    has = roll_hi.notna() & last.notna()
+    return (int((last[has] >= roll_hi[has]).sum()),
+            int((last[has] <= roll_lo[has]).sum()), bool(has.any()))
+
+
 def bear_checklist(
     closes: pd.DataFrame,
     index_close: pd.Series,
@@ -960,13 +971,8 @@ def bear_checklist(
                                     f"({off:.1%} off its {r.high_window}-day high) · {lead_txt}"))
 
     # Q3 -- the index rising over a tape making more new lows than new highs.
-    roll_hi = px.rolling(r.high_window, min_periods=r.high_window).max()
-    roll_lo = px.rolling(r.high_window, min_periods=r.high_window).min()
-    last = px.iloc[-1]
-    has = roll_hi.iloc[-1].notna() & last.notna()
-    n_hi = int((last[has] >= roll_hi.iloc[-1][has]).sum())
-    n_lo = int((last[has] <= roll_lo.iloc[-1][has]).sum())
-    if len(idx) <= r.rising_days or not has.any():
+    n_hi, n_lo, has_any = _highs_lows(px, r.high_window)
+    if len(idx) <= r.rising_days or not has_any:
         out.append(dict(key="divergence", answer=None,
                         reading="not enough history for 52-week highs and lows"))
     else:
@@ -988,4 +994,101 @@ def bear_checklist(
             key="mli", answer=bool(now < then and now <= floor),
             reading=(f"{now} leaders now · {r.mli_lookback} sessions ago: {then} · "
                      f"lowest of the prior {r.mli_low_window}: {floor}")))
+    return out
+
+
+
+@dataclass(frozen=True)
+class TwoWeekRules:
+    """Thresholds behind the next-two-weeks decision table."""
+    level: float = 30.0          # the "50-day ratio" line: % of names above the 50-day
+    recovery_days: int = 5       # row 1: "back above 30% within a few days"
+    bear_days: int = 10          # row 3: 10 sessions in a row below 30%
+    high_window: int = 252       # a new high / new low is a 52-week one
+
+
+def two_week_table(
+    closes: pd.DataFrame,
+    index_close: pd.Series,
+    pct_above_50: pd.Series,
+    rules: Optional[TwoWeekRules] = None,
+    index_name: str = "SPY",
+) -> List[Dict]:
+    """The three data rows of the next-two-weeks decision table, on the last session.
+
+    `pct_above_50` is the "50-day ratio" -- the breadth table's % above the
+    50-day, so it is read over the same names (and the same gap-free
+    sessions) as the daily monitor. Each row is `{key, answer, reading}`,
+    `answer` None when there is not enough history to say.
+
+    * recovery: back above the line within the last `recovery_days` sessions
+      after being under it, with the index up over the same span.
+    * false_high: the index at a 52-week high while the ratio is still under
+      the line and new lows outnumber new highs.
+    * bear: under the line for `bear_days` sessions in a row. While the
+      streak is short of that, the reading projects the session it would
+      reach it on.
+    """
+    from .data import thin_rows
+
+    r = rules or TwoWeekRules()
+    pct = pct_above_50.dropna()
+    px = closes.sort_index()
+    gaps = thin_rows(px)
+    if gaps:
+        px = px.drop(index=list(gaps))
+    idx = index_close.sort_index().reindex(pct.index).ffill()
+    out: List[Dict] = []
+    if len(pct) <= r.recovery_days:
+        return [dict(key=k, answer=None, reading="not enough history")
+                for k in ("recovery", "false_high", "bear")]
+
+    now = float(pct.iloc[-1])
+    below = (pct < r.level).to_numpy()[::-1]
+    run = int(np.argmin(below)) if not below.all() else len(below)
+
+    # Row 1 -- a normal oversold bounce.
+    window = pct.iloc[-1 - r.recovery_days:-1]
+    was_under = bool((window < r.level).any())
+    chg = (idx.iloc[-1] / idx.iloc[-1 - r.recovery_days] - 1.0
+           if pd.notna(idx.iloc[-1 - r.recovery_days]) else np.nan)
+    out.append(dict(
+        key="recovery",
+        answer=bool(now >= r.level and was_under and chg > 0),
+        reading=(f"{now:.1f}% above the 50-day · "
+                 + (f"was under {r.level:.0f}% in the last {r.recovery_days} sessions"
+                    if was_under else f"not under {r.level:.0f}% in the last "
+                                      f"{r.recovery_days} sessions")
+                 + (f" · {index_name} {chg:+.1%} over them" if pd.notna(chg) else ""))))
+
+    # Row 2 -- a new high the tape does not confirm.
+    hi = index_close.sort_index().rolling(r.high_window, min_periods=r.high_window).max()
+    n_hi, n_lo, has_any = _highs_lows(px, r.high_window)
+    if pd.isna(hi.iloc[-1]) or not has_any:
+        out.append(dict(key="false_high", answer=None,
+                        reading=f"under {r.high_window} sessions of history"))
+    else:
+        last_idx = index_close.sort_index().iloc[-1]
+        at_high = bool(last_idx >= hi.iloc[-1])
+        out.append(dict(
+            key="false_high",
+            answer=bool(at_high and now < r.level and n_lo > n_hi),
+            reading=((f"{index_name} at a {r.high_window}-day high" if at_high else
+                      f"{index_name} {last_idx / hi.iloc[-1] - 1:.1%} off its "
+                      f"{r.high_window}-day high")
+                     + f" · {now:.1f}% above the 50-day · "
+                       f"{n_hi} new highs vs {n_lo} new lows")))
+
+    # Row 3 -- ten sessions under the line.
+    if run >= r.bear_days:
+        reading = (f"under {r.level:.0f}% for {run} sessions "
+                   f"(the {r.bear_days}th was {pct.index[-1 - (run - r.bear_days)]:%Y-%m-%d})")
+    elif run:
+        day10 = pct.index[-1] + pd.offsets.BDay(r.bear_days - run)
+        reading = (f"under {r.level:.0f}% for {run} session{'s' if run != 1 else ''} · "
+                   f"session {r.bear_days} would be the {day10:%Y-%m-%d} close "
+                   "if it stays under (weekdays; holidays not counted)")
+    else:
+        reading = f"{now:.1f}% — not under {r.level:.0f}%"
+    out.append(dict(key="bear", answer=run >= r.bear_days, reading=reading))
     return out

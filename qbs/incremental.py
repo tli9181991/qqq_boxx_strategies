@@ -256,6 +256,14 @@ def refresh_incremental(
             failed = list(full)
     from .data import thin_rows
 
+    # A date the download put in the index with no price under it -- yfinance
+    # does this for a session it has not published yet -- is not a session.
+    # Written to the cache it reads as a torn bar on every load until the
+    # data arrives; left out, the next update simply fetches that date.
+    closes = closes.dropna(how="all")
+    if volumes is not None:
+        volumes = volumes.reindex(closes.index)
+
     # A thin session still thin after the update is one the provider does not
     # have either. Reported so the caller can say which day is missing.
     holes = {d: v for d, v in thin_rows(closes).items()
