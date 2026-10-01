@@ -536,6 +536,7 @@ def cross_sectional_momentum(
         lvl_arr = stop_level.to_numpy()
         dist_arr = stop_dist.to_numpy()
         col_ix = {c: i for i, c in enumerate(px.columns)}
+    entry_rank: Dict[str, float] = {}    # rank each held name was bought at
     ref: Dict[str, float] = {}           # entry level, or high-water mark since entry
     barred_until: Dict[str, int] = {}    # ticker -> first row it may be bought again
     n_stops = 0
@@ -568,6 +569,7 @@ def cross_sectional_momentum(
                     if lvl <= floor:
                         held.remove(t)
                         ref.pop(t, None)
+                        entry_rank.pop(t, None)
                         barred_until[t] = i_dt + 1 + int(stop.cooldown_days)
                         n_stops += 1
                         events.append(dict(
@@ -586,6 +588,7 @@ def cross_sectional_momentum(
                 if fall <= -d:
                     held.remove(t)
                     ref.pop(t, None)
+                    entry_rank.pop(t, None)
                     barred_until[t] = i_dt + 1 + int(stop.cooldown_days)
                     n_stops += 1
                     events.append(dict(
@@ -624,13 +627,22 @@ def cross_sectional_momentum(
             if use_stop and not stop.refill:
                 slots -= sum(1 for t in barred if rank.get(t, np.inf) <= p.exit_rank)
 
-            keep = [t for t in held if rank.get(t, np.inf) <= p.exit_rank]
+            def exit_line(t):
+                # The fixed band, or with `exit_drop` the name's own line: the
+                # rank it was bought at plus the allowed drop.
+                if p.exit_drop is None:
+                    return p.exit_rank
+                return entry_rank.get(t, p.n_hold) + p.exit_drop
+
+            keep = [t for t in held if rank.get(t, np.inf) <= exit_line(t)]
             for t in held:
                 if t not in keep:
+                    line = exit_line(t)       # before the entry rank is forgotten
+                    entry_rank.pop(t, None)
                     events.append(dict(
                         date=dt, action="sell", asset=t,
                         price=float(px.at[dt, t]) if t in px.columns else np.nan,
-                        reason=(f"rank {rank.get(t, float('nan')):.0f} > {p.exit_rank}"
+                        reason=(f"rank {rank.get(t, float('nan')):.0f} > {line:.0f}"
                                 if t in rank.index else "no longer eligible"),
                         # Structured alongside the prose: the live run log stores
                         # these as columns, and parsing them back out of `reason`
@@ -676,6 +688,7 @@ def cross_sectional_momentum(
                     if too_close is not None:
                         continue
                 keep.append(t)
+                entry_rank[t] = float(rank[t])
                 if use_stop:
                     # The stop's reference starts at the close it was bought on
                     # -- or, for a support stop, at the floor under it then.

@@ -64,6 +64,27 @@ The exit-10 row for "ranks 7+" is not a fair test: a held name that climbs
 into the top 6 sorts last on that rule and is sold, which is where its 66–78×
 turnover comes from. The exit-20 row keeps such a name.
 
+## Exit at entry rank + 8
+
+A follow-up test gave each held name its own exit line: the rank it was
+bought at plus 8. A name bought at rank 2 is sold past 10; one bought at 6,
+past 14. `MomentumParams.exit_drop` implements it (off by default).
+
+| 6-stock book | Default: CAGR | Max DD | Turnover | Extended: CAGR | Max DD | Turnover |
+|---|---|---|---|---|---|---|
+| Fixed exit 8 (shipped) | 48.1% | −40.4% | 21.1× | 34.0% | −40.4% | 25.4× |
+| Entry rank + 8 | 51.5% | −39.2% | 10.9× | 42.4% | −39.2% | 13.4× |
+| Fixed exit 14 | 55.0% | −38.4% | 9.4× | 40.4% | −38.4% | 11.2× |
+
+At 4, 6 and 8 names in both windows, entry rank + 8 beat the shipped exit on
+CAGR in 6 of 6 cells at about half the turnover, and beat a fixed exit of
+`n_hold + 8` on CAGR in 4 of 6; the fixed exit had the lower turnover in all
+6. Most of the gain is the wider band. Drops of 4 and 12 were worse than 8.
+
+It is logged, not traded: preflight scores it daily into
+`var/strategy_comparison.csv` as `momentum6_exitdrop`, beside `momentum6`
+(`QBS_COMPARE_EXIT_DROP`, see `deploy/docker/README.md`).
+
 ## BE and TSM
 
 Neither is a Nasdaq-100 constituent — Bloom Energy and TSMC's ADR both list

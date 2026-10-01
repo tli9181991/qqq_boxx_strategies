@@ -138,9 +138,23 @@ class MomentumParams:
     corr_window: int = 60           # trading days of returns behind the estimate
     corr_pool: int = 30             # how far down the ranking a slot may reach
 
+    # ---- per-name exit: sell once a name has fallen `exit_drop` places -----
+    # None is OFF and keeps the fixed band above (`exit_rank`). Set, each held
+    # name gets its own exit line: the rank it was bought at plus `exit_drop`,
+    # so a name bought at rank 2 is sold past 10 and one bought at 6 past 14.
+    # `exit_rank` is then unused. Measured over 2022-2026 at 8 it beat the
+    # fixed band of 8 in six of six (n_hold, window) cells at about half the
+    # turnover, and roughly tied a fixed band of n_hold + 8 -- most of the
+    # gain is the wider band, not the per-name line. Logged beside the live
+    # book by the preflight comparison (`LiveConfig.compare_exit_drop`)
+    # rather than traded; see docs/TOP20_SELECTION.md.
+    exit_drop: int | None = None
+
     def __post_init__(self):
         if self.exit_rank < self.n_hold:
             raise ValueError("exit_rank must be >= n_hold (the band cannot be negative)")
+        if self.exit_drop is not None and self.exit_drop < 0:
+            raise ValueError("exit_drop must be >= 0, or None for the fixed band")
         if self.max_corr is not None and not -1.0 <= self.max_corr <= 1.0:
             raise ValueError("max_corr must be a correlation in [-1, 1], or None for off")
         if self.corr_pool < self.n_hold:

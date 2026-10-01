@@ -120,6 +120,12 @@ class LiveConfig:
     # asked ~60 questions. Not computed in the trade phase -- a few seconds of
     # arithmetic has no business anywhere near the MOC cutoff.
     shadow_weights: List[float] = field(default_factory=lambda: [0.5, 1.25, 2.0])
+    # A paper sleeve for the per-name exit (`MomentumParams.exit_drop`): the
+    # same six momentum picks, sold once a name falls this many places below
+    # the rank it was bought at. Scored by preflight into
+    # strategy_comparison.csv beside "momentum6", holding nothing and sending
+    # no orders. 0 turns it off. Not computed in the trade phase.
+    compare_exit_drop: int = 8
     # Names to score beside the ranking without making them buyable -- a stock
     # outside the Nasdaq-100 whose strength you want to read against the book's.
     # They are ranked in a copy of the universe; the book is computed from the
@@ -189,6 +195,8 @@ class LiveConfig:
             raise ValueError("notional must be positive")
         if self.residual_notional < 0:
             raise ValueError("residual_notional must not be negative")
+        if self.compare_exit_drop < 0:
+            raise ValueError("compare_exit_drop must not be negative (0 is off)")
         if self.max_gross_turnover <= 0:
             raise ValueError("max_gross_turnover must be positive")
         if not 0.0 < self.min_universe_coverage <= 1.0:
@@ -365,6 +373,8 @@ class LiveConfig:
         if os.environ.get("QBS_SHADOW_WEIGHTS") is not None:
             raw = os.environ["QBS_SHADOW_WEIGHTS"].replace(",", " ").split()
             cfg.shadow_weights = [float(w) for w in raw]
+        cfg.compare_exit_drop = _env_int("QBS_COMPARE_EXIT_DROP",
+                                         cfg.compare_exit_drop)
         cfg.sheets_id = os.environ.get("QBS_SHEETS_ID", cfg.sheets_id)
         cfg.sheets_key_file = os.environ.get("QBS_SHEETS_KEY", cfg.sheets_key_file)
         cfg.__post_init__()
