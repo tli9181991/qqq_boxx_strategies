@@ -23,6 +23,7 @@ KINDS = [
     StopLossParams(kind="trailing", stop_pct=0.15),
     StopLossParams(kind="chandelier", atr_mult=3.0),
     StopLossParams(kind="residual", resid_mult=2.0),
+    StopLossParams(kind="support", support_atr_mult=1.0),
 ]
 
 
@@ -147,3 +148,17 @@ def test_watchlist_stop_levels():
     # `asof` cuts the history: nothing after it may set the high.
     cut = watchlist_stop_levels(pd.DataFrame({"A": a}), asof=idx[49])
     assert cut["A"]["high"] == pytest.approx(a.iloc[49])
+
+
+def test_support_floor_is_the_confirmed_swing_low_less_atr():
+    from qbs.strategies import support_floor
+    # Down to a low of 90 at row 10, then up: the low is confirmed at row 15.
+    c = np.r_[np.linspace(100, 90, 11), np.linspace(91, 110, 30)]
+    px = pd.DataFrame({"A": c}, index=pd.bdate_range("2024-01-01", periods=len(c)))
+    p = StopLossParams(kind="support", support_pivot=5, support_atr_mult=0.0)
+    f = support_floor(px, p)["A"]
+    assert f.iloc[:15].isna().all(), "a swing low is unusable before it is confirmed"
+    assert f.iloc[15] == pytest.approx(90.0)
+    buf = support_floor(px, StopLossParams(kind="support", support_pivot=5,
+                                           support_atr_mult=2.0))["A"]
+    assert (buf.iloc[20:] < f.iloc[20:]).all(), "the ATR buffer sits below the level"

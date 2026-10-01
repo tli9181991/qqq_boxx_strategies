@@ -138,9 +138,23 @@ class MomentumParams:
     corr_window: int = 60           # trading days of returns behind the estimate
     corr_pool: int = 30             # how far down the ranking a slot may reach
 
+    # ---- per-name exit: sell once a name has fallen `exit_drop` places -----
+    # None is OFF and keeps the fixed band above (`exit_rank`). Set, each held
+    # name gets its own exit line: the rank it was bought at plus `exit_drop`,
+    # so a name bought at rank 2 is sold past 10 and one bought at 6 past 14.
+    # `exit_rank` is then unused. Measured over 2022-2026 at 8 it beat the
+    # fixed band of 8 in six of six (n_hold, window) cells at about half the
+    # turnover, and roughly tied a fixed band of n_hold + 8 -- most of the
+    # gain is the wider band, not the per-name line. Logged beside the live
+    # book by the preflight comparison (`LiveConfig.compare_exit_drop`)
+    # rather than traded; see docs/TOP20_SELECTION.md.
+    exit_drop: int | None = None
+
     def __post_init__(self):
         if self.exit_rank < self.n_hold:
             raise ValueError("exit_rank must be >= n_hold (the band cannot be negative)")
+        if self.exit_drop is not None and self.exit_drop < 0:
+            raise ValueError("exit_drop must be >= 0, or None for the fixed band")
         if self.max_corr is not None and not -1.0 <= self.max_corr <= 1.0:
             raise ValueError("max_corr must be a correlation in [-1, 1], or None for off")
         if self.corr_pool < self.n_hold:
@@ -428,6 +442,15 @@ class StopLossParams:
     that drops 12% on a flat day has. It is the stop that asks the same
     question the residual book was built to ask.
 
+    ``support`` is a structure stop, from the support levels of
+    `notebooks/M6_finalnotebook.ipynb`: the highest confirmed swing low
+    below the close, minus ``support_atr_mult`` x close-ATR. It only ratchets
+    up while the name is held -- a higher swing low lifts it, a break of the
+    old one does not lower it. A swing low is confirmed ``support_pivot``
+    sessions after it prints (it needs those later closes to be a low at
+    all), so the level is causal, unlike the notebook's, which found its
+    pivots over the whole test window at once.
+
     What happens to the freed slot is ``refill``: True hands it to the next
     name in the ranking the same day, False leaves it in the safe asset for
     as long as the stopped name would otherwise still have been held (in the
@@ -438,7 +461,7 @@ class StopLossParams:
     Read `docs/STOP_LOSS.md` before switching one on: most variants measured
     there make the book WORSE, and the ones that help are specific.
     """
-    kind: str = "off"             # "off" | "fixed" | "trailing" | "chandelier" | "residual"
+    kind: str = "off"             # "off" | "fixed" | "trailing" | "chandelier" | "residual" | "support"
     stop_pct: float = 0.15        # fixed / trailing distance, as a fraction
     atr_mult: float = 3.0         # chandelier: multiples of the close-ATR
     atr_window: int = 20
@@ -446,20 +469,26 @@ class StopLossParams:
     resid_horizon: int = 21       # trading days the residual sigma is scaled to
     resid_window: int = 63        # days behind the residual sigma estimate
     beta_window: int = 252        # days behind the residual stop's beta
+    support_atr_mult: float = 1.0  # support: ATR buffer below the support level
+    support_pivot: int = 5        # support: a swing low must be the lowest close
+                                  # for this many sessions either side of it
+    support_lookback: int = 126   # support: only swing lows this recent count
     cooldown_days: int = 21       # sessions a stopped name may not be re-bought
     refill: bool = True           # freed slot -> next ranked name (True) or cash
 
-    KINDS = ("off", "fixed", "trailing", "chandelier", "residual")
+    KINDS = ("off", "fixed", "trailing", "chandelier", "residual", "support")
 
     def __post_init__(self):
         if self.kind not in self.KINDS:
             raise ValueError(f"kind must be one of {self.KINDS}, got {self.kind!r}")
         if not 0.0 < self.stop_pct < 1.0:
             raise ValueError("stop_pct must be in (0, 1)")
-        if self.atr_mult <= 0 or self.resid_mult <= 0:
+        if self.atr_mult <= 0 or self.resid_mult <= 0 or self.support_atr_mult < 0:
             raise ValueError("stop multiples must be positive")
         if self.cooldown_days < 0:
             raise ValueError("cooldown_days must not be negative")
+        if self.support_pivot < 1:
+            raise ValueError("support_pivot must be at least 1")
 
     @property
     def enabled(self) -> bool:
@@ -471,7 +500,12 @@ class StopLossParams:
             return "no stop"
         dist = {"fixed": f"{self.stop_pct:.0%}", "trailing": f"{self.stop_pct:.0%}",
                 "chandelier": f"{self.atr_mult:g}x ATR{self.atr_window}",
-                "residual": f"{self.resid_mult:g}x resid sigma"}[self.kind]
+                "residual": f"{self.resid_mult:g}x resid sigma",
+                "support": (f"low - {self.support_atr_mult:g}x ATR"
+                            + (f", pivot {self.support_pivot}"
+                               if self.support_pivot != 5 else "")
+                            + (f", lookback {self.support_lookback}"
+                               if self.support_lookback != 126 else ""))}[self.kind]
         tail = "" if self.refill else ", slot->cash"
         return f"{self.kind} {dist} (cd {self.cooldown_days}{tail})"
 

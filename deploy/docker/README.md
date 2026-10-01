@@ -364,6 +364,24 @@ Set `QBS_RESMOM_NOTIONAL=0` to return to the original single strategy. This
 switch does not enable a live IB account; the live-account guard remains
 independent.
 
+### Paper comparison: a per-name exit
+
+`QBS_COMPARE_EXIT_DROP=8` (the default) adds a fourth line,
+`momentum6_exitdrop`: the same six momentum picks as `momentum6`, but each
+name is sold once it falls 8 places below the rank it was bought at, instead
+of past the fixed band. A name bought at rank 2 is sold past 10; one bought at
+6, past 14. It is scored by **preflight only**, holds nothing and sends no
+orders. With it on, the comparison CSV is written even when the residual
+sleeve is off, and `report` prints its return against `momentum6`:
+
+```
+  exit entry+8 vs fixed band: +1.20% (entry-rank exit ahead)
+```
+
+The backtest that motivated it is in `docs/TOP20_SELECTION.md`. Set
+`QBS_COMPARE_EXIT_DROP=0` to stop logging it. To trade it, set
+`exit_drop` in `MomentumParams` — not done by default.
+
 ## Sharing an account with your own holdings
 
 Skip this if the strategy has an account to itself — which is the arrangement to

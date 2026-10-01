@@ -523,6 +523,7 @@ def default_stop_variants() -> List["StopLossParams"]:
         + [S(kind="trailing", stop_pct=x) for x in (0.10, 0.15, 0.20, 0.25)]
         + [S(kind="chandelier", atr_mult=k) for k in (3.0, 4.0, 5.0, 6.0)]
         + [S(kind="residual", resid_mult=k) for k in (1.0, 1.5, 2.0, 3.0)]
+        + [S(kind="support", support_atr_mult=m) for m in (0.0, 0.5, 1.0, 2.0)]
     )
 
 
