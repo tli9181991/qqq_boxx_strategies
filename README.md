@@ -1188,6 +1188,15 @@ updates any price frame that is missing a published session. The status line
 under the toggle says which happened — *fetched on this run*, or *already fetched
 since the Sep 21 close (at 16:30 ET) — next automatic attempt after the Sep 22 close*.
 
+**Finviz is asked gently.** Every screener pull (~130 pages of 20 rows) waits
+`QBS_FINVIZ_SLEEP` seconds between pages (default 3, jittered, never under 1). After
+Finviz answers with a block — the Cloudflare "Slow down your request rate" page — it
+is not asked again for `QBS_FINVIZ_COOLDOWN_HOURS` (default 6), recorded in
+`data/universe/finviz_blocked_until.txt` so a restart does not reset it. The close
+top-up costs no extra pull when it can avoid one: it reuses the universe list's
+Price/Volume when that list was pulled after the close, and one top-up per session is
+shared by the picks and market tabs.
+
 **The gate counts attempts, not data age**, and that distinction is the whole design.
 Streamlit re-runs the script on every widget interaction, so a data-age test would
 answer *yes* on every rerun and start a 2,400-name download each time. The attempt is
