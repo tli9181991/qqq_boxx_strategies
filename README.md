@@ -214,6 +214,12 @@ is 4/6 invested and 2/6 in cash. Spreading 100% across the survivors would conce
 the portfolio exactly when the fewest names were qualifying — i.e. in a deteriorating
 market, which is precisely backwards.
 
+**Choosing six from the top 20 instead.** Holding a top-6 name until it
+leaves the top 20, rather than past rank 8, cuts turnover from about 21× to
+7× a year with return in the same range; picking ranks 7–20, the lowest-vol
+or the lowest-beta names from the pool all did worse. See
+[`docs/TOP20_SELECTION.md`](docs/TOP20_SELECTION.md).
+
 ### 4b. The correlation cap — six slots, or six bets?
 
 `MomentumParams.max_corr` is off by default and changes nothing when it is.
