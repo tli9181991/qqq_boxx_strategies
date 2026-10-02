@@ -4878,3 +4878,49 @@ def test_rebound_far_from_every_average_has_no_signal():
     last = rebound_frame(bars).iloc[-1]
     assert all(ma_status(last, ma) is None for ma in MAS)
     assert last["SMA50_dist"] > 0.05
+
+
+# --------------------------------------------------------------------------
+# Breakout monitor (the dashboard's watchlist screen)
+# --------------------------------------------------------------------------
+
+def _breakout_bars(n=300, vol_last=1.0):
+    """A rising zig-zag: higher highs, higher lows, last bar on average volume
+    times `vol_last`."""
+    t = np.arange(n)
+    c = 100 + 0.2 * t + 5 * np.sin(t / 6)
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    vol = np.full(n, 1e6)
+    vol[-1] *= vol_last
+    return pd.DataFrame({"Open": c, "High": c + 1, "Low": c - 1, "Close": c,
+                         "Volume": vol}, index=idx)
+
+
+def test_breakout_monitor_scores_an_uptrend_with_higher_highs_and_lows():
+    from qbs.breakout_monitor import breakout_monitor
+    r = breakout_monitor("UP", _breakout_bars(vol_last=2.0))
+    assert r["structure"]["HH"] and r["structure"]["HL"]
+    assert all(s < r["price"] for s in r["support"])
+    assert all(x > r["price"] for x in r["resistance"])
+    assert 0 <= r["score"] <= 100 and r["volume_ratio"] > 1.5
+
+
+def test_breakout_monitor_keeps_one_year_only():
+    from qbs.breakout_monitor import last_year
+    df = last_year(_breakout_bars(n=600))
+    assert df.index[-1] - df.index[0] < pd.Timedelta(days=365)
+
+
+def test_breakout_monitor_reports_missing_bars_instead_of_raising():
+    from qbs.breakout_monitor import breakout_monitor
+    assert "error" in breakout_monitor("NOPE", None)
+    assert "error" in breakout_monitor("NOVOL",
+                                       _breakout_bars().drop(columns="Volume"))
+
+
+def test_breakout_status_bands():
+    from qbs.breakout_monitor import setup_status
+    assert setup_status(80).startswith("🔥")
+    assert setup_status(65).startswith("🟡")
+    assert setup_status(50).startswith("⚪")
+    assert setup_status(49).startswith("❌")
