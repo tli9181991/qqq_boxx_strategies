@@ -4941,3 +4941,17 @@ def test_breakout_swing_prominence_scales_with_atr():
     strict_h, strict_l = find_swings(df, atr_mult=50)
     assert len(loose_h) > 0 and len(loose_l) > 0
     assert len(strict_h) == 0 and len(strict_l) == 0
+
+
+def test_breakout_monitor_levels_match_the_daily_picks_chart():
+    from qbs.breakout import closes_to_bars, sr_levels
+    from qbs.breakout_monitor import breakout_monitor
+    from qbs.config import BreakoutParams
+    bars = _breakout_bars()
+    r = breakout_monitor("UP", bars)
+    chart = sr_levels(closes_to_bars(bars[["Close"]].rename(
+        columns={"Close": "UP"}))["UP"], BreakoutParams())
+    last = bars["Close"].iloc[-1]
+    assert r["resistance"] == sorted(x for x in chart if x >= last)[:3]
+    assert r["support"] == sorted((x for x in chart if x < last),
+                                  reverse=True)[:3]
