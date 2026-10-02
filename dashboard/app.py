@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
                          bear_checklist, two_week_table,
                          daily_breadth, ma_class,
-                         ma_fast_cell, momentum_label, momentum_profile,
+                         momentum_label, momentum_profile,
                          pulse_cell, pulse_class, sector_breakdown,
                          sector_leaders)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
@@ -89,6 +89,11 @@ PULSE_CELL = {"dark_green": UP_STRONG, "light_green": UP,
 # (the shared CELL "low" pink all but vanished under white text on the dark
 # theme); at or under 20% it deepens to the strong red.
 SLOW_BELOW_30, SLOW_BELOW_20 = "#d9534f", DN_STRONG
+
+# The daily monitor's % > 20D column: red TEXT under 30%, so the green shading
+# of the recent window stays. {on the green cells: ..., on unshaded: ...}.
+FAST_LOW = 30.0
+FAST_LOW_TEXT = {True: DN_STRONG, False: "#ff6b6b"}
 
 # How many slots the residual book runs here. The research default is six,
 # the same as its total-return sibling, because the point of that comparison
@@ -2010,8 +2015,18 @@ with tab_market:
             # `enumerate` over the column, not the index: `disp` is built
             # newest-first, so position 0 IS the latest session. Reading the
             # date instead would break the moment the sort order changed.
-            return [f"background-color: {PULSE_CELL[ma_fast_cell(v, i)]}"
-                    for i, v in enumerate(col)]
+            # The last `ma_fast_recent` sessions shaded green -- the window
+            # being read -- and any reading under 30% in red text, dark on the
+            # green cells and bright on the unshaded ones so it reads on both.
+            recent = BreadthParams().ma_fast_recent
+            css = []
+            for i, v in enumerate(col):
+                parts = [f"background-color: {UP}"] if i < recent else []
+                if pd.notna(v) and v < FAST_LOW:
+                    parts.append(f"color: {FAST_LOW_TEXT[i < recent]}; "
+                                 "font-weight: 600")
+                css.append("; ".join(parts))
+            return css
         if name == "% > 50D":
             return [f"background-color: "
                     + (SLOW_BELOW_20 if pd.notna(v) and v <= 20 else
@@ -2052,9 +2067,9 @@ with tab_market:
         f"≤{_u[2]:.0f} · dark green above. "
         f"Dn 4%: dark green ≤{_d[0]:.0f} · light green ≤{_d[1]:.0f} · light "
         f"red ≤{_d[2]:.0f} · dark red above. "
-        f"**% > 20D** is shaded on the **last {_bp.ma_fast_recent} sessions "
-        f"only** — green above {_bp.ma_fast_green:.0f}%, red at or below. It "
-        "reads the tape now, and a shaded year of it is wallpaper. "
+        f"**% > 20D** shades the **last {_bp.ma_fast_recent} sessions** green — "
+        "the window being read — and prints any reading **under "
+        f"{FAST_LOW:.0f}% in red**, in those sessions and older ones alike. "
         "% > 50D keeps the full-history scale: red under 30% (the "
         "checklist's line), dark red at 20% or below, green above 80%. "
         "ATR shades red beyond ±5. The bar chart above keeps the plain "
