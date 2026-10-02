@@ -2,7 +2,7 @@
 
     streamlit run dashboard/app.py
 
-Four tabs:
+Five tabs:
 
 * **Daily picks** -- what each of the three selection strategies held on each
   day, with the entries and exits that changed it. The momentum book ranks the
@@ -11,6 +11,9 @@ Four tabs:
   absolute bar and can hold almost nothing.
 * **Market overview** -- the breadth monitor: 4% movers, percent holding the
   moving averages, index stretch in ATR units, and the momentum-leader group.
+* **Breakout monitor** -- a watchlist of its own (stocks or crypto), each name
+  scored out of 100 on structure, trend, momentum, distance to resistance and
+  volume -- the `breakout-checking` script, ported unchanged.
 * **News & sentiment** -- the last 12 hours of market headlines, always; plus
   a model's read of them when one is configured and switched on.
 * **Analyst** -- the price panel again, and a chat over the lab's own tools.
@@ -48,6 +51,8 @@ from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
                          pulse_cell, pulse_class, sector_breakdown,
                          sector_leaders)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
+from qbs.breakout_monitor import (DEFAULT_WATCHLIST as BREAKOUT_DEFAULT,
+                                  breakout_monitor)
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams, ResidualMomentumParams)
 from qbs.data import (MARKET_TZ, drop_partial_bars, freshness_note,
@@ -1536,9 +1541,9 @@ with st.sidebar:
              f"{DISABLE_NEWS_ANALYSIS_VAR}=0 in your .env to allow it.")
 
 
-tab_picks, tab_market, tab_news, tab_analyst = st.tabs(
-    ["📋 Daily picks", "📊 Market overview", "📰 News & sentiment",
-     "🤖 Analyst"])
+tab_picks, tab_market, tab_breakout, tab_news, tab_analyst = st.tabs(
+    ["📋 Daily picks", "📊 Market overview", "📈 Breakout monitor",
+     "📰 News & sentiment", "🤖 Analyst"])
 
 
 # ==========================================================================
@@ -2423,7 +2428,96 @@ with tab_market:
 
 
 # ==========================================================================
-# Tab 3 -- the LLM analyst
+# Tab 3 -- breakout monitor
+# ==========================================================================
+# Its own list, not the sidebar watchlist: that one is ranked against the
+# Nasdaq-100 book, and a crypto pair has no place in that ranking. This one is
+# scored on each name's own bars and nothing else.
+
+# Not QBS_DASH_WATCHLIST, for the reason above: a name added to one list
+# should not quietly appear in the other.
+BREAKOUT_WATCHLIST_VAR = "QBS_DASH_BREAKOUT_WATCHLIST"
+
+
+@st.cache_data(show_spinner="Scoring the breakout watchlist…")
+def breakout_rows(tickers: tuple, download_start: str, online: bool,
+                  bar_epoch: str):
+    """`breakout_monitor` for every name, one fetch per name."""
+    return [breakout_monitor(t, ohlc_for(t, download_start, online, bar_epoch))
+            for t in tickers]
+
+
+def _levels(xs) -> str:
+    return " · ".join(f"{x:,.2f}" for x in xs) or "—"
+
+
+with tab_breakout:
+    st.subheader("Breakout monitor")
+    bo_raw = st.text_input(
+        "Breakout watchlist",
+        os.environ.get(BREAKOUT_WATCHLIST_VAR, ", ".join(BREAKOUT_DEFAULT)),
+        key="breakout_watchlist",
+        help="Comma or space separated; Yahoo symbols, so crypto is BTC-USD. "
+             f"Set {BREAKOUT_WATCHLIST_VAR} in the repo root's .env to change "
+             "the starting list. Separate from the sidebar watchlist.")
+    BREAKOUT_WATCHLIST = parse_watchlist(bo_raw)
+    if not BREAKOUT_WATCHLIST:
+        st.info("The breakout watchlist is empty.", icon="ℹ️")
+    else:
+        results = breakout_rows(tuple(BREAKOUT_WATCHLIST), download_start,
+                                bool(online), BAR_EPOCH)
+        ok = sorted((r for r in results if "error" not in r),
+                    key=lambda r: r["score"], reverse=True)
+        bad = [r for r in results if "error" in r]
+        if ok:
+            bo = pd.DataFrame([{
+                "Ticker": r["ticker"],
+                "Score": r["score"],
+                "Status": r["status"],
+                "Price": r["price"],
+                "As of": f"{r['asof']:%Y-%m-%d}",
+                "HH": "✅" if r["structure"].get("HH") else "—",
+                "HL": "✅" if r["structure"].get("HL") else "—",
+                "To R1": (r["to_resistance"] * 100
+                          if r["to_resistance"] is not None else np.nan),
+                "Resistance": _levels(r["resistance"]),
+                "Support": _levels(r["support"]),
+                "RSI": r["rsi"],
+                "Vol / 20D": r["volume_ratio"],
+            } for r in ok])
+            BO_TINT = [(80, UP_STRONG), (65, UP), (50, "#f5e6a8")]
+            bo_style = bo.style.apply(
+                lambda c: [next((f"background-color: {t}" for f, t in BO_TINT
+                                 if v >= f), "") for v in c], subset=["Score"])
+            st.dataframe(
+                bo_style.format({"Price": "{:,.2f}", "To R1": "{:+.1f}%",
+                                 "RSI": "{:.0f}", "Vol / 20D": "{:.2f}×"},
+                                na_rep="—"),
+                hide_index=True, width="stretch",
+                height=min(620, 38 + 35 * len(bo)))
+        for r in bad:
+            st.warning(md(f"**{r['ticker']}**: {r['error']}"
+                          + ("" if online else " — offline and not cached; "
+                             "switch **Source** to Online to fetch it once.")))
+        st.caption(md(
+            "One year of daily bars per name. **Score** out of 100: market "
+            "structure 25 (HH 10 — last swing high above the one before; HL "
+            "10 — same for swing lows; 5 for closing above the last swing "
+            "low) · moving averages 15 (close > SMA20, SMA20 > SMA50, SMA50 > "
+            "SMA200, SMA20 and SMA50 rising over 5 bars) · momentum 13 (RSI "
+            "50–75, MACD over its signal, up over 20 bars) · breakout "
+            "proximity 15 (nearest resistance within 2% / 4% / 7% / 10%) · "
+            "volume 15 (today vs its 20-day average: > 1.5× / 1.2× / 1×, 4 "
+            "otherwise). 🔥 ≥ 80 · 🟡 ≥ 65 · ⚪ ≥ 50 · ❌ below. Swings are "
+            "`find_peaks` 5 bars apart, prominence a quarter of the year's "
+            "standard deviation; resistance and support are the three nearest "
+            "swings above and below the close. **To R1** is the distance to "
+            "the nearest. A crypto pair's last bar is the current UTC day, "
+            "still forming. Ported unchanged from the breakout-checking script."))
+
+
+# ==========================================================================
+# Tabs 4-5 -- news, and the LLM analyst
 # ==========================================================================
 # A Gemini agent that reads the tabs above through tools and writes about
 # them. Everything it can quote is computed by this package; it has no
