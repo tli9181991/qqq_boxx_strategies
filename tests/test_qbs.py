@@ -4838,3 +4838,43 @@ def test_two_tabs_share_one_screener_pull(monkeypatch):
     b, _ = Q.latest_quotes("finviz")
     assert len(calls) == 1 and a.equals(b)
     Q.clear_quote_memo()
+
+
+# --------------------------------------------------------------------------
+# S&P 500 rebound monitor
+# --------------------------------------------------------------------------
+
+def _rebound_bars(last):
+    """250 calm sessions drifting up 0.1/day, then `last(sma50_estimate)`."""
+    n = 250
+    c = 400 + 0.1 * np.arange(n)
+    rows = [[x - 0.2, x + 0.5, x - 0.5, x] for x in c]
+    sma50 = c[-49:].mean()          # close enough: the last bar is one of 50
+    rows.append(last(sma50))
+    idx = pd.bdate_range("2025-01-01", periods=len(rows))
+    return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"], index=idx)
+
+
+def test_rebound_hammer_that_reclaims_the_50_day_is_support():
+    from qbs.rebound import ma_status, rebound_frame
+    # Opens above, dives 2.5% through the 50-day, closes back above it near the high.
+    bars = _rebound_bars(lambda m: [m * 1.016, m * 1.0205, m * 0.995, m * 1.02])
+    last = rebound_frame(bars).iloc[-1]
+    assert last["hammer"] and last["SMA50_reclaim"] and last["SMA50_support"]
+    assert ma_status(last, "SMA50") == "support"
+
+
+def test_rebound_close_below_the_average_is_not_a_reclaim():
+    from qbs.rebound import ma_status, rebound_frame
+    bars = _rebound_bars(lambda m: [m * 1.0, m * 1.001, m * 0.992, m * 0.995])
+    last = rebound_frame(bars).iloc[-1]
+    assert not last["SMA50_reclaim"] and last["SMA50_touch"]
+    assert ma_status(last, "SMA50") == "touch"
+
+
+def test_rebound_far_from_every_average_has_no_signal():
+    from qbs.rebound import MAS, ma_status, rebound_frame
+    bars = _rebound_bars(lambda m: [m * 1.10, m * 1.105, m * 1.095, m * 1.10])
+    last = rebound_frame(bars).iloc[-1]
+    assert all(ma_status(last, ma) is None for ma in MAS)
+    assert last["SMA50_dist"] > 0.05

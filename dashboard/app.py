@@ -66,6 +66,7 @@ from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
                         watchlist_rows, watchlist_stop_levels)
 from qbs.strategies import cross_sectional_momentum, residual_momentum
 from qbs.incremental import persist_fill
+from qbs.rebound import MAS as REBOUND_MAS, ma_status, rebound_frame
 from qbs.universe import UNIVERSE_DIR, load_universe, load_universe_prices
 
 st.set_page_config(page_title="Strategy picks / Market overview", layout="wide",
@@ -972,6 +973,9 @@ QQQ_OHLC = ohlc_for("QQQ", download_start, bool(online), BAR_EPOCH)
 # Its bars are fetched here, the same way as QQQ's -- real High/Low for the
 # ATR -- and cached under data/ohlc/. Closes are the fallback.
 SPY_OHLC = ohlc_for("SPY", download_start, bool(online), BAR_EPOCH)
+# The rebound monitor's own index, as its source script uses it. SPY tracks
+# the same S&P 500 and is the fallback when VOO's bars cannot be had.
+VOO_OHLC = ohlc_for("VOO", download_start, bool(online), BAR_EPOCH)
 SPY_CLOSE, SPY_ERR = ((SPY_OHLC["Close"], None) if SPY_OHLC is not None
                       else spy_close_for(download_start, bool(online), BAR_EPOCH))
 breadth = build_breadth(uni, px["QQQ"], UNIVERSE_NOTE, bar_epoch=BAR_EPOCH,
@@ -2185,6 +2189,74 @@ with tab_market:
         f"close. Row 3 counts consecutive sessions under {_tw.level:.0f}% and, "
         f"while the streak is short of {_tw.bear_days}, projects the session it "
         "would reach it on — the live version of the source's \"Oct 6\"."))
+
+    # ---- S&P 500 rebound monitor -------------------------------------------
+    st.divider()
+    st.markdown("#### S&P 500 rebound monitor")
+    rb_name, rb_bars = (("VOO", VOO_OHLC) if VOO_OHLC is not None else
+                        ("SPY", SPY_OHLC) if SPY_OHLC is not None else (None, None))
+    if rb_bars is None or len(rb_bars) < 200:
+        st.info(md(
+            "No VOO or SPY daily bars to read — "
+            + ("the download failed." if online else
+               "offline and not cached; switch **Source** to Online to fetch them once.")),
+            icon="ℹ️")
+    else:
+        rb = rebound_frame(rb_bars)
+        rb_last = rb.iloc[-1]
+        rc = st.columns(len(REBOUND_MAS) + 1)
+        rc[0].metric(f"{rb_name} close", f"{rb_last['Close']:,.2f}")
+        rc[0].caption(f"{rb.index[-1]:%Y-%m-%d}"
+                      + (" · 🔨 hammer" if rb_last["hammer"] else ""))
+        for col, ma in zip(rc[1:], REBOUND_MAS):
+            status = ma_status(rb_last, ma)
+            col.metric(f"vs {ma}", fmt(rb_last[f"{ma}_dist"] * 100, "{:+.2f}%"))
+            col.caption({"support": "🟢 **support** — hammer that reclaimed it",
+                         "reclaim": "🟢 reclaimed — dipped to it, closed above",
+                         "touch": "🟡 touched — low within 1%"}.get(
+                             status, f"{rb_last[ma]:,.2f}"))
+
+        rb_n = st.slider("Sessions shown", 5, 60, 10, key="rebound_days")
+        rb_view = rb.tail(rb_n).iloc[::-1]
+        RB_TINT = {"support": UP_STRONG, "reclaim": UP, "touch": "#f5e6a8"}
+        rb_cells, rb_tints = {}, {}
+        for ma in REBOUND_MAS:
+            labels, tints = [], []
+            for _, row in rb_view.iterrows():
+                st_ = ma_status(row, ma)
+                labels.append(fmt(row[f"{ma}_dist"] * 100, "{:+.1f}%")
+                              + (f" · {st_}" if st_ else ""))
+                tints.append(RB_TINT.get(st_, ""))
+            rb_cells[ma], rb_tints[ma] = labels, tints
+        rb_disp = pd.DataFrame({
+            "Date": rb_view.index.strftime("%Y-%m-%d"),
+            "Close": rb_view["Close"].round(2),
+            "Low": rb_view["Low"].round(2),
+            "Hammer": ["🔨" if h else "" for h in rb_view["hammer"]],
+            **{ma: rb_cells[ma] for ma in REBOUND_MAS},
+            "ATR14": rb_view["ATR14"].round(2),
+        })
+        rb_style = rb_disp.style
+        for ma in REBOUND_MAS:
+            rb_style = rb_style.apply(
+                lambda _c, t=rb_tints[ma]: [f"background-color: {x}" if x else ""
+                                            for x in t], subset=[ma])
+        st.dataframe(rb_style.format({"Close": "{:,.2f}", "Low": "{:,.2f}",
+                                      "ATR14": "{:,.2f}"}),
+                     hide_index=True, width="stretch",
+                     height=min(620, 38 + 35 * len(rb_disp)))
+        st.caption(md(
+            f"**{rb_name}** daily bars"
+            + ("" if rb_name == "VOO" else " (VOO had no data this session)")
+            + ". Each moving-average cell is the close's distance from that "
+            "average, and the strongest signal of the day for it: **touch** — "
+            "the low came within 1% of the average · **reclaim** — the low "
+            "dipped to or under it (within 1%) and the close finished back "
+            "**above** it · **support** — a reclaim on a 🔨 day, the line "
+            "rejected the sell-off. The hammer here is the monitor's own rule: "
+            "lower wick ≥ 2× the body, upper wick ≤ 1.5× the body, close in the "
+            "top 40% of the range (no prior-trend test — the dip to the average "
+            "is the context). Ported unchanged from the rebound-monitor script."))
 
     # ---- momentum leaders -------------------------------------------------
     st.divider()
