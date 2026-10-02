@@ -4924,3 +4924,20 @@ def test_breakout_status_bands():
     assert setup_status(65).startswith("🟡")
     assert setup_status(50).startswith("⚪")
     assert setup_status(49).startswith("❌")
+
+
+def test_breakout_atr_is_the_mean_true_range():
+    from qbs.breakout_monitor import calculate_atr
+    # Every bar spans 2 and closes mid-range, so each true range is 2.
+    atr = calculate_atr(_breakout_bars(n=40))["ATR"]
+    assert atr.iloc[:13].isna().all()
+    assert atr.iloc[-1] >= 2.0
+
+
+def test_breakout_swing_prominence_scales_with_atr():
+    from qbs.breakout_monitor import add_indicators, find_swings
+    df = add_indicators(_breakout_bars())
+    loose_h, loose_l = find_swings(df, atr_mult=0.5)
+    strict_h, strict_l = find_swings(df, atr_mult=50)
+    assert len(loose_h) > 0 and len(loose_l) > 0
+    assert len(strict_h) == 0 and len(strict_l) == 0

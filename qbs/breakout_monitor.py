@@ -1,9 +1,10 @@
 """Breakout monitor: how close is a name to a breakout, scored out of 100?
 
-Ported from the `breakout-checking` script as written -- the same indicators,
-the same swing detection, the same scoring table and the same status bands --
-so the dashboard reads exactly what that script prints. It runs on one year of
-daily bars per name (the script's `period="1y"`).
+Ported from the `breakout-checking` script -- the same indicators, the same
+scoring table and the same status bands. Swing detection has since moved from
+the script's standard-deviation prominence to an ATR-based one (1.5x the
+latest 14-day ATR). It runs on one year of daily bars per name (the script's
+`period="1y"`).
 
 Not to be confused with `qbs.breakout`, the M6 weekly-breakout STRATEGY with
 its own levels and hourly entries. This is a read-only screen over a
@@ -12,8 +13,7 @@ watchlist; nothing trades on it.
 Steps, per name:
 
 * swings     -- `scipy.signal.find_peaks` on the highs and the (negated)
-                lows, 5 bars apart, prominence a quarter of the window's
-                standard deviation
+                lows, 5 bars apart, prominence 1.5x the latest 14-day ATR
 * structure  -- HH: the last swing high above the one before it; HL: the
                 same for the swing lows
 * levels     -- the three nearest swing highs above the close (resistance)
@@ -43,8 +43,8 @@ NO_SETUP = "❌ NO SETUP"
 def last_year(ohlc: pd.DataFrame) -> pd.DataFrame:
     """The final 365 calendar days of bars: the script's `period="1y"`.
 
-    Trimming matters beyond speed -- the swing prominence is a fraction of the
-    window's standard deviation, so a longer history finds different swings.
+    Trimming matters beyond speed -- the swings are found over the whole
+    window, so a longer history can reach older levels.
     """
     df = ohlc.sort_index()
     cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in df]
@@ -54,10 +54,26 @@ def last_year(ohlc: pd.DataFrame) -> pd.DataFrame:
     return df[df.index > df.index[-1] - pd.Timedelta(days=365)]
 
 
+# Swing prominence in ATRs: a peak must stand out by this many days of
+# normal range to count.
+SWING_ATR_MULT = 1.5
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """`ATR`: the simple `period`-day average of the true range. In place."""
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close],
+                           axis=1).max(axis=1)
+    df["ATR"] = true_range.rolling(period).mean()
+    return df
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """SMA20/50/200, 20-day average volume, 14-day RSI (simple averages)
-    and MACD(12, 26, 9)."""
-    df = df.copy()
+    """SMA20/50/200, 20-day average volume, 14-day RSI (simple averages),
+    MACD(12, 26, 9) and 14-day ATR."""
+    df = calculate_atr(df.copy())
     df["SMA20"] = df["Close"].rolling(20).mean()
     df["SMA50"] = df["Close"].rolling(50).mean()
     df["SMA200"] = df["Close"].rolling(200).mean()
@@ -75,14 +91,20 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def find_swings(df: pd.DataFrame, distance: int = 5) -> Tuple[pd.Series, pd.Series]:
-    """Swing highs and swing lows, each a Series of price by date."""
+def find_swings(df: pd.DataFrame, distance: int = 5,
+                atr_mult: float = SWING_ATR_MULT) -> Tuple[pd.Series, pd.Series]:
+    """Swing highs and swing lows, each a Series of price by date.
+
+    Prominence is `atr_mult` x the latest ATR, for both. `df` must carry an
+    `ATR` column (`add_indicators` adds it).
+    """
     from scipy.signal import find_peaks
 
+    prominence = df["ATR"].iloc[-1] * atr_mult
     high_idx, _ = find_peaks(df["High"].values, distance=distance,
-                             prominence=df["High"].std() * 0.25)
+                             prominence=prominence)
     low_idx, _ = find_peaks(-df["Low"].values, distance=distance,
-                            prominence=df["Low"].std() * 0.25)
+                            prominence=prominence)
     return df.iloc[high_idx]["High"], df.iloc[low_idx]["Low"]
 
 
