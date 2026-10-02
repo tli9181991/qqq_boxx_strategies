@@ -2508,13 +2508,14 @@ with tab_breakout:
             "50–75, MACD over its signal, up over 20 bars) · breakout "
             "proximity 15 (nearest resistance within 2% / 4% / 7% / 10%) · "
             "volume 15 (today vs its 20-day average: > 1.5× / 1.2× / 1×, 4 "
-            "otherwise). 🔥 ≥ 80 · 🟡 ≥ 65 · ⚪ ≥ 50 · ❌ below. Swings are "
-            "`find_peaks` 5 bars apart, prominence 1.5× the latest 14-day "
-            "ATR; resistance and support are the three nearest "
-            "swings above and below the close. **To R1** is the distance to "
-            "the nearest. A crypto pair's last bar is the current UTC day, "
+            "otherwise). 🔥 ≥ 80 · 🟡 ≥ 65 · ⚪ ≥ 50 · ❌ below. HH/HL "
+            "swings are `find_peaks` 5 bars apart, prominence 1.5× the "
+            "latest 14-day ATR. Resistance and support are the **Daily picks "
+            "chart's levels** — the same engine on the same close history — "
+            "the three nearest above and below the close. **To R1** is the "
+            "distance to the nearest. A crypto pair's last bar is the current UTC day, "
             "still forming. Ported from the breakout-checking script, with "
-            "ATR-based swing prominence."))
+            "ATR-based swings and the Daily picks levels."))
 
 
 # ==========================================================================

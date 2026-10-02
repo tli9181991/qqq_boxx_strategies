@@ -3,11 +3,13 @@
 Ported from the `breakout-checking` script -- the same indicators, the same
 scoring table and the same status bands. Swing detection has since moved from
 the script's standard-deviation prominence to an ATR-based one (1.5x the
-latest 14-day ATR). It runs on one year of daily bars per name (the script's
+latest 14-day ATR), and support/resistance now comes from the Daily picks
+chart's engine (`qbs.breakout.sr_levels`) so the two tabs agree. Everything
+but the levels runs on one year of daily bars per name (the script's
 `period="1y"`).
 
-Not to be confused with `qbs.breakout`, the M6 weekly-breakout STRATEGY with
-its own levels and hourly entries. This is a read-only screen over a
+Not to be confused with `qbs.breakout`, the M6 weekly-breakout STRATEGY whose
+level engine it borrows; it has hourly entries and trades. This is a read-only screen over a
 watchlist; nothing trades on it.
 
 Steps, per name:
@@ -16,8 +18,9 @@ Steps, per name:
                 lows, 5 bars apart, prominence 1.5x the latest 14-day ATR
 * structure  -- HH: the last swing high above the one before it; HL: the
                 same for the swing lows
-* levels     -- the three nearest swing highs above the close (resistance)
-                and the three nearest swing lows below it (support)
+* levels     -- the Daily picks chart's support/resistance (`qbs.breakout.
+                sr_levels` on the close history): the three nearest above the
+                close (resistance) and below it (support)
 * score      -- structure 25, moving averages 15, momentum 13, distance to
                 the nearest resistance 15, volume vs its 20-day average 15;
                 capped at 100
@@ -119,15 +122,26 @@ def detect_market_structure(swing_highs: pd.Series, swing_lows: pd.Series) -> Di
             "last_low": float(last_low), "prev_low": float(prev_low)}
 
 
-def get_support_resistance(df: pd.DataFrame, swing_highs: pd.Series,
-                           swing_lows: pd.Series) -> Tuple[List[float], List[float]]:
-    """The three nearest swing lows below the close and swing highs above it,
-    nearest first."""
-    price = df["Close"].iloc[-1]
-    highs = swing_highs[swing_highs > price].sort_values()
-    lows = swing_lows[swing_lows < price].sort_values(ascending=False)
-    return ([float(x) for x in lows.iloc[:3]],
-            [float(x) for x in highs.iloc[:3]])
+def get_support_resistance(closes: pd.Series, n: int = 3
+                           ) -> Tuple[List[float], List[float]]:
+    """The `n` nearest levels below the last close (support) and at or above
+    it (resistance), nearest first.
+
+    The Daily picks chart's levels, not this module's swings: `sr_levels` on
+    close-to-close bars over the whole history, split at the last close the
+    way the chart colours them. Same input, same engine, so the two tabs show
+    the same numbers for a name.
+    """
+    from qbs.breakout import closes_to_bars, sr_levels
+    from qbs.config import BreakoutParams
+
+    closes = closes.dropna()
+    bars = closes_to_bars(closes.to_frame("x"))["x"]
+    levels = sr_levels(bars, BreakoutParams())
+    price = float(closes.iloc[-1])
+    res = sorted(x for x in levels if x >= price)
+    sup = sorted((x for x in levels if x < price), reverse=True)
+    return sup[:n], res[:n]
 
 
 def score_setup(df: pd.DataFrame, structure: Dict, support: List[float],
@@ -209,6 +223,7 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame]) -> Dict:
         return {"ticker": ticker, "error": "no daily bars"}
     if "Volume" not in ohlc:
         return {"ticker": ticker, "error": "no volume in the bars"}
+    full_close = ohlc["Close"].astype(float).sort_index()
     df = last_year(ohlc)
     if len(df) < 20:
         return {"ticker": ticker, "error": f"only {len(df)} bars"}
@@ -216,7 +231,8 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame]) -> Dict:
     df = add_indicators(df)
     highs, lows = find_swings(df)
     structure = detect_market_structure(highs, lows)
-    support, resistance = get_support_resistance(df, highs, lows)
+    support, resistance = get_support_resistance(
+        full_close.loc[:df.index[-1]])
     score = score_setup(df, structure, support, resistance)
     latest = df.iloc[-1]
     return {
