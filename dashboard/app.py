@@ -33,6 +33,7 @@ package does not cache).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Dict, Optional
@@ -52,7 +53,9 @@ from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
                          sector_leaders)
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.breakout_monitor import (DEFAULT_WATCHLIST as BREAKOUT_DEFAULT,
-                                  breakout_monitor)
+                                  breakout_monitor, get_support_resistance,
+                                  load_manual_levels, parse_levels,
+                                  save_manual_levels)
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
                         MomentumParams, ResidualMomentumParams)
 from qbs.data import (MARKET_TZ, drop_partial_bars, freshness_note,
@@ -664,7 +667,7 @@ def ohlc_for(ticker: str, download_start: str, online: bool, bar_epoch: str):
 
 @st.cache_data(show_spinner=False)
 def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
-                 lookback: int, max_levels: int = 8):
+                 lookback: int, max_levels: int = 8, src: str = "universe"):
     """Price, EMAs and support/resistance for one name, as of one date.
 
     Levels are derived from history up to `asof` ONLY — the same causal rule
@@ -672,6 +675,10 @@ def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
     would show the chart lines that the strategy could not have seen on the
     date being inspected, which is the look-ahead the breakout port exists to
     remove; a dashboard that quietly reintroduces it is worse than none.
+
+    `src` names where `_uni` came from. `_uni` is not hashed, so a caller
+    passing a different close series for the same ticker (the Breakout
+    monitor's own bars) must pass its own `src` or it is served this one's.
     """
     close = _uni[ticker].dropna().loc[:asof]
     if close.empty:
@@ -1189,6 +1196,91 @@ WATCH_FRAME = pd.DataFrame({
 WATCH_EXTRA = [t for t in WATCH_FRAME.columns if t not in uni.columns]
 
 
+def draw_price_chart(ticker: str, price: pd.DataFrame, ema_long: pd.DataFrame,
+                     lvl: pd.DataFrame, asof, months: int):
+    """Candles (or a close line), the EMAs and the level rules: the picture
+    half of `price_panel`, shared with the Breakout monitor tab so both tabs
+    draw one chart. `price`, `ema_long` and `lvl` are `chart_frames` output;
+    `lvl` may be replaced by the caller (hand-corrected levels)."""
+    # Candles need real Open/High/Low. When they cannot be had the
+    # chart falls back to a close line and says so, rather than
+    # drawing a wickless body per bar off the close series -- that
+    # would assert a session high and low that never happened.
+    ohlc = ohlc_for(ticker, download_start, bool(online), BAR_EPOCH)
+    bars = None
+    if ohlc is not None and not ohlc.empty:
+        win = ohlc.loc[:asof].tail(int(months * 21))
+        if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
+            bars = win.reset_index()
+            bars.columns = [str(c).lower() for c in bars.columns]
+
+    # One index across every layer here. Numbered per layer, a candle at
+    # session 40 and an EMA point at session 40 would be different days
+    # whenever the two frames start on different dates.
+    (price, ema_long, bars), xaxis = session_axis(price, ema_long, bars)
+    xenc = alt.X("n:Q", axis=xaxis, title=None,
+                 scale=alt.Scale(nice=False, zero=False))
+
+    yscale = alt.Scale(zero=False, nice=True)
+    if bars is not None:
+        body_colour = alt.condition(
+            "datum.open <= datum.close",
+            alt.value(CANDLE_UP), alt.value(CANDLE_DN))
+        cbase = alt.Chart(bars).encode(
+            x=xenc, color=body_colour,
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("open:Q", format=".2f"),
+                     alt.Tooltip("high:Q", format=".2f"),
+                     alt.Tooltip("low:Q", format=".2f"),
+                     alt.Tooltip("close:Q", format=".2f")])
+        wick = cbase.mark_rule(size=1).encode(
+            y=alt.Y("low:Q", title=None, scale=yscale),
+            y2=alt.Y2("high:Q"))
+        body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
+            y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
+        line = wick + body
+    else:
+        line = alt.Chart(price).mark_line(
+            color="#0b0b0b", size=1.7).encode(
+            x=xenc,
+            y=alt.Y("close:Q", title=None, scale=yscale),
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("close:Q", title="Close", format=".2f")])
+    emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
+        x=xenc,
+        y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
+        color=alt.Color("ema:N", title=None, scale=alt.Scale(
+            domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
+            legend=alt.Legend(orient="top", direction="horizontal")),
+        tooltip=[alt.Tooltip("date:T", title="Date"),
+                 alt.Tooltip("ema:N", title="Line"),
+                 alt.Tooltip("value:Q", title="Value", format=".2f")])
+    layers = [line, emas]
+    if not lvl.empty:
+        rules = alt.Chart(lvl).mark_rule(
+            strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
+            y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
+            color=alt.Color("kind:N", title=None, scale=alt.Scale(
+                domain=["Resistance", "Support"],
+                range=["#d03b3b", "#0ca30c"]),
+                legend=alt.Legend(orient="top", direction="horizontal")),
+            tooltip=[alt.Tooltip("kind:N", title="Level"),
+                     alt.Tooltip("level:Q", title="Price", format=".2f")])
+        layers.append(rules)
+    st.altair_chart(
+        alt.layer(*layers).resolve_scale(color="independent")
+        .properties(height=430), width="stretch")
+    if bars is None:
+        st.caption(
+            "📉 Close line, not candles — no Open/High/Low for "
+            f"**{ticker}**. The universe cache holds closes only; "
+            "switch **Source** to Online so the panel can fetch "
+            "real OHLC for the selected name. Candles are never "
+            "drawn from closes, because a wickless body would "
+            "assert a high and low that never happened."
+        )
+
+
 def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 default_ticker: Optional[str] = None,
                 extra: Optional[pd.DataFrame] = None,
@@ -1257,83 +1349,7 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     else:
         price, ema_long, lvl, last, n_levels, has_overhead = frames
 
-        # Candles need real Open/High/Low. When they cannot be had the
-        # chart falls back to a close line and says so, rather than
-        # drawing a wickless body per bar off the close series -- that
-        # would assert a session high and low that never happened.
-        ohlc = ohlc_for(ticker, download_start, bool(online), BAR_EPOCH)
-        bars = None
-        if ohlc is not None and not ohlc.empty:
-            win = ohlc.loc[:asof].tail(int(months * 21))
-            if len(win) > 2 and {"Open", "High", "Low"} <= set(win.columns):
-                bars = win.reset_index()
-                bars.columns = [str(c).lower() for c in bars.columns]
-
-        # One index across every layer here. Numbered per layer, a candle at
-        # session 40 and an EMA point at session 40 would be different days
-        # whenever the two frames start on different dates.
-        (price, ema_long, bars), xaxis = session_axis(price, ema_long, bars)
-        xenc = alt.X("n:Q", axis=xaxis, title=None,
-                     scale=alt.Scale(nice=False, zero=False))
-
-        yscale = alt.Scale(zero=False, nice=True)
-        if bars is not None:
-            body_colour = alt.condition(
-                "datum.open <= datum.close",
-                alt.value(CANDLE_UP), alt.value(CANDLE_DN))
-            cbase = alt.Chart(bars).encode(
-                x=xenc, color=body_colour,
-                tooltip=[alt.Tooltip("date:T", title="Date"),
-                         alt.Tooltip("open:Q", format=".2f"),
-                         alt.Tooltip("high:Q", format=".2f"),
-                         alt.Tooltip("low:Q", format=".2f"),
-                         alt.Tooltip("close:Q", format=".2f")])
-            wick = cbase.mark_rule(size=1).encode(
-                y=alt.Y("low:Q", title=None, scale=yscale),
-                y2=alt.Y2("high:Q"))
-            body = cbase.mark_bar(size=max(1.5, 380 / len(bars))).encode(
-                y=alt.Y("open:Q", scale=yscale), y2=alt.Y2("close:Q"))
-            line = wick + body
-        else:
-            line = alt.Chart(price).mark_line(
-                color="#0b0b0b", size=1.7).encode(
-                x=xenc,
-                y=alt.Y("close:Q", title=None, scale=yscale),
-                tooltip=[alt.Tooltip("date:T", title="Date"),
-                         alt.Tooltip("close:Q", title="Close", format=".2f")])
-        emas = alt.Chart(ema_long).mark_line(size=1.1, opacity=0.9).encode(
-            x=xenc,
-            y=alt.Y("value:Q", scale=alt.Scale(zero=False, nice=True)),
-            color=alt.Color("ema:N", title=None, scale=alt.Scale(
-                domain=list(EMA_COLOURS), range=list(EMA_COLOURS.values())),
-                legend=alt.Legend(orient="top", direction="horizontal")),
-            tooltip=[alt.Tooltip("date:T", title="Date"),
-                     alt.Tooltip("ema:N", title="Line"),
-                     alt.Tooltip("value:Q", title="Value", format=".2f")])
-        layers = [line, emas]
-        if not lvl.empty:
-            rules = alt.Chart(lvl).mark_rule(
-                strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
-                y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
-                color=alt.Color("kind:N", title=None, scale=alt.Scale(
-                    domain=["Resistance", "Support"],
-                    range=["#d03b3b", "#0ca30c"]),
-                    legend=alt.Legend(orient="top", direction="horizontal")),
-                tooltip=[alt.Tooltip("kind:N", title="Level"),
-                         alt.Tooltip("level:Q", title="Price", format=".2f")])
-            layers.append(rules)
-        st.altair_chart(
-            alt.layer(*layers).resolve_scale(color="independent")
-            .properties(height=430), width="stretch")
-        if bars is None:
-            st.caption(
-                "📉 Close line, not candles — no Open/High/Low for "
-                f"**{ticker}**. The universe cache holds closes only; "
-                "switch **Source** to Online so the panel can fetch "
-                "real OHLC for the selected name. Candles are never "
-                "drawn from closes, because a wickless body would "
-                "assert a high and low that never happened."
-            )
+        draw_price_chart(ticker, price, ema_long, lvl, asof, months)
 
         above = [f"EMA {n}" for n in EMA_SPANS
                  if not ema_long[ema_long["ema"] == f"EMA {n}"].empty
@@ -2441,9 +2457,15 @@ BREAKOUT_WATCHLIST_VAR = "QBS_DASH_BREAKOUT_WATCHLIST"
 
 @st.cache_data(show_spinner="Scoring the breakout watchlist…")
 def breakout_rows(tickers: tuple, download_start: str, online: bool,
-                  bar_epoch: str):
-    """`breakout_monitor` for every name, one fetch per name."""
-    return [breakout_monitor(t, ohlc_for(t, download_start, online, bar_epoch))
+                  bar_epoch: str, manual_json: str):
+    """`breakout_monitor` for every name, one fetch per name.
+
+    The hand-corrected levels come in as JSON so they are part of the cache
+    key: saving a correction re-scores, nothing else does.
+    """
+    manual = json.loads(manual_json)
+    return [breakout_monitor(t, ohlc_for(t, download_start, online, bar_epoch),
+                             manual.get(t))
             for t in tickers]
 
 
@@ -2464,8 +2486,12 @@ with tab_breakout:
     if not BREAKOUT_WATCHLIST:
         st.info("The breakout watchlist is empty.", icon="ℹ️")
     else:
+        # Read from disk on every run, so a launch or refresh picks up what
+        # was saved last time.
+        MANUAL_LEVELS = load_manual_levels()
         results = breakout_rows(tuple(BREAKOUT_WATCHLIST), download_start,
-                                bool(online), BAR_EPOCH)
+                                bool(online), BAR_EPOCH,
+                                json.dumps(MANUAL_LEVELS, sort_keys=True))
         ok = sorted((r for r in results if "error" not in r),
                     key=lambda r: r["score"], reverse=True)
         bad = [r for r in results if "error" in r]
@@ -2482,6 +2508,7 @@ with tab_breakout:
                           if r["to_resistance"] is not None else np.nan),
                 "Resistance": _levels(r["resistance"]),
                 "Support": _levels(r["support"]),
+                "Levels": "✏️ manual" if r["manual"] else "estimated",
                 "RSI": r["rsi"],
                 "Vol / 20D": r["volume_ratio"],
             } for r in ok])
@@ -2515,7 +2542,83 @@ with tab_breakout:
             "the three nearest above and below the close. **To R1** is the "
             "distance to the nearest. A crypto pair's last bar is the current UTC day, "
             "still forming. Ported from the breakout-checking script, with "
-            "ATR-based swings and the Daily picks levels."))
+            "ATR-based swings and the Daily picks levels. **✏️ manual** rows use your saved levels instead (editor below), and their proximity points follow them."))
+
+        if ok:
+            st.divider()
+            st.markdown("#### Price & levels")
+            bc1, bc2, bc3 = st.columns([2, 1, 1])
+            bt = bc1.selectbox("Ticker", [r["ticker"] for r in ok],
+                               key="bo_chart_ticker",
+                               help="Highest score first, as in the table.")
+            b_months = bc2.selectbox("Window", [3, 6, 12, 24], index=2,
+                                     format_func=lambda m: f"{m}m",
+                                     key="bo_chart_win")
+            b_nlvl = bc3.number_input(
+                "Levels", 0, 30, 8, key="bo_chart_levels",
+                help="Nearest N estimated levels to the last price. Saved "
+                     "manual levels are always all drawn.")
+            b_close = (ohlc_for(bt, download_start, bool(online), BAR_EPOCH)
+                       ["Close"].astype(float).dropna().rename(bt).to_frame())
+            b_asof = b_close.index[-1]
+            b_frames = chart_frames(b_close, bt, b_asof, int(b_months * 21),
+                                    int(b_nlvl), src="breakout")
+            price, ema_long, lvl, b_last, b_n, _ = b_frames
+            b_man = MANUAL_LEVELS.get(bt)
+            if b_man:
+                lvl = pd.DataFrame(
+                    [{"level": x, "kind": "Support"} for x in b_man["support"]]
+                    + [{"level": x, "kind": "Resistance"}
+                       for x in b_man["resistance"]],
+                    columns=["level", "kind"])
+            draw_price_chart(bt, price, ema_long, lvl, b_asof, b_months)
+            st.caption(md(
+                f"**{bt}** {b_last:,.2f} on {b_asof:%Y-%m-%d} · "
+                + (f"✏️ your {len(lvl)} saved levels" if b_man else
+                   f"showing {len(lvl)} of {b_n} estimated levels in view")
+                + " · the Daily picks chart, on this name's own bars."))
+
+            # ---- hand-corrected levels ---------------------------------
+            b_est_sup, b_est_res = get_support_resistance(b_close[bt])
+            b_cur = b_man or {"support": b_est_sup, "resistance": b_est_res}
+            b_fmt = lambda xs: ", ".join(f"{x:.2f}" for x in sorted(xs))
+            # The saved values are in the key, so a save or reset refills the
+            # boxes instead of keeping what was typed before it.
+            b_ver = json.dumps(b_man, sort_keys=True)
+            with st.form(f"bo_levels_form_{bt}"):
+                st.markdown(f"**Correct {bt}'s levels**"
+                            + (" — ✏️ manual" if b_man else " — estimated"))
+                fc1, fc2 = st.columns(2)
+                b_sup_txt = fc1.text_input(
+                    "Support levels", b_fmt(b_cur["support"]),
+                    key=f"bo_sup_{bt}_{b_ver}",
+                    help="Comma or space separated prices.")
+                b_res_txt = fc2.text_input(
+                    "Resistance levels", b_fmt(b_cur["resistance"]),
+                    key=f"bo_res_{bt}_{b_ver}",
+                    help="Comma or space separated prices.")
+                fb1, fb2, _ = st.columns([1, 1, 3])
+                b_save = fb1.form_submit_button("💾 Save", width="stretch")
+                b_reset = fb2.form_submit_button(
+                    "↺ Use estimate", width="stretch", disabled=not b_man)
+            if b_save:
+                try:
+                    b_sup, b_res = parse_levels(b_sup_txt), parse_levels(b_res_txt)
+                except ValueError as exc:
+                    st.error(f"Not saved — {exc}")
+                else:
+                    save_manual_levels(bt, b_sup, b_res)
+                    st.rerun()
+            if b_reset:
+                save_manual_levels(bt, None, None)
+                st.rerun()
+            st.caption(md(
+                "Saved to `data/breakout_levels.json` on this machine (not "
+                "committed) and loaded every time the dashboard starts or "
+                "refreshes; they replace the estimate in the table, the score "
+                "and this chart until you press **Use estimate**. Saving both "
+                "boxes empty also goes back to the estimate. Manual levels are "
+                "fixed prices: they do not move when new bars arrive."))
 
 
 # ==========================================================================

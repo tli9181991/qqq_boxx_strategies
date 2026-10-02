@@ -28,6 +28,8 @@ Steps, per name:
 
 from __future__ import annotations
 
+import json
+import os
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -35,6 +37,15 @@ import pandas as pd
 # The script's starting list. The dashboard seeds its box from this unless
 # QBS_DASH_BREAKOUT_WATCHLIST says otherwise.
 DEFAULT_WATCHLIST = ("DOCN", "FTNT", "BTC-USD", "ETH-USD")
+
+# Hand-corrected levels, one entry per ticker. Local to this machine and not
+# committed (see .gitignore): they are one person's reading of a chart.
+def _default_levels_path() -> str:
+    from qbs.data import CACHE_DIR
+    return os.path.join(CACHE_DIR, "breakout_levels.json")
+
+
+MANUAL_LEVELS_PATH = _default_levels_path()
 
 # (minimum score, label) -- highest first, as the script checks them.
 STATUS_BANDS = ((80, "🔥 STRONG BREAKOUT SETUP"),
@@ -212,12 +223,76 @@ def setup_status(score: float) -> str:
     return NO_SETUP
 
 
-def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame]) -> Dict:
+def parse_levels(raw: Optional[str]) -> List[float]:
+    """Prices out of a text box: comma or space separated, a leading `$`
+    tolerated. No thousands separators -- the comma splits ("1083.61").
+
+    Raises ValueError naming the first entry that is not a positive number,
+    so a typo is reported rather than silently dropped.
+    """
+    out = []
+    for tok in (raw or "").replace(",", " ").split():
+        try:
+            v = float(tok.strip().lstrip("$"))
+        except ValueError:
+            raise ValueError(f"not a price: {tok!r}") from None
+        if v <= 0:
+            raise ValueError(f"not a positive price: {tok!r}")
+        out.append(v)
+    return sorted(set(out))
+
+
+def load_manual_levels(path: str = MANUAL_LEVELS_PATH) -> Dict[str, Dict]:
+    """`{ticker: {"support": [...], "resistance": [...]}}`, or {} if none
+    saved. A missing or unreadable file is no overrides, not an error."""
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for t, v in (raw or {}).items():
+        if isinstance(v, dict):
+            out[str(t).upper()] = {
+                k: sorted(float(x) for x in v.get(k, []) or [])
+                for k in ("support", "resistance")}
+    return out
+
+
+def save_manual_levels(ticker: str, support: Optional[List[float]],
+                       resistance: Optional[List[float]],
+                       path: str = MANUAL_LEVELS_PATH) -> Dict[str, Dict]:
+    """Store one ticker's corrected levels; both None (or empty) removes its
+    entry, i.e. back to the estimate. Written atomically. Returns the new
+    full mapping."""
+    levels = load_manual_levels(path)
+    t = ticker.upper()
+    if support or resistance:
+        levels[t] = {"support": sorted(support or []),
+                     "resistance": sorted(resistance or [])}
+    else:
+        levels.pop(t, None)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(levels, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return levels
+
+
+def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame],
+                     manual: Optional[Dict[str, List[float]]] = None) -> Dict:
     """Everything the script prints for one name, as one dict.
 
     `ohlc` is daily Open/High/Low/Close/Volume; anything past the last year is
     dropped first. A name without bars, or without a Volume column, comes back
     with an `error` instead of a score -- one bad ticker costs its own row.
+
+    `manual` (`{"support": [...], "resistance": [...]}`) replaces the
+    estimated levels, and the score's breakout-proximity points follow it.
+    Each list is shown nearest the close first; a hand-entered resistance the
+    price has already cleared is still listed, but proximity scores the
+    nearest one ABOVE the close, which is what the estimate always offers.
     """
     if ohlc is None or ohlc.empty:
         return {"ticker": ticker, "error": "no daily bars"}
@@ -231,10 +306,19 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame]) -> Dict:
     df = add_indicators(df)
     highs, lows = find_swings(df)
     structure = detect_market_structure(highs, lows)
-    support, resistance = get_support_resistance(
-        full_close.loc[:df.index[-1]])
-    score = score_setup(df, structure, support, resistance)
     latest = df.iloc[-1]
+    price = float(latest["Close"])
+    if manual:
+        support = sorted(manual.get("support", []),
+                         key=lambda x: abs(x - price))
+        resistance = sorted(manual.get("resistance", []),
+                            key=lambda x: abs(x - price))
+        overhead = sorted(x for x in resistance if x > price)
+    else:
+        support, resistance = get_support_resistance(
+            full_close.loc[:df.index[-1]])
+        overhead = resistance
+    score = score_setup(df, structure, support, overhead)
     return {
         "ticker": ticker,
         "asof": df.index[-1],
@@ -246,6 +330,7 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame]) -> Dict:
         "status": setup_status(score),
         "rsi": float(latest["RSI"]),
         "volume_ratio": float(latest["Volume"] / latest["VOL20"]),
-        "to_resistance": (resistance[0] / latest["Close"] - 1
-                          if resistance else None),
+        "to_resistance": (overhead[0] / latest["Close"] - 1
+                          if overhead else None),
+        "manual": bool(manual),
     }
