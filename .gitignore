@@ -38,6 +38,10 @@ data/hourly/
 # Per-ticker daily OHLC cache for the dashboard candlesticks
 data/ohlc/
 
+# Hand-corrected breakout-monitor levels (local to each machine)
+data/breakout_levels.json
+data/breakout_levels.json.tmp
+
 # Broad US universe pulled from Finviz (large, regenerated on demand)
 data/finviz_universe.csv
 data/universe/us_closes.csv

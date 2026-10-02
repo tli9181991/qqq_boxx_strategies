@@ -4955,3 +4955,39 @@ def test_breakout_monitor_levels_match_the_daily_picks_chart():
     assert r["resistance"] == sorted(x for x in chart if x >= last)[:3]
     assert r["support"] == sorted((x for x in chart if x < last),
                                   reverse=True)[:3]
+
+
+def test_breakout_manual_levels_round_trip(tmp_path):
+    from qbs.breakout_monitor import load_manual_levels, save_manual_levels
+    path = str(tmp_path / "levels.json")
+    assert load_manual_levels(path) == {}
+    save_manual_levels("ftnt", [150.0, 140.0], [170.0], path=path)
+    assert load_manual_levels(path) == {
+        "FTNT": {"support": [140.0, 150.0], "resistance": [170.0]}}
+    save_manual_levels("FTNT", None, None, path=path)
+    assert load_manual_levels(path) == {}
+
+
+def test_breakout_parse_levels():
+    from qbs.breakout_monitor import parse_levels
+    assert parse_levels("163.04, $166.14 150") == [150.0, 163.04, 166.14]
+    assert parse_levels("") == []
+    with pytest.raises(ValueError):
+        parse_levels("163, abc")
+
+
+def test_breakout_manual_levels_replace_the_estimate_and_the_score():
+    from qbs.breakout_monitor import breakout_monitor
+    bars = _breakout_bars()
+    last = float(bars["Close"].iloc[-1])
+    est = breakout_monitor("UP", bars)
+    near = breakout_monitor("UP", bars, {"support": [last * 0.9],
+                                         "resistance": [last * 1.01]})
+    far = breakout_monitor("UP", bars, {"support": [last * 0.9],
+                                        "resistance": [last * 0.95, last * 1.5]})
+    assert near["manual"] and not est["manual"]
+    assert near["resistance"] == [last * 1.01]
+    assert near["to_resistance"] == pytest.approx(0.01)
+    # A cleared resistance stays listed but proximity scores the one above.
+    assert far["to_resistance"] == pytest.approx(0.5)
+    assert near["score"] - far["score"] == 15
