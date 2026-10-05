@@ -4952,9 +4952,14 @@ def test_breakout_monitor_levels_match_the_daily_picks_chart():
     chart = sr_levels(closes_to_bars(bars[["Close"]].rename(
         columns={"Close": "UP"}))["UP"], BreakoutParams())
     last = bars["Close"].iloc[-1]
-    assert r["resistance"] == sorted(x for x in chart if x >= last)[:3]
-    assert r["support"] == sorted((x for x in chart if x < last),
+    from qbs.breakout_monitor import clean_levels
+    snapped = clean_levels(chart, last, True, r["adr"])
+    assert r["resistance"] == sorted(x for x in snapped if x >= last)[:3]
+    assert r["support"] == sorted((x for x in snapped if x < last),
                                   reverse=True)[:3]
+    # Crypto keeps the chart's exact levels.
+    c = breakout_monitor("BTC-USD", bars)
+    assert c["resistance"] == sorted(x for x in chart if x >= last)[:3]
 
 
 def test_breakout_manual_levels_round_trip(tmp_path):
@@ -4991,3 +4996,30 @@ def test_breakout_manual_levels_replace_the_estimate_and_the_score():
     # A cleared resistance stays listed but proximity scores the one above.
     assert far["to_resistance"] == pytest.approx(0.5)
     assert near["score"] - far["score"] == 15
+
+
+def test_breakout_round_steps_scale_with_price():
+    from qbs.breakout_monitor import is_crypto, round_step, snap_levels
+    assert [round_step(p) for p in (15, 35, 157, 750, 1200)] == [1, 2.5, 5, 10, 25]
+    assert snap_levels([163.04, 166.14, 149.98], 157.47) == [150, 165]
+    assert snap_levels([1083.61, 1212.28], 1000.26) == [1075, 1200]
+    assert is_crypto("eth-usd") and not is_crypto("FTNT")
+
+
+def test_breakout_levels_within_one_daily_range_merge():
+    from qbs.breakout_monitor import average_daily_range, clean_levels
+    # $5 steps; 116.9 and 121.2 draw as 115 and 120 -- one zone under a $6
+    # range, two lines under a $3 one. The merged level is the round number
+    # nearest their exact mean (119.05 -> 120).
+    lv = [116.9, 121.2, 139.0, 144.2, 170.0]
+    assert clean_levels(lv, 150, True, 6.0) == [120, 140, 170]
+    assert clean_levels(lv, 150, True, 3.0) == [115, 120, 140, 145, 170]
+    # A group spans at most one range: 100, 105, 110 under $6 is two levels,
+    # not a chain that swallows all three.
+    assert len(clean_levels([100, 105, 110], 150, True, 6.0)) == 2
+    # No range (or crypto without rounding) leaves them as they are.
+    assert clean_levels(lv, 150, False, None) == sorted(lv)
+    bars = _breakout_bars()
+    assert average_daily_range(bars) == pytest.approx(2.0)
+    assert average_daily_range(bars.drop(columns=["High"])) != \
+        average_daily_range(bars.drop(columns=["High"]))  # NaN
