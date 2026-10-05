@@ -5042,3 +5042,75 @@ def test_breakout_volume_contraction_scores_a_dry_up():
     # (0.75e6) puts today's unchanged 1e6 at 1.33x (12 points, not 4).
     assert dried["score"] - flat["score"] == 18
     assert volume_contraction(bars.tail(30)) != volume_contraction(bars.tail(30))
+
+
+# --------------------------------------------------------------------------
+# Swing-trade setups (qbs.swing)
+# --------------------------------------------------------------------------
+
+def _swing_series(tail, n=300, start=100.0, drift=0.3, seed=0):
+    """`n` sessions of a gently rising, lightly noisy close, then `tail`."""
+    rng = np.random.default_rng(seed)
+    base = start + drift * np.arange(n) + rng.normal(0, 0.4, n)
+    vals = list(base) + [base[-1] * f for f in tail]
+    return pd.Series(vals, index=pd.bdate_range("2025-01-01", periods=len(vals)))
+
+
+def test_swing_mean_reversion_catches_a_sharp_dip_in_an_uptrend():
+    from qbs.swing import Ctx, SwingParams, mean_reversion
+    c = _swing_series([0.98, 0.96, 0.94])
+    hit = mean_reversion(Ctx(c, "X"), None, SwingParams())
+    assert hit is not None and hit["rsi2"] < 10
+    assert hit["stop"] < hit["close"] < hit["target"]
+    # The same dip under a falling 200-day SMA is not a trade.
+    down = _swing_series([0.98, 0.96, 0.94], drift=-0.2, start=200)
+    assert mean_reversion(Ctx(down, "X"), None, SwingParams()) is None
+
+
+def test_swing_trend_pullback_needs_a_pullback_to_support():
+    from qbs.swing import Ctx, SwingParams, trend_pullback
+    flat_top = _swing_series([1.0] * 3)
+    assert trend_pullback(Ctx(flat_top, "X"), None, SwingParams()) is None
+    # Six down days, ~3.6% off the high, landing on the 50-day SMA.
+    dip = _swing_series([1 - 0.006 * i for i in range(1, 7)])
+    hit = trend_pullback(Ctx(dip, "X"), None, SwingParams())
+    assert hit is not None and -0.15 <= hit["pullback"] <= -0.03
+    assert hit["support_kind"] == "SMA50"
+    # Four more down days take it under the SMA50 by more than half an ATR.
+    deeper = _swing_series([1 - 0.006 * i for i in range(1, 11)])
+    assert trend_pullback(Ctx(deeper, "X"), None, SwingParams()) is None
+    assert hit["stop"] < min(hit["support"], hit["close"])
+
+
+def test_swing_relative_strength_measures_the_gap_to_the_market():
+    from qbs.swing import Ctx, SwingParams, market_pullback, relative_strength
+    stock = _swing_series([1.0 + 0.012 * i for i in range(1, 11)])
+    mkt = _swing_series([1.0 - 0.004 * i for i in range(1, 11)], seed=1)
+    hit = relative_strength(Ctx(stock, "X"), mkt, SwingParams())
+    assert hit is not None and hit["rs_gap"] > 0.05
+    assert market_pullback(mkt, SwingParams())["pullback"]
+    assert relative_strength(Ctx(stock, "X"), stock, SwingParams()) is None
+
+
+def test_swing_range_bounce_turns_up_off_the_box_floor():
+    from qbs.swing import Ctx, SwingParams, range_bounce
+    n = 300
+    t = np.arange(n)
+    c = 100 + 5 * np.sin(2 * np.pi * t / 20)            # a 90-110 box
+    c[-2], c[-1] = 91.0, 92.0                           # floor, then up
+    s = pd.Series(c, index=pd.bdate_range("2025-01-01", periods=n))
+    hit = range_bounce(Ctx(s, "X"), None, SwingParams())
+    assert hit is not None and hit["position"] <= 0.3
+    assert hit["target"] == pytest.approx(s.iloc[-40:].max())
+
+
+def test_swing_scan_returns_a_frame_per_setup_and_skips_short_history():
+    from qbs.swing import SETUPS, scan
+    closes = pd.DataFrame({"A": _swing_series([0.98, 0.96, 0.94]),
+                           "B": _swing_series([1.0])})
+    closes["SHORT"] = np.nan
+    closes.iloc[-50:, closes.columns.get_loc("SHORT")] = 10.0
+    res = scan(closes, _swing_series([1.0] * 3, seed=2))
+    assert set(res) == {s.key for s in SETUPS}
+    assert "A" in res["mean_reversion"].index
+    assert all("SHORT" not in df.index for df in res.values() if not df.empty)
