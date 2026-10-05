@@ -54,6 +54,7 @@ from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.breakout_monitor import (DEFAULT_WATCHLIST as BREAKOUT_DEFAULT,
                                   breakout_monitor, get_support_resistance,
+                                  is_crypto, round_step, snap_levels,
                                   load_manual_levels, parse_levels,
                                   save_manual_levels)
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
@@ -2539,7 +2540,9 @@ with tab_breakout:
             "swings are `find_peaks` 5 bars apart, prominence 1.5× the "
             "latest 14-day ATR. Resistance and support are the **Daily picks "
             "chart's levels** — the same engine on the same close history — "
-            "the three nearest above and below the close. **To R1** is the "
+            "**snapped to round numbers for stocks** (step by price: $1 under "
+            "$20, $2.5 to $50, $5 to $500, $10 to $1,000, $25 above; crypto "
+            "stays exact), the three nearest above and below the close. **To R1** is the "
             "distance to the nearest. A crypto pair's last bar is the current UTC day, "
             "still forming. Ported from the breakout-checking script, with "
             "ATR-based swings and the Daily picks levels. **✏️ manual** rows use your saved levels instead (editor below), and their proximity points follow them."))
@@ -2571,15 +2574,23 @@ with tab_breakout:
                     + [{"level": x, "kind": "Resistance"}
                        for x in b_man["resistance"]],
                     columns=["level", "kind"])
+            elif not is_crypto(bt) and not lvl.empty:
+                # The table's round numbers, so the lines match the rows.
+                lvl = pd.DataFrame({"level": snap_levels(lvl["level"], b_last)})
+                lvl["kind"] = np.where(lvl["level"] >= b_last,
+                                       "Resistance", "Support")
             draw_price_chart(bt, price, ema_long, lvl, b_asof, b_months)
             st.caption(md(
                 f"**{bt}** {b_last:,.2f} on {b_asof:%Y-%m-%d} · "
                 + (f"✏️ your {len(lvl)} saved levels" if b_man else
-                   f"showing {len(lvl)} of {b_n} estimated levels in view")
+                   f"showing {len(lvl)} of {b_n} estimated levels in view"
+                   + ("" if is_crypto(bt) else
+                      f", snapped to ${round_step(b_last):g} steps"))
                 + " · the Daily picks chart, on this name's own bars."))
 
             # ---- hand-corrected levels ---------------------------------
-            b_est_sup, b_est_res = get_support_resistance(b_close[bt])
+            b_est_sup, b_est_res = get_support_resistance(
+                b_close[bt], round_levels=not is_crypto(bt))
             b_cur = b_man or {"support": b_est_sup, "resistance": b_est_res}
             b_fmt = lambda xs: ", ".join(f"{x:.2f}" for x in sorted(xs))
             # The saved values are in the key, so a save or reset refills the

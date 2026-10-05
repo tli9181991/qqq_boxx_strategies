@@ -4952,9 +4952,14 @@ def test_breakout_monitor_levels_match_the_daily_picks_chart():
     chart = sr_levels(closes_to_bars(bars[["Close"]].rename(
         columns={"Close": "UP"}))["UP"], BreakoutParams())
     last = bars["Close"].iloc[-1]
-    assert r["resistance"] == sorted(x for x in chart if x >= last)[:3]
-    assert r["support"] == sorted((x for x in chart if x < last),
+    from qbs.breakout_monitor import snap_levels
+    snapped = snap_levels(chart, last)
+    assert r["resistance"] == sorted(x for x in snapped if x >= last)[:3]
+    assert r["support"] == sorted((x for x in snapped if x < last),
                                   reverse=True)[:3]
+    # Crypto keeps the chart's exact levels.
+    c = breakout_monitor("BTC-USD", bars)
+    assert c["resistance"] == sorted(x for x in chart if x >= last)[:3]
 
 
 def test_breakout_manual_levels_round_trip(tmp_path):
@@ -4991,3 +4996,11 @@ def test_breakout_manual_levels_replace_the_estimate_and_the_score():
     # A cleared resistance stays listed but proximity scores the one above.
     assert far["to_resistance"] == pytest.approx(0.5)
     assert near["score"] - far["score"] == 15
+
+
+def test_breakout_round_steps_scale_with_price():
+    from qbs.breakout_monitor import is_crypto, round_step, snap_levels
+    assert [round_step(p) for p in (15, 35, 157, 750, 1200)] == [1, 2.5, 5, 10, 25]
+    assert snap_levels([163.04, 166.14, 149.98], 157.47) == [150, 165]
+    assert snap_levels([1083.61, 1212.28], 1000.26) == [1075, 1200]
+    assert is_crypto("eth-usd") and not is_crypto("FTNT")
