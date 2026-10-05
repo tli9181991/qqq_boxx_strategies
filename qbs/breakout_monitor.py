@@ -24,8 +24,9 @@ Steps, per name:
                 average daily range (`clean_levels`): the three nearest above
                 the close (resistance) and below it (support)
 * score      -- structure 25, moving averages 15, momentum 13, distance to
-                the nearest resistance 15, volume vs its 20-day average 15;
-                capped at 100
+                the nearest resistance 15, volume expansion (today vs its
+                20-day average) 15, volume contraction (the 10 sessions
+                before today vs the 50 before those) 10; at most 93
 """
 
 from __future__ import annotations
@@ -238,9 +239,33 @@ def get_support_resistance(closes: pd.Series, n: int = 3,
     return sup[:n], res[:n]
 
 
+# Volume contraction: the base's last CONTRACTION_DAYS sessions (today
+# excluded) against the CONTRACTION_BASE sessions before them.
+CONTRACTION_DAYS = 10
+CONTRACTION_BASE = 50
+
+
+def volume_contraction(df: pd.DataFrame, days: int = CONTRACTION_DAYS,
+                       base: int = CONTRACTION_BASE) -> float:
+    """Mean volume of the `days` sessions before today over the mean of the
+    `base` sessions before those. Under 1 means volume has dried up.
+
+    Today is left out on purpose: today's volume is the EXPANSION leg, scored
+    on its own, and a breakout day inside the window would hide the dry-up
+    that preceded it. NaN with too little history or no volume.
+    """
+    vol = df["Volume"].astype(float)
+    if len(vol) < days + base + 1:
+        return float("nan")
+    recent = vol.iloc[-(days + 1):-1].mean()
+    before = vol.iloc[-(days + base + 1):-(days + 1)].mean()
+    return float(recent / before) if before > 0 else float("nan")
+
+
 def score_setup(df: pd.DataFrame, structure: Dict, support: List[float],
                 resistance: List[float]) -> int:
-    """The script's 0-100 setup score. See the module docstring for weights."""
+    """The 0-93 setup score: the script's 83 points plus volume contraction.
+    See the module docstring for weights."""
     latest = df.iloc[-1]
     score = 0
 
@@ -294,6 +319,15 @@ def score_setup(df: pd.DataFrame, structure: Dict, support: List[float],
         score += 8
     else:
         score += 4
+
+    # volume contraction: quiet volume while the base forms
+    contraction = volume_contraction(df)
+    if contraction < 0.7:
+        score += 10
+    elif contraction < 0.85:
+        score += 6
+    elif contraction < 1.0:
+        score += 3
 
     return min(score, 100)
 
@@ -415,6 +449,7 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame],
         "status": setup_status(score),
         "rsi": float(latest["RSI"]),
         "volume_ratio": float(latest["Volume"] / latest["VOL20"]),
+        "contraction": volume_contraction(df),
         "to_resistance": (overhead[0] / latest["Close"] - 1
                           if overhead else None),
         "manual": bool(manual),
