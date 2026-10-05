@@ -5023,3 +5023,22 @@ def test_breakout_levels_within_one_daily_range_merge():
     assert average_daily_range(bars) == pytest.approx(2.0)
     assert average_daily_range(bars.drop(columns=["High"])) != \
         average_daily_range(bars.drop(columns=["High"]))  # NaN
+
+
+def test_breakout_volume_contraction_scores_a_dry_up():
+    from qbs.breakout_monitor import breakout_monitor, volume_contraction
+    bars = _breakout_bars()
+    assert volume_contraction(bars) == pytest.approx(1.0)
+    dry = bars.copy()
+    dry.iloc[-11:-1, dry.columns.get_loc("Volume")] = 0.5e6   # last 10 at half
+    assert volume_contraction(dry) == pytest.approx(0.5)
+    # Today's volume is the expansion leg and stays out of the ratio.
+    surge = dry.copy()
+    surge.iloc[-1, surge.columns.get_loc("Volume")] = 5e6
+    assert volume_contraction(surge) == pytest.approx(0.5)
+    flat, dried = breakout_monitor("UP", bars), breakout_monitor("UP", dry)
+    assert dried["contraction"] == pytest.approx(0.5)
+    # +10 for the dry-up, and +8 on expansion: the quieter 20-day average
+    # (0.75e6) puts today's unchanged 1e6 at 1.33x (12 points, not 4).
+    assert dried["score"] - flat["score"] == 18
+    assert volume_contraction(bars.tail(30)) != volume_contraction(bars.tail(30))

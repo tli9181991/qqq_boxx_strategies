@@ -2512,6 +2512,7 @@ with tab_breakout:
                 "Levels": "✏️ manual" if r["manual"] else "estimated",
                 "RSI": r["rsi"],
                 "Vol / 20D": r["volume_ratio"],
+                "Vol 10D / 50D": r["contraction"],
             } for r in ok])
             BO_TINT = [(80, UP_STRONG), (65, UP), (50, "#f5e6a8")]
             bo_style = bo.style.apply(
@@ -2519,7 +2520,8 @@ with tab_breakout:
                                  if v >= f), "") for v in c], subset=["Score"])
             st.dataframe(
                 bo_style.format({"Price": "{:,.2f}", "To R1": "{:+.1f}%",
-                                 "RSI": "{:.0f}", "Vol / 20D": "{:.2f}×"},
+                                 "RSI": "{:.0f}", "Vol / 20D": "{:.2f}×",
+                                 "Vol 10D / 50D": "{:.2f}×"},
                                 na_rep="—"),
                 hide_index=True, width="stretch",
                 height=min(620, 38 + 35 * len(bo)))
@@ -2535,8 +2537,10 @@ with tab_breakout:
             "SMA200, SMA20 and SMA50 rising over 5 bars) · momentum 13 (RSI "
             "50–75, MACD over its signal, up over 20 bars) · breakout "
             "proximity 15 (nearest resistance within 2% / 4% / 7% / 10%) · "
-            "volume 15 (today vs its 20-day average: > 1.5× / 1.2× / 1×, 4 "
-            "otherwise). 🔥 ≥ 80 · 🟡 ≥ 65 · ⚪ ≥ 50 · ❌ below. HH/HL "
+            "volume expansion 15 (today vs its 20-day average: > 1.5× / 1.2× "
+            "/ 1×, 4 otherwise) · volume contraction 10 (**Vol 10D / 50D** — "
+            "the 10 sessions before today vs the 50 before those: < 0.7× 10, "
+            "< 0.85× 6, < 1× 3). Most a name can score is 93. 🔥 ≥ 80 · 🟡 ≥ 65 · ⚪ ≥ 50 · ❌ below. HH/HL "
             "swings are `find_peaks` 5 bars apart, prominence 1.5× the "
             "latest 14-day ATR. Resistance and support are the **Daily picks "
             "chart's levels** — the same engine on the same close history — "
