@@ -9,10 +9,12 @@
 | Volatility contraction | ranges narrowing near the highs, before expansion | 3-15 d  |
 | Relative strength      | names holding up while the market pulls back      | 5-20 d  |
 
-Every screen reads closes only, so it runs on the cached universe with no
-network. Ranges come from the close-to-close envelope (`closes_to_bars`),
-which understates a real session's high-low range, and there is no volume
-leg anywhere -- a breakout or a dry-up cannot be confirmed on volume here.
+The rules read closes, so they run on the cached (closes-only) universe with
+no network. Ranges -- ATR, stops, the level-merge width -- come from real
+High/Low when `scan` is given OHLC bars (the Finviz candidates are), and from
+the close-to-close envelope (`closes_to_bars`) otherwise, which understates a
+real session's range. No rule has a volume leg; the Finviz volatility-
+contraction preset is the only place volume enters.
 
 Levels are the dashboard's: `qbs.breakout.sr_levels`, then snapped to round
 numbers and merged within one daily range (`qbs.breakout_monitor.
@@ -101,11 +103,18 @@ MIN_BARS = 260
 class Ctx:
     """Everything the screens read for one name, computed once."""
 
-    def __init__(self, close: pd.Series, ticker: str = ""):
+    def __init__(self, close: pd.Series, ticker: str = "",
+                 ohlc: Optional[pd.DataFrame] = None):
         c = close.dropna().astype(float)
         self.ticker = ticker
         self.c = c
-        self.bars = closes_to_bars(c.to_frame("x"))["x"]
+        # Real High/Low when the caller has them (ATR, stops and the merge
+        # width then reflect the true daily range); the close-to-close
+        # envelope otherwise.
+        real = (ohlc is not None and {"High", "Low", "Close"} <= set(ohlc.columns))
+        self.real_bars = bool(real)
+        self.bars = (ohlc[["High", "Low", "Close"]].astype(float).reindex(c.index)
+                     .ffill() if real else closes_to_bars(c.to_frame("x"))["x"])
         self.last = float(c.iloc[-1])
         self.prev = float(c.iloc[-2])
         self.sma20 = c.rolling(20).mean()
@@ -343,19 +352,22 @@ SORT = {"trend_pullback": ("rr", True), "breakout_retest": ("rr", True),
 
 
 def scan(closes: pd.DataFrame, market: Optional[pd.Series],
-         p: SwingParams = SwingParams()) -> Dict[str, pd.DataFrame]:
+         p: SwingParams = SwingParams(),
+         ohlc: Optional[Dict[str, pd.DataFrame]] = None
+         ) -> Dict[str, pd.DataFrame]:
     """Every screen over every column of `closes`, as of its last row.
 
     Returns one frame per setup key, a row per qualifying name (index =
     ticker), sorted best first (see SORT). Names with under
     `MIN_BARS` closes are skipped -- every screen needs the 200-day SMA.
+    `ohlc` maps a ticker to its real daily bars, used for ATR and ranges.
     """
     rows: Dict[str, List[Dict]] = {k: [] for k in SCREENS}
     for t in closes.columns:
         c = closes[t].dropna()
         if len(c) < MIN_BARS:
             continue
-        ctx = Ctx(c, t)
+        ctx = Ctx(c, t, (ohlc or {}).get(t))
         for key, fn in SCREENS.items():
             hit = fn(ctx, market, p)
             if hit is not None:

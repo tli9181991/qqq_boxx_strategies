@@ -5114,3 +5114,49 @@ def test_swing_scan_returns_a_frame_per_setup_and_skips_short_history():
     assert set(res) == {s.key for s in SETUPS}
     assert "A" in res["mean_reversion"].index
     assert all("SHORT" not in df.index for df in res.values() if not df.empty)
+
+
+def test_swing_finviz_presets_are_valid_finviz_filters():
+    pytest.importorskip("finvizfinance")
+    from qbs import swing_finviz as swf
+    from qbs.swing import SETUPS
+    assert set(swf.PRESETS) == {s.key for s in SETUPS}
+    for key in [None, *swf.PRESETS]:
+        assert swf.validate_filters(swf.preset_filters(key)) == []
+    assert set(swf.EDITABLE) <= set(swf.filter_options())
+    bad = swf.validate_filters({"Price": "Over $11", "Nope": "x"})
+    assert len(bad) == 2
+
+
+def test_swing_finviz_screen_is_cached_per_filter_set(tmp_path, monkeypatch):
+    pytest.importorskip("finvizfinance")
+    from qbs import finviz, swing_finviz as swf
+    calls = []
+
+    def fake_pull(filters, sleep_sec=None):
+        calls.append(filters)
+        return pd.DataFrame({"Ticker": ["AAA", "BBB", "CCC"],
+                             "Sector": ["Tech"] * 3,
+                             "Volume": [5e6, 9e6, 1e6]})
+    monkeypatch.setattr(finviz, "screener_pull", fake_pull)
+    f = swf.preset_filters("mean_reversion")
+    assert swf.load_cached(f, str(tmp_path)) == (None, None)
+    rows, err = swf.run_screen({**f, "Pattern": "Any"}, str(tmp_path))
+    assert err is None and len(rows) == 3
+    # "Any" filters nothing, so it is not sent and does not change the key.
+    assert "Pattern" not in calls[0]
+    cached, when = swf.load_cached(f, str(tmp_path))
+    assert list(cached["Ticker"]) == ["AAA", "BBB", "CCC"] and when is not None
+    assert swf.candidates(cached, 2) == ["BBB", "AAA"]     # most traded first
+    # A filter typo is refused before anything is sent.
+    _, err = swf.run_screen({"Price": "Over $11"}, str(tmp_path))
+    assert err and len(calls) == 1
+
+
+def test_swing_screens_use_real_bars_for_atr_when_given():
+    from qbs.swing import Ctx
+    c = _swing_series([1.0])
+    ohlc = pd.DataFrame({"High": c + 5, "Low": c - 5, "Close": c})
+    assert Ctx(c, "X", ohlc).real_bars
+    assert Ctx(c, "X", ohlc).a == pytest.approx(10, abs=1.5)
+    assert Ctx(c, "X").a < 2
