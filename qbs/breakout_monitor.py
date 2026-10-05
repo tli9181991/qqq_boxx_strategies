@@ -20,8 +20,9 @@ Steps, per name:
                 same for the swing lows
 * levels     -- the Daily picks chart's support/resistance (`qbs.breakout.
                 sr_levels` on the close history), snapped to round numbers for
-                stocks (`round_step`): the three nearest above the close
-                (resistance) and below it (support)
+                stocks (`round_step`) and merged where two sit within one
+                average daily range (`clean_levels`): the three nearest above
+                the close (resistance) and below it (support)
 * score      -- structure 25, moving averages 15, momentum 13, distance to
                 the nearest resistance 15, volume vs its 20-day average 15;
                 capped at 100
@@ -163,8 +164,54 @@ def snap_levels(levels, price: float) -> List[float]:
     return sorted({round(float(x) / step) * step for x in levels})
 
 
+# The daily range used to merge levels: mean High - Low over this many bars.
+ADR_WINDOW = 14
+
+
+def average_daily_range(ohlc: pd.DataFrame, window: int = ADR_WINDOW) -> float:
+    """Mean High - Low of the last `window` bars; NaN without High/Low."""
+    if not {"High", "Low"} <= set(ohlc.columns):
+        return float("nan")
+    rng = (ohlc["High"] - ohlc["Low"]).astype(float).dropna().tail(window)
+    return float(rng.mean()) if len(rng) else float("nan")
+
+
+def clean_levels(levels, price: float, round_levels: bool = True,
+                 merge_width: Optional[float] = None) -> List[float]:
+    """Snap (stocks) and merge levels into the ones worth drawing.
+
+    Two levels closer than one day's range are one zone, not two: price
+    covers the gap between them in an ordinary session. With `merge_width`
+    (the average daily range) levels are grouped from the bottom up, a group
+    spanning no more than `merge_width`, and each group becomes ONE level:
+    the mean of its exact levels, snapped to the round step when
+    `round_levels`. So levels drawn at 115 and 120 under a $6 daily range
+    become one, at the round number nearest their exact mean.
+
+    The grouping reads the snapped prices when `round_levels`, so what merges
+    is exactly what would otherwise be drawn as two lines a step apart.
+    """
+    exact = sorted(float(x) for x in levels)
+    if not exact:
+        return []
+    step = round_step(price) if round_levels else None
+    snap = (lambda x: round(x / step) * step) if step else (lambda x: x)
+    if not merge_width or merge_width != merge_width or merge_width <= 0:
+        return sorted({snap(x) for x in exact})
+    out, group = [], [exact[0]]
+    for x in exact[1:]:
+        if snap(x) - snap(group[0]) <= merge_width:
+            group.append(x)
+        else:
+            out.append(snap(sum(group) / len(group)))
+            group = [x]
+    out.append(snap(sum(group) / len(group)))
+    return sorted(set(out))
+
+
 def get_support_resistance(closes: pd.Series, n: int = 3,
-                           round_levels: bool = True
+                           round_levels: bool = True,
+                           merge_width: Optional[float] = None
                            ) -> Tuple[List[float], List[float]]:
     """The `n` nearest levels below the last close (support) and at or above
     it (resistance), nearest first.
@@ -174,7 +221,9 @@ def get_support_resistance(closes: pd.Series, n: int = 3,
     way the chart colours them. With `round_levels` (stocks) each level is
     then snapped to a round number BEFORE the split, so a level that snaps
     across the price changes side: 157.48 under a 157.60 close becomes 155
-    support. The Daily picks chart keeps the exact levels.
+    support. With `merge_width` (the name's average daily range) levels
+    within one day's range of each other are merged first (`clean_levels`).
+    The Daily picks chart keeps the exact levels.
     """
     from qbs.breakout import closes_to_bars, sr_levels
     from qbs.config import BreakoutParams
@@ -183,8 +232,7 @@ def get_support_resistance(closes: pd.Series, n: int = 3,
     bars = closes_to_bars(closes.to_frame("x"))["x"]
     levels = sr_levels(bars, BreakoutParams())
     price = float(closes.iloc[-1])
-    if round_levels:
-        levels = snap_levels(levels, price)
+    levels = clean_levels(levels, price, round_levels, merge_width)
     res = sorted(x for x in levels if x >= price)
     sup = sorted((x for x in levels if x < price), reverse=True)
     return sup[:n], res[:n]
@@ -343,6 +391,7 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame],
     structure = detect_market_structure(highs, lows)
     latest = df.iloc[-1]
     price = float(latest["Close"])
+    adr = average_daily_range(df)
     if manual:
         support = sorted(manual.get("support", []),
                          key=lambda x: abs(x - price))
@@ -351,7 +400,8 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame],
         overhead = sorted(x for x in resistance if x > price)
     else:
         support, resistance = get_support_resistance(
-            full_close.loc[:df.index[-1]], round_levels=not is_crypto(ticker))
+            full_close.loc[:df.index[-1]], round_levels=not is_crypto(ticker),
+            merge_width=adr)
         overhead = resistance
     score = score_setup(df, structure, support, overhead)
     return {
@@ -368,4 +418,5 @@ def breakout_monitor(ticker: str, ohlc: Optional[pd.DataFrame],
         "to_resistance": (overhead[0] / latest["Close"] - 1
                           if overhead else None),
         "manual": bool(manual),
+        "adr": adr,
     }

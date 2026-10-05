@@ -54,7 +54,7 @@ from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.breakout_monitor import (DEFAULT_WATCHLIST as BREAKOUT_DEFAULT,
                                   breakout_monitor, get_support_resistance,
-                                  is_crypto, round_step, snap_levels,
+                                  clean_levels, is_crypto, round_step,
                                   load_manual_levels, parse_levels,
                                   save_manual_levels)
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
@@ -2542,7 +2542,9 @@ with tab_breakout:
             "chart's levels** — the same engine on the same close history — "
             "**snapped to round numbers for stocks** (step by price: $1 under "
             "$20, $2.5 to $50, $5 to $500, $10 to $1,000, $25 above; crypto "
-            "stays exact), the three nearest above and below the close. **To R1** is the "
+            "stays exact) and **merged where two sit within one average daily "
+            "range** (14-day mean High − Low), the three nearest above and "
+            "below the close. **To R1** is the "
             "distance to the nearest. A crypto pair's last bar is the current UTC day, "
             "still forming. Ported from the breakout-checking script, with "
             "ATR-based swings and the Daily picks levels. **✏️ manual** rows use your saved levels instead (editor below), and their proximity points follow them."))
@@ -2568,15 +2570,17 @@ with tab_breakout:
                                     int(b_nlvl), src="breakout")
             price, ema_long, lvl, b_last, b_n, _ = b_frames
             b_man = MANUAL_LEVELS.get(bt)
+            b_row = next(r for r in ok if r["ticker"] == bt)
             if b_man:
                 lvl = pd.DataFrame(
                     [{"level": x, "kind": "Support"} for x in b_man["support"]]
                     + [{"level": x, "kind": "Resistance"}
                        for x in b_man["resistance"]],
                     columns=["level", "kind"])
-            elif not is_crypto(bt) and not lvl.empty:
-                # The table's round numbers, so the lines match the rows.
-                lvl = pd.DataFrame({"level": snap_levels(lvl["level"], b_last)})
+            elif not lvl.empty:
+                # The table's rounding and merging, so the lines match the rows.
+                lvl = pd.DataFrame({"level": clean_levels(
+                    lvl["level"], b_last, not is_crypto(bt), b_row["adr"])})
                 lvl["kind"] = np.where(lvl["level"] >= b_last,
                                        "Resistance", "Support")
             draw_price_chart(bt, price, ema_long, lvl, b_asof, b_months)
@@ -2585,12 +2589,15 @@ with tab_breakout:
                 + (f"✏️ your {len(lvl)} saved levels" if b_man else
                    f"showing {len(lvl)} of {b_n} estimated levels in view"
                    + ("" if is_crypto(bt) else
-                      f", snapped to ${round_step(b_last):g} steps"))
+                      f", snapped to ${round_step(b_last):g} steps")
+                   + f", merged within one daily range "
+                     f"(${b_row['adr']:,.2f})")
                 + " · the Daily picks chart, on this name's own bars."))
 
             # ---- hand-corrected levels ---------------------------------
             b_est_sup, b_est_res = get_support_resistance(
-                b_close[bt], round_levels=not is_crypto(bt))
+                b_close[bt], round_levels=not is_crypto(bt),
+                merge_width=b_row["adr"])
             b_cur = b_man or {"support": b_est_sup, "resistance": b_est_res}
             b_fmt = lambda xs: ", ".join(f"{x:.2f}" for x in sorted(xs))
             # The saved values are in the key, so a save or reset refills the
