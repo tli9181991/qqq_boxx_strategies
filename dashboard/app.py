@@ -54,7 +54,8 @@ from qbs.breadth import (BreadthParams, TwoWeekRules, atr_class,
 from qbs.breakout import closes_to_bars, levels_in_view, sr_levels
 from qbs.breakout_monitor import (DEFAULT_WATCHLIST as BREAKOUT_DEFAULT,
                                   breakout_monitor, get_support_resistance,
-                                  clean_levels, is_crypto, round_step,
+                                  average_daily_range, clean_levels,
+                                  is_crypto, round_step,
                                   load_manual_levels, parse_levels,
                                   save_manual_levels)
 from qbs.config import (BreakoutParams, Config, FinvizScreenParams,
@@ -668,7 +669,9 @@ def ohlc_for(ticker: str, download_start: str, online: bool, bar_epoch: str):
 
 @st.cache_data(show_spinner=False)
 def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
-                 lookback: int, max_levels: int = 8, src: str = "universe"):
+                 lookback: int, max_levels: int = 8, src: str = "universe",
+                 round_levels: bool = False,
+                 merge_width: Optional[float] = None):
     """Price, EMAs and support/resistance for one name, as of one date.
 
     Levels are derived from history up to `asof` ONLY — the same causal rule
@@ -680,6 +683,12 @@ def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
     `src` names where `_uni` came from. `_uni` is not hashed, so a caller
     passing a different close series for the same ticker (the Breakout
     monitor's own bars) must pass its own `src` or it is served this one's.
+
+    `round_levels` / `merge_width` clean the levels the way the Breakout
+    monitor does (`qbs.breakout_monitor.clean_levels`): snapped to round
+    numbers, and merged where two sit within one daily range. Applied to the
+    whole set BEFORE the nearest `max_levels` are picked, so a merge frees a
+    slot for the next level out rather than leaving the chart a line short.
     """
     close = _uni[ticker].dropna().loc[:asof]
     if close.empty:
@@ -691,6 +700,9 @@ def chart_frames(_uni: pd.DataFrame, ticker: str, asof: pd.Timestamp,
 
     levels = sr_levels(closes_to_bars(close.to_frame(ticker))[ticker],
                        BreakoutParams())
+    if round_levels or merge_width:
+        levels = clean_levels(levels, float(close.iloc[-1]), round_levels,
+                              merge_width)
 
     window = close.iloc[-lookback:]
     price = window.rename("close").reset_index()
@@ -1344,7 +1356,20 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
     n_lvl = c3.number_input("Levels", 0, 30, 8, key=f"{key_prefix}_levels",
                             help="Nearest N support/resistance levels "
                                  "to the last price. 0 hides them.")
-    frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl))
+    # The Breakout monitor's level cleaning: round numbers for stocks, and
+    # levels within one daily range merged. The range is the name's real
+    # High - Low up to the chart date; closes-only names fall back to the
+    # close-to-close envelope, which understates it (fewer merges).
+    lvl_ohlc = ohlc_for(ticker, download_start, bool(online), BAR_EPOCH)
+    lvl_ohlc = lvl_ohlc.loc[:asof] if lvl_ohlc is not None else None
+    if lvl_ohlc is None or lvl_ohlc.empty:
+        lvl_ohlc = closes_to_bars(uni[[ticker]].dropna().loc[:asof]).get(ticker)
+    adr = (average_daily_range(lvl_ohlc) if lvl_ohlc is not None
+           else float("nan"))
+    adr = adr if adr == adr else None
+    frames = chart_frames(uni, ticker, asof, int(months * 21), int(n_lvl),
+                          round_levels=not is_crypto(ticker),
+                          merge_width=adr)
     if frames is None:
         st.info(f"No price history for {ticker} up to this date.")
     else:
@@ -1359,6 +1384,10 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
             f"**{ticker}** {last:,.2f} · above "
             f"{', '.join(above) if above else 'none'} · "
             f"showing {len(lvl)} of {n_levels} levels in view"
+            + ("" if is_crypto(ticker) else
+               f", rounded to \\${round_step(last):g}")
+            + (f", merged within one daily range (\\${adr:,.2f})"
+               if adr else "")
         )
         if not has_overhead:
             st.warning(
@@ -2570,23 +2599,21 @@ with tab_breakout:
             b_close = (ohlc_for(bt, download_start, bool(online), BAR_EPOCH)
                        ["Close"].astype(float).dropna().rename(bt).to_frame())
             b_asof = b_close.index[-1]
-            b_frames = chart_frames(b_close, bt, b_asof, int(b_months * 21),
-                                    int(b_nlvl), src="breakout")
-            price, ema_long, lvl, b_last, b_n, _ = b_frames
             b_man = MANUAL_LEVELS.get(bt)
             b_row = next(r for r in ok if r["ticker"] == bt)
+            # The table's rounding and merging, so the lines match the rows.
+            b_frames = chart_frames(
+                b_close, bt, b_asof, int(b_months * 21), int(b_nlvl),
+                src="breakout", round_levels=not is_crypto(bt),
+                merge_width=b_row["adr"] if b_row["adr"] == b_row["adr"]
+                else None)
+            price, ema_long, lvl, b_last, b_n, _ = b_frames
             if b_man:
                 lvl = pd.DataFrame(
                     [{"level": x, "kind": "Support"} for x in b_man["support"]]
                     + [{"level": x, "kind": "Resistance"}
                        for x in b_man["resistance"]],
                     columns=["level", "kind"])
-            elif not lvl.empty:
-                # The table's rounding and merging, so the lines match the rows.
-                lvl = pd.DataFrame({"level": clean_levels(
-                    lvl["level"], b_last, not is_crypto(bt), b_row["adr"])})
-                lvl["kind"] = np.where(lvl["level"] >= b_last,
-                                       "Resistance", "Support")
             draw_price_chart(bt, price, ema_long, lvl, b_asof, b_months)
             st.caption(md(
                 f"**{bt}** {b_last:,.2f} on {b_asof:%Y-%m-%d} · "
