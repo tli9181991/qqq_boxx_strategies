@@ -2,7 +2,7 @@
 
     streamlit run dashboard/app.py
 
-Five tabs:
+Six tabs:
 
 * **Daily picks** -- what each of the three selection strategies held on each
   day, with the entries and exits that changed it. The momentum book ranks the
@@ -14,6 +14,9 @@ Five tabs:
 * **Breakout monitor** -- a watchlist of its own (stocks or crypto), each name
   scored out of 100 on structure, trend, momentum, distance to resistance and
   volume -- the `breakout-checking` script, ported unchanged.
+* **Swing trades** -- six swing setups (trend pullback, breakout retest,
+  range bounce, mean reversion, volatility contraction, relative strength)
+  screened over the universe and the watchlist, with stop and target.
 * **News & sentiment** -- the last 12 hours of market headlines, always; plus
   a model's read of them when one is configured and switched on.
 * **Analyst** -- the price panel again, and a chat over the lab's own tools.
@@ -71,6 +74,10 @@ from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
+from qbs.swing import (SETUPS, SCREENS, SwingParams, market_pullback,
+                       scan as swing_scan)
+from qbs import swing_finviz as swf
+from qbs.finviz import blocked_until, cooldown_note
 from qbs.candles import HammerRules, hammer_frame, volume_stats
 from qbs.shadow import (parse_watchlist, watchlist_residual_ranks,
                         watchlist_rows, watchlist_stop_levels)
@@ -1587,9 +1594,10 @@ with st.sidebar:
              f"{DISABLE_NEWS_ANALYSIS_VAR}=0 in your .env to allow it.")
 
 
-tab_picks, tab_market, tab_breakout, tab_news, tab_analyst = st.tabs(
+(tab_picks, tab_market, tab_breakout, tab_swing, tab_news,
+ tab_analyst) = st.tabs(
     ["📋 Daily picks", "📊 Market overview", "📈 Breakout monitor",
-     "📰 News & sentiment", "🤖 Analyst"])
+     "🔄 Swing trades", "📰 News & sentiment", "🤖 Analyst"])
 
 
 # ==========================================================================
@@ -2671,7 +2679,235 @@ with tab_breakout:
 
 
 # ==========================================================================
-# Tabs 4-5 -- news, and the LLM analyst
+# Tab 4 -- swing trades
+# ==========================================================================
+# Six setups from the swing-trading playbook, each a screen in qbs/swing.py.
+# The rule shown under each table is that screen's own docstring, so the
+# text cannot drift from the code it describes.
+
+import inspect
+
+
+@st.cache_data(show_spinner="Scanning swing setups…")
+def swing_results(_closes: pd.DataFrame, _market: pd.Series, names: tuple,
+                  last: str, bar_epoch: str, src: str, _ohlc=None):
+    """`qbs.swing.scan` behind a cache keyed on what it reads."""
+    return swing_scan(_closes, _market, ohlc=_ohlc)
+
+
+# Display: column -> (header, format). Shared readings first, then each
+# setup's own. Fractions show as percentages.
+SWING_COLS = {
+    "close": ("Close", "{:,.2f}"), "stop": ("Stop", "{:,.2f}"),
+    "target": ("Target", "{:,.2f}"), "rr": ("R:R", "{:.1f}"),
+    "pullback": ("Off 20D high", "{:+.1%}"), "rsi14": ("RSI14", "{:.0f}"),
+    "support": ("Support", "{:,.2f}"), "support_kind": ("Support is", "{}"),
+    "turning_up": ("Up today", "{}"),
+    "level": ("Level", "{:,.2f}"), "age": ("Broke out (sessions ago)", "{:.0f}"),
+    "vs_level_atr": ("vs level (ATR)", "{:+.2f}"),
+    "box_low": ("Box low", "{:,.2f}"), "box_high": ("Box high", "{:,.2f}"),
+    "box_width": ("Box height", "{:.1%}"), "position": ("Position in box", "{:.0%}"),
+    "rsi2": ("RSI2", "{:.1f}"), "below_sma5": ("vs SMA5", "{:+.1%}"),
+    "atr_ratio": ("ATR10 / ATR50", "{:.2f}"),
+    "range_pct": ("10D range pctile", "{:.0%}"), "pivot": ("Pivot", "{:,.2f}"),
+    "off_high": ("Off high", "{:+.1%}"),
+    "ret": ("10D return", "{:+.1%}"), "mkt_ret": ("QQQ 10D", "{:+.1%}"),
+    "rs_gap": ("vs QQQ", "{:+.1%}"),
+}
+
+def render_swing(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame,
+                 sw_last_bar, regime: Dict, real_bars: bool, src: str):
+    """The swing results: summary, a table per setup, a chart for a hit.
+    Shared by both universes, so they read the same."""
+    st.dataframe(pd.DataFrame([{
+        "Setup": s_.name, "Looks for": s_.looks_for, "Typical hold": s_.hold,
+        "Names today": len(sw[s_.key]),
+        "Top names": ", ".join(sw[s_.key].index[:5]),
+    } for s_ in SETUPS]), hide_index=True, width="stretch")
+
+    st.info(md(
+        ("Ranges, ATR and stops use each name's **real daily high–low**. "
+         if real_bars else
+         "**Closes only.** Ranges and ATR come from the close-to-close "
+         "envelope, which is narrower than a real session's high–low, so "
+         "stops sit tighter than they would on real bars. ")
+        + "No setup is confirmed on volume. Stops and targets are reference "
+        "prices for sizing, not orders. Support and resistance are the "
+        "charts' levels (round numbers, merged within a daily range)."),
+        icon="ℹ️")
+
+    for s_ in SETUPS:
+        frame = sw[s_.key]
+        with st.expander(f"**{s_.name}** — {s_.looks_for.lower()} · "
+                         f"{s_.hold} · {len(frame)} names",
+                         expanded=not frame.empty):
+            if s_.key == "relative_strength":
+                (st.success if regime["pullback"] else st.warning)(md(
+                    f"QQQ is {regime['off_high']:+.1%} off its 20-day high and "
+                    f"{regime['ret']:+.1%} over 10 sessions — "
+                    + ("**a pullback**, the regime this setup is for."
+                       if regime["pullback"] else
+                       "**not pulling back**, so these are simply the "
+                       "strongest names; the setup is about strength in a "
+                       "weak tape.")))
+            if frame.empty:
+                st.caption("No name qualifies today.")
+            else:
+                cols = [c for c in SWING_COLS if c in frame.columns]
+                view = frame[cols].copy()
+                if "turning_up" in view:
+                    view["turning_up"] = np.where(view["turning_up"], "✅", "—")
+                view = view.rename(columns={c: SWING_COLS[c][0] for c in cols})
+                view.index.name = "Ticker"
+                st.dataframe(
+                    view.style.format(
+                        {SWING_COLS[c][0]: SWING_COLS[c][1] for c in cols
+                         if c != "turning_up"}, na_rep="—"),
+                    width="stretch", height=min(420, 38 + 35 * len(view)))
+            st.caption(md("**Rule.** " + " ".join(
+                inspect.getdoc(SCREENS[s_.key]).split())))
+
+    # ---- one name on the chart -------------------------------------------
+    hits = [(s_.name, t) for s_ in SETUPS for t in sw[s_.key].index]
+    if hits:
+        st.divider()
+        st.markdown("#### Price & levels")
+        sc1, sc2 = st.columns([3, 1])
+        pick = sc1.selectbox(
+            "Setup · ticker", hits, key="sw_pick",
+            format_func=lambda h: f"{h[1]} — {h[0]}")
+        sw_months = sc2.selectbox("Window", [3, 6, 12, 24], index=1,
+                                  format_func=lambda m: f"{m}m", key="sw_win")
+        s_key = next(s_.key for s_ in SETUPS if s_.name == pick[0])
+        row = sw[s_key].loc[pick[1]]
+        sw_t = pick[1]
+        sw_ohlc = ohlc_for(sw_t, download_start, bool(online), BAR_EPOCH)
+        sw_bars = (sw_ohlc.loc[:sw_last_bar] if sw_ohlc is not None
+                   and not sw_ohlc.empty else
+                   closes_to_bars(sw_closes[[sw_t]].dropna())[sw_t])
+        sw_adr = average_daily_range(sw_bars)
+        sw_frames = chart_frames(
+            sw_closes, sw_t, sw_last_bar, int(sw_months * 21), 8,
+            src=f"swing-{src}", round_levels=not is_crypto(sw_t),
+            merge_width=sw_adr if sw_adr == sw_adr else None)
+        if sw_frames is not None:
+            price, ema_long, lvl, sw_last, _, _ = sw_frames
+            draw_price_chart(sw_t, price, ema_long, lvl, sw_last_bar,
+                             sw_months)
+            st.caption(md(
+                f"**{sw_t}** · {pick[0]} · close {row['close']:,.2f} · "
+                f"stop {fmt(row['stop'], '{:,.2f}')} · "
+                f"target {fmt(row['target'], '{:,.2f}')} · "
+                f"R:R {fmt(row['rr'], '{:.1f}')}"))
+
+
+
+
+with tab_swing:
+    freshness_banner()
+    st.subheader("Swing trades")
+    sw_mkt = px["QQQ"]
+    regime = market_pullback(sw_mkt, SwingParams())
+    sw_src = st.radio(
+        "Universe", ["Nasdaq-100 + watchlist", "Finviz screen"],
+        horizontal=True, key="sw_src",
+        help="Finviz pre-screens the whole US market with coarse filters, "
+             "then the six setups run on the survivors' real daily bars.")
+
+    if sw_src == "Nasdaq-100 + watchlist":
+        sw_closes = uni.join(WATCH_FRAME[WATCH_EXTRA]) if WATCH_EXTRA else uni
+        sw = swing_results(sw_closes, sw_mkt, tuple(sw_closes.columns),
+                           str(LAST_BAR), BAR_EPOCH, "ndx")
+        st.caption(md(
+            f"{len(SETUPS)} setups screened over {UNIVERSE_NOTE}"
+            + (f" plus {len(WATCH_EXTRA)} watchlist names" if WATCH_EXTRA else "")
+            + f" · data through {session_text(LAST_BAR)} · {SRC}"))
+        render_swing(sw, sw_closes, LAST_BAR, regime, False, "ndx")
+    else:
+        SETUP_NAMES = {s_.key: s_.name for s_ in SETUPS}
+        fc1, fc2 = st.columns([2, 1])
+        sw_preset = fc1.selectbox(
+            "Finviz preset", [None, *swf.PRESETS], key="sw_preset",
+            format_func=lambda k: ("Base only (liquid US stocks)" if k is None
+                                   else f"{SETUP_NAMES[k]} candidates"),
+            help="The base (US common stock, mid cap and up, over $10, over "
+                 "1M shares a day) plus the coarse filters for one setup. "
+                 "Edit any of them below.")
+        sw_max = fc2.number_input(
+            "Max names", 10, 500, swf.MAX_CANDIDATES, step=10, key="sw_max",
+            help="Daily bars are downloaded per name, so the list is cut to "
+                 "the most traded names past this.")
+        preset = swf.preset_filters(sw_preset)
+        opts = swf.filter_options()
+        filters = {k: v for k, v in preset.items() if k not in swf.EDITABLE}
+        with st.expander("Finviz filters", expanded=False):
+            st.caption(md("Fixed: " + " · ".join(
+                f"{k} = {v}" for k, v in filters.items())))
+            fcols = st.columns(3)
+            for i, name in enumerate(swf.EDITABLE):
+                choices = opts.get(name) or ["Any"]
+                default = preset.get(name, "Any")
+                filters[name] = fcols[i % 3].selectbox(
+                    name, choices,
+                    index=choices.index(default) if default in choices else 0,
+                    key=f"sw_f_{sw_preset}_{name}")
+        filters = swf.clean_filters(filters)
+        rows, fetched = swf.load_cached(filters)
+        until = blocked_until()
+        if until is not None:
+            st.warning(cooldown_note(until), icon="⏳")
+        if st.button("🔎 Run Finviz screen", key="sw_run",
+                     disabled=until is not None or not online,
+                     help=("Switch Source to Online to pull from Finviz."
+                           if not online else
+                           "One paced crawl of the screener, ~3 s a page of "
+                           "20 names. The result is cached for these filters.")):
+            with st.spinner("Pulling the Finviz screen…"):
+                fresh, err = swf.run_screen(filters)
+            if err:
+                st.error(f"Finviz screen failed — {err}")
+            else:
+                rows, fetched = fresh, pd.Timestamp.now("UTC")
+
+        if rows is None:
+            st.info("No pull for these filters yet — press **Run Finviz "
+                    "screen**.", icon="ℹ️")
+        elif rows.empty:
+            st.info(f"No stock passed these filters (pulled "
+                    f"{fetched:%Y-%m-%d %H:%M} UTC).", icon="ℹ️")
+        else:
+            tickers = swf.candidates(rows, int(sw_max))
+            prog = st.progress(0.0, text="Loading daily bars…")
+            bars = {}
+            for i, t in enumerate(tickers):
+                b = ohlc_for(t, download_start, bool(online), BAR_EPOCH)
+                if b is not None and not b.empty:
+                    bars[t] = b
+                prog.progress((i + 1) / len(tickers),
+                              text=f"Loading daily bars… {t}")
+            prog.empty()
+            missing = [t for t in tickers if t not in bars]
+            st.caption(md(
+                f"**{len(rows)}** stocks passed the Finviz filters (pulled "
+                f"{fetched.tz_convert(None):%Y-%m-%d %H:%M} UTC) · "
+                f"bars for **{len(bars)}** of the {len(tickers)} most traded"
+                + (f" · no bars for {', '.join(missing[:10])}"
+                   + ("…" if len(missing) > 10 else "") if missing else "")))
+            with st.expander(f"Finviz rows ({len(rows)})", expanded=False):
+                st.dataframe(rows, hide_index=True, width="stretch")
+            if bars:
+                sw_closes = pd.DataFrame(
+                    {t: b["Close"].astype(float) for t, b in bars.items()})
+                sw_last_bar = sw_closes.index.max()
+                sw = swing_results(sw_closes, sw_mkt, tuple(sw_closes.columns),
+                                   str(sw_last_bar), BAR_EPOCH,
+                                   "finviz-" + swf.cache_path(filters), bars)
+                render_swing(sw, sw_closes, sw_last_bar, regime, True,
+                             "finviz")
+
+
+# ==========================================================================
+# Tabs 5-6 -- news, and the LLM analyst
 # ==========================================================================
 # A Gemini agent that reads the tabs above through tools and writes about
 # them. Everything it can quote is computed by this package; it has no

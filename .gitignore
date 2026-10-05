@@ -42,6 +42,9 @@ data/ohlc/
 data/breakout_levels.json
 data/breakout_levels.json.tmp
 
+# Finviz swing pre-screen results, per filter set
+data/swing_finviz/
+
 # Broad US universe pulled from Finviz (large, regenerated on demand)
 data/finviz_universe.csv
 data/universe/us_closes.csv
