@@ -1907,6 +1907,10 @@ with tab_market:
 
 
     st.subheader("Breadth & momentum monitor")
+    st.caption(md(
+        "📌 **Strategy source:** the breadth monitor, checklist, decision table "
+        "and rebound monitor on this tab follow the strategy published by "
+        "[Kelileo CUP on Patreon](https://www.patreon.com/cw/KelileoCUP/posts)."))
 
     use_us = st.toggle(
         "Measure the US market (Finviz universe)", value=True, key="use_us",
