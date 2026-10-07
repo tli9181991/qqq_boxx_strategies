@@ -1031,6 +1031,18 @@ def names_on(key: str, when) -> list:
 CANDLE_TOP_N = 6
 
 
+def close_on(ticker: str, when) -> float:
+    """`ticker`'s last daily close on or before `when`, NaN if there is none.
+
+    From the frame the books were ranked on, so the price beside a pick is the
+    one the pick was made on -- and moving the date slider moves it with it.
+    """
+    if ticker not in uni.columns:
+        return float("nan")
+    s = uni[ticker].loc[:when].dropna()
+    return float(s.iloc[-1]) if len(s) else float("nan")
+
+
 def top_held(key: str, when, n: int) -> list:
     """The `n` best-ranked names `key`'s book held on `when`, best first.
 
@@ -1684,19 +1696,25 @@ with tab_picks:
                     held_rank.get(t) or "—" for t in extra]
                 held = [t in picks[key] for t in listed]
                 tf = pd.DataFrame({"Rank": rk, "Ticker": listed,
+                                   "Close": [close_on(t, asof) for t in listed],
                                    "Held": ["✅" if h else "" for h in held]})
                 st.dataframe(
                     tf.style.apply(lambda _c: [f"background-color: {UP}" if h
                                                else "" for h in held],
-                                   subset=["Ticker"]),
+                                   subset=["Ticker"])
+                    .format({"Close": "{:,.2f}"}, na_rep="—"),
                     hide_index=True, width="stretch",
                     height=min(460, 38 + 35 * len(tf)))
                 st.caption(f"Top {len(top)} of the ranking · ✅ = held "
-                           f"({len(names)} of {int(n_hold)} slots)")
+                           f"({len(names)} of {int(n_hold)} slots) · Close = "
+                           f"last daily close on {asof:%Y-%m-%d}")
             elif names:
-                st.dataframe(pd.DataFrame({"Ticker": names}), hide_index=True,
-                             width="stretch",
-                             height=min(420, 38 + 35 * len(names)))
+                st.dataframe(
+                    pd.DataFrame({"Ticker": names,
+                                  "Close": [close_on(t, asof) for t in names]})
+                    .style.format({"Close": "{:,.2f}"}, na_rep="—"),
+                    hide_index=True, width="stretch",
+                    height=min(420, 38 + 35 * len(names)))
             else:
                 st.info("Nothing held — fully in cash.")
             if row is not None and row["buys"]:
