@@ -381,3 +381,113 @@ def scan(closes: pd.DataFrame, market: Optional[pd.Series],
             df = df.sort_values(col, ascending=not desc, na_position="last")
         out[key] = df
     return out
+
+
+# ==========================================================================
+# Fibonacci retracement of the last up-leg
+# ==========================================================================
+
+FIB_RETRACEMENTS = (0.236, 0.382, 0.5, 0.618, 0.786)
+FIB_EXTENSIONS = (1.272, 1.618, 2.0)
+
+
+def fib_retracement(bars: pd.DataFrame,
+                    retracements=FIB_RETRACEMENTS,
+                    extensions=FIB_EXTENSIONS) -> Optional[Dict]:
+    """Fibonacci levels of the last up-leg: its swing low to its swing high.
+
+    The swings are the Breakout monitor's (`find_swings`: `find_peaks` on
+    highs and lows over the last year, 5 bars apart, prominence 1.5x the
+    latest 14-day ATR), so this tab and that one agree on what a swing is.
+
+    * **High** -- the last swing high, or the highest high since it if price
+      has traded above it (`high_confirmed` False: not yet a swing). The leg
+      is `leg_running` while the close is within one ATR of that high.
+    * **Low** -- the last swing low before that swing high: where the leg
+      started. `higher_low` says whether it sits above the swing low before
+      it, i.e. whether the leg started from a higher low (an uptrend) or a
+      lower one (a bounce inside a downtrend, which the levels describe less
+      well).
+
+    Retracements, `high - r x (high - low)`, are where a pullback may find
+    support. Extensions, `low + r x (high - low)`, are profit targets above
+    the high. `levels` also carries the high itself (the first target while
+    price is below it) and the low (where the leg fails). `support` is the
+    nearest retracement under the close; `target` the nearest of the high and
+    the extensions above it. Reference prices, not signals.
+
+    `bars` needs High, Low and Close, cut at the as-of date by the caller.
+    Returns None when there is no swing high, or no swing low before it.
+    """
+    from .breakout_monitor import calculate_atr, find_swings, last_year
+
+    df = last_year(bars)
+    if len(df) < 30 or not {"High", "Low", "Close"} <= set(df.columns):
+        return None
+    df = calculate_atr(df)
+    if not np.isfinite(df["ATR"].iloc[-1]):
+        return None
+    highs, lows = find_swings(df)
+    if highs.empty:
+        return None
+
+    swing_dt = highs.index[-1]
+    after = df.loc[swing_dt:, "High"]
+    high_dt = after.idxmax()
+    high = float(after.max())
+    # A high made after the last swing high has not yet been confirmed as a
+    # swing (it needs bars on its right). Separately, the leg is still
+    # RUNNING only while the close is within one ATR of its high: a new high
+    # followed by a sharp drop is a pullback, not a leg in progress.
+    high_confirmed = high_dt == swing_dt
+    close = float(df["Close"].iloc[-1])
+    leg_running = (high - close) <= float(df["ATR"].iloc[-1])
+
+    before = lows[lows.index < swing_dt]
+    if before.empty:
+        return None
+    low_dt, low = before.index[-1], float(before.iloc[-1])
+    prev_low = float(before.iloc[-2]) if len(before) > 1 else None
+    span = high - low
+    if span <= 0:
+        return None
+
+    since = df.loc[high_dt:, "Low"]
+    pullback_low = float(since.iloc[1:].min()) if len(since) > 1 else None
+
+    # Top to bottom: the targets, the high, the rebound zones, the low.
+    levels = [dict(label=f"{r:.1%} ext", ratio=r, price=low + r * span,
+                   kind="extension") for r in sorted(extensions, reverse=True)]
+    levels.append(dict(label="High (0%)", ratio=0.0, price=high, kind="high"))
+    levels += [dict(label=f"{r:.1%}", ratio=r, price=high - r * span,
+                    kind="retracement") for r in sorted(retracements)]
+    levels.append(dict(label="Low (100%)", ratio=1.0, price=low, kind="low"))
+    for lv in levels:
+        lv["vs_close"] = lv["price"] / close - 1.0
+
+    # Support: the first rebound zone under the close. Target: the first
+    # place to take profit above it -- the leg's high, else an extension. A
+    # retracement ABOVE the close is resistance on the way back up, not a
+    # target, so it is neither.
+    below = [lv for lv in levels if lv["kind"] == "retracement"
+             and lv["price"] < close]
+    # While the leg is still running its "high" is just the latest bar's,
+    # a fraction above the close; the targets are then the extensions.
+    target_kinds = ("extension",) if leg_running else ("high", "extension")
+    above = [lv for lv in levels if lv["kind"] in target_kinds
+             and lv["price"] > close]
+    return dict(
+        low=low, low_date=low_dt, high=high, high_date=high_dt,
+        prev_low=prev_low,
+        higher_low=bool(prev_low is not None and low > prev_low),
+        high_confirmed=bool(high_confirmed),
+        leg_running=bool(leg_running), close=close,
+        # 0 = at the high, 1 = back at the low, >1 = below the leg's start.
+        retraced=(high - close) / span,
+        pullback_low=pullback_low,
+        pullback_retraced=(None if pullback_low is None
+                           else (high - pullback_low) / span),
+        support=max(below, key=lambda lv: lv["price"]) if below else None,
+        target=min(above, key=lambda lv: lv["price"]) if above else None,
+        levels=levels,
+    )

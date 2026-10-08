@@ -74,8 +74,8 @@ from qbs.quotes import (fill_disabled, fill_last_bar, fill_note,
 from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
                                  resolve_source)
 from qbs.screens import finviz_momentum_screen
-from qbs.swing import (SETUPS, SCREENS, SwingParams, market_pullback,
-                       scan as swing_scan)
+from qbs.swing import (SETUPS, SCREENS, SwingParams, fib_retracement,
+                       market_pullback, scan as swing_scan)
 from qbs import swing_finviz as swf
 from qbs.finviz import blocked_until, cooldown_note
 from qbs.candles import HammerRules, hammer_frame, volume_stats
@@ -656,6 +656,11 @@ def load_us_market(download_start: str, online: bool, force: bool,
 
 
 EMA_SPANS = (10, 20, 50, 200)
+# Fibonacci rules: deep teal for retracements (where a pullback may hold),
+# magenta for extensions (targets above the leg's high). Neither is used by
+# the EMAs (orange, yellow, blue, violet) or the level rules (red, green).
+FIB_COLOURS = ("#00696e", "#e87ba4")
+
 EMA_COLOURS = {"EMA 10": "#eb6834", "EMA 20": "#eda100",
                "EMA 50": "#2a78d6", "EMA 200": "#8a63d2"}
 
@@ -1229,11 +1234,17 @@ WATCH_EXTRA = [t for t in WATCH_FRAME.columns if t not in uni.columns]
 
 
 def draw_price_chart(ticker: str, price: pd.DataFrame, ema_long: pd.DataFrame,
-                     lvl: pd.DataFrame, asof, months: int):
+                     lvl: pd.DataFrame, asof, months: int,
+                     fib: Optional[Dict] = None):
     """Candles (or a close line), the EMAs and the level rules: the picture
     half of `price_panel`, shared with the Breakout monitor tab so both tabs
     draw one chart. `price`, `ema_long` and `lvl` are `chart_frames` output;
-    `lvl` may be replaced by the caller (hand-corrected levels)."""
+    `lvl` may be replaced by the caller (hand-corrected levels).
+
+    `fib` is `qbs.swing.fib_retracement` output. When given, its levels are
+    drawn as dotted rules labelled at the right edge, and the leg's low and
+    high are marked. Extensions far above the window are left to the table,
+    so a 200% target does not squash the candles."""
     # Candles need real Open/High/Low. When they cannot be had the
     # chart falls back to a close line and says so, rather than
     # drawing a wickless body per bar off the close series -- that
@@ -1288,6 +1299,54 @@ def draw_price_chart(ticker: str, price: pd.DataFrame, ema_long: pd.DataFrame,
                  alt.Tooltip("ema:N", title="Line"),
                  alt.Tooltip("value:Q", title="Value", format=".2f")])
     layers = [line, emas]
+    if fib:
+        lo_win = float(price["close"].min())
+        hi_win = float((bars["high"] if bars is not None else price["close"]).max())
+        fib_df = pd.DataFrame([
+            dict(level=lv["price"], label=lv["label"],
+                 kind=("Fib retracement" if lv["kind"] == "retracement"
+                       else "Fib extension"))
+            for lv in fib["levels"]
+            if lv["kind"] in ("retracement", "extension")
+            and lo_win * 0.9 <= lv["price"] <= hi_win * 1.12])
+        if not fib_df.empty:
+            fib_df["n"] = float(price["n"].max())
+            fscale = alt.Scale(domain=["Fib retracement", "Fib extension"],
+                               range=[FIB_COLOURS[0], FIB_COLOURS[1]])
+            fenc = dict(y=alt.Y("level:Q", scale=alt.Scale(zero=False, nice=True)),
+                        color=alt.Color("kind:N", title=None, scale=fscale,
+                                        legend=alt.Legend(orient="top",
+                                                          direction="horizontal")))
+            layers.append(alt.Chart(fib_df).mark_rule(
+                strokeDash=[2, 3], size=1.2, opacity=0.9).encode(
+                **fenc, tooltip=[alt.Tooltip("label:N", title="Fib"),
+                                 alt.Tooltip("level:Q", title="Price",
+                                             format=".2f")]))
+            # Same colours as the rules, but no second legend for them.
+            tenc = {**fenc, "color": alt.Color("kind:N", scale=fscale,
+                                               legend=None)}
+            layers.append(alt.Chart(fib_df).mark_text(
+                align="right", dy=-6, fontSize=10).encode(
+                x=xenc, text="label:N", **tenc))
+        # The leg's two anchors, where they fall inside the window.
+        n_of = dict(zip(pd.DatetimeIndex(price["date"]), price["n"]))
+        if bars is not None:
+            n_of.update(zip(pd.DatetimeIndex(bars["date"]), bars["n"]))
+        pts = [dict(n=n_of[d], level=v, tag=t) for d, v, t in (
+                   (pd.Timestamp(fib["low_date"]), fib["low"],
+                    "HL" if fib["higher_low"] else "LL"),
+                   (pd.Timestamp(fib["high_date"]), fib["high"], "H"))
+               if pd.Timestamp(d) in n_of]
+        if pts:
+            pdf = pd.DataFrame(pts)
+            penc = dict(x=xenc, y=alt.Y("level:Q",
+                                        scale=alt.Scale(zero=False, nice=True)))
+            layers.append(alt.Chart(pdf).mark_point(
+                shape="diamond", size=90, filled=True,
+                color=FIB_COLOURS[0]).encode(**penc))
+            layers.append(alt.Chart(pdf).mark_text(
+                dy=-12, fontWeight="bold", color=FIB_COLOURS[0]).encode(
+                **penc, text="tag:N"))
     if not lvl.empty:
         rules = alt.Chart(lvl).mark_rule(
             strokeDash=[5, 4], size=1.1, opacity=0.85).encode(
@@ -2737,6 +2796,76 @@ SWING_COLS = {
     "rs_gap": ("vs QQQ", "{:+.1%}"),
 }
 
+def render_fib(ticker: str, fib: Optional[Dict], real_bars: bool) -> None:
+    """The Fibonacci table under the swing chart: each level, its price and
+    how far it sits from the close, with the leg it was drawn on."""
+    st.markdown("##### Fibonacci retracement — last up-leg")
+    if not fib:
+        st.caption("No swing high with a swing low before it in the last year, "
+                   "so there is no leg to measure.")
+        return
+    leg = (f"{'Higher low' if fib['higher_low'] else 'Lower low'} "
+           f"**{fib['low']:,.2f}** ({fib['low_date']:%b %d}) → "
+           f"{'swing high' if fib['high_confirmed'] else 'high (not yet a confirmed swing)'} "
+           f"**{fib['high']:,.2f}** ({fib['high_date']:%b %d}). "
+           f"Close {fib['close']:,.2f} has retraced "
+           f"**{fib['retraced']:.0%}** of the leg")
+    if fib["leg_running"]:
+        leg += "; the leg is still running (close within one ATR of the high)"
+    elif (fib["pullback_low"] is not None
+          and fib["pullback_low"] < fib["close"]):
+        # Only worth saying when the pullback went deeper than today's close.
+        leg += (f"; the deepest pullback since the high was "
+                f"{fib['pullback_retraced']:.0%} ({fib['pullback_low']:,.2f})")
+    leg += "."
+    if fib["retraced"] > 1:
+        leg += " **Below the leg's low — the leg has failed.**"
+    if not fib["higher_low"]:
+        leg += (" The leg started from a *lower* low, so this is a bounce "
+                "inside a downtrend rather than an uptrend pullback.")
+    st.markdown(leg)
+
+    def _use(lv):
+        if lv["kind"] == "extension":
+            return "profit target"
+        if lv["kind"] == "high":
+            if fib["leg_running"]:
+                return "the leg's high so far (still rising)"
+            return ("first profit target (retest of the high)"
+                    if lv["price"] > fib["close"] else "the leg's high")
+        if lv["kind"] == "low":
+            return "the leg fails below here"
+        return ("rebound zone" if lv["price"] < fib["close"]
+                else "resistance on the way back up")
+
+    tab = pd.DataFrame([{
+        "Level": lv["label"], "Price": lv["price"], "vs close": lv["vs_close"],
+        "Use": _use(lv),
+    } for lv in fib["levels"]])
+    sup, tgt = fib["support"], fib["target"]
+
+    def _mark(r):
+        if sup is not None and r["Level"] == sup["label"]:
+            return [f"background-color: {UP}"] * len(r)
+        if tgt is not None and r["Level"] == tgt["label"]:
+            return [f"background-color: {CELL['low']}"] * len(r)
+        return [""] * len(r)
+    st.dataframe(tab.style.apply(_mark, axis=1).format(
+        {"Price": "{:,.2f}", "vs close": "{:+.1%}"}),
+        hide_index=True, width="stretch")
+    st.caption(md(
+        "Green row: the nearest retracement below the close — the first "
+        "level a pullback would test. Red row: the first place to take profit "
+        "above the close — the leg's high, or an extension once price is past "
+        "it. Retracements are `high − r × leg`, "
+        "extensions `low + r × leg`. Swings are the Breakout monitor's "
+        "(5 bars apart, prominence 1.5× the latest ATR) "
+        + ("on real daily highs and lows." if real_bars else
+           "on the close-to-close envelope (no OHLC cached for this name), "
+           "which understates the real highs and lows.")
+        + " Reference levels, not signals."))
+
+
 def render_swing(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame,
                  sw_last_bar, regime: Dict, real_bars: bool, src: str):
     """The swing results: summary, a table per setup, a chart for a hit.
@@ -2814,13 +2943,16 @@ def render_swing(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame,
             merge_width=sw_adr if sw_adr == sw_adr else None)
         if sw_frames is not None:
             price, ema_long, lvl, sw_last, _, _ = sw_frames
+            sw_fib = fib_retracement(sw_bars)
             draw_price_chart(sw_t, price, ema_long, lvl, sw_last_bar,
-                             sw_months)
+                             sw_months, fib=sw_fib)
             st.caption(md(
                 f"**{sw_t}** · {pick[0]} · close {row['close']:,.2f} · "
                 f"stop {fmt(row['stop'], '{:,.2f}')} · "
                 f"target {fmt(row['target'], '{:,.2f}')} · "
                 f"R:R {fmt(row['rr'], '{:.1f}')}"))
+            render_fib(sw_t, sw_fib, real_bars=sw_ohlc is not None
+                       and not sw_ohlc.empty)
 
 
 
