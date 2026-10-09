@@ -273,3 +273,55 @@ def trade_table(trades: List[Trade]) -> pd.DataFrame:
         stop=t.stop, target=t.target, held=t.held, reason=t.reason,
         pnl=t.pnl, ret=t.ret if t.exit_px is not None else float("nan"),
         costs=t.costs) for t in trades])
+
+
+def momentum_first_picks(
+    scan_day: Dict[str, pd.DataFrame],
+    closes: pd.DataFrame,
+    n_slots: int = 6,
+    stop_mult: float = 2.0,
+    slot_usd: float = 1000.0,
+    lookback: int = 126,
+    skip: int = 21,
+) -> pd.DataFrame:
+    """Today's picks for the momentum-first swing book.
+
+    The variant that held up in docs/SWING_BOOK.md: every name passing one of
+    the six swing screens today, ranked by 6-1 momentum (the Top-6 book's
+    own score), best `n_slots` first. Each pick keeps its screen's target and
+    setup time limit, with the stop widened to `stop_mult` x the screen's
+    distance below the close -- the screens' stops sit 1-2 ATRs under the
+    close, which the backtest found too tight.
+
+    `scan_day` is `qbs.swing.scan` output; `closes` the same universe's closes
+    up to today. Picks are candidates for new trades, not a held book: the
+    dashboard has no record of what was bought on earlier days.
+    """
+    p = SwingBookParams(n_slots=n_slots, slot_usd=slot_usd, rank_by="momentum",
+                        stop_mult=stop_mult)
+    c = closes.dropna(how="all")
+    if len(c) <= lookback:
+        mom = pd.Series(dtype=float)
+    else:
+        mom = c.iloc[-1 - skip] / c.iloc[-1 - lookback] - 1.0
+    cands = candidates_for(scan_day, p, mom)
+    # As in the backtest, a name one share of which costs more than a slot is
+    # skipped and the next one takes its place.
+    cands = cands[cands["score"].notna() & (cands["close"] <= slot_usd)].head(n_slots)
+    rows = []
+    for rank, r in enumerate(cands.itertuples(index=False), 1):
+        close = float(r.close)
+        stop = None if r.stop is None else close - stop_mult * (close - float(r.stop))
+        target = r.target
+        rr = ((target - close) / (close - stop)
+              if stop is not None and target is not None and target > close > stop
+              else float("nan"))
+        rows.append(dict(
+            rank=rank, ticker=r.ticker, setup=r.setup, close=close, stop=stop,
+            target=target, rr=rr, momentum=float(r.score),
+            max_hold=int(p.max_hold.get(r.setup, 15)),
+            shares=int(math.floor(slot_usd / close)) if close > 0 else 0,
+        ))
+    return pd.DataFrame(rows, columns=["rank", "ticker", "setup", "close", "stop",
+                                       "target", "rr", "momentum", "max_hold",
+                                       "shares"])

@@ -110,3 +110,32 @@ def test_intraday_stop_and_target_with_ohlc():
     # Without bars, the same closes never touch either level.
     _, plain = run_swing_book(px, FLAT_SAFE, {DAYS[0]: sc}, p)
     assert set(trade_table(plain)["reason"]) == {"time"}
+
+
+def test_momentum_first_picks_rank_by_momentum_and_widen_stops():
+    from qbs.swing_book import momentum_first_picks
+    idx = pd.bdate_range("2025-01-01", periods=200)
+    # AAA has the strongest 6-1 momentum, CCC the weakest.
+    closes = pd.DataFrame({
+        "AAA": np.linspace(50, 100, 200),
+        "BBB": np.linspace(80, 100, 200),
+        "CCC": np.linspace(99, 100, 200),
+    }, index=idx)
+    last = closes.iloc[-1]
+    scan_day = {
+        "trend_pullback": _scan({"CCC": (last["CCC"], 95.0, 110.0, 2.0),
+                                 "BBB": (last["BBB"], 96.0, 104.0, 1.0)}),
+        "mean_reversion": _scan({"AAA": (last["AAA"], 98.0, 103.0, 1.5)}),
+    }
+    picks = momentum_first_picks(scan_day, closes, n_slots=2, stop_mult=2.0)
+    assert list(picks["ticker"]) == ["AAA", "BBB"]          # CCC ranks last
+    a = picks.iloc[0]
+    assert a["setup"] == "mean_reversion" and a["max_hold"] == 7
+    assert a["stop"] == pytest.approx(100.0 - 2 * (100.0 - 98.0))   # 96
+    assert a["rr"] == pytest.approx((103.0 - 100.0) / (100.0 - 96.0))
+    assert a["shares"] == 10
+    # Names one share of which costs more than the slot are skipped.
+    scan_day["mean_reversion"] = _scan({"AAA": (200.0, 196.0, 206.0, 1.5)})
+    picks = momentum_first_picks(scan_day, closes, n_slots=2, slot_usd=150.0)
+    assert list(picks["ticker"]) == ["BBB", "CCC"]
+    assert "AAA" not in set(picks["ticker"])
