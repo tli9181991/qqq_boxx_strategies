@@ -10,6 +10,10 @@ yfinance>=0.2.40
 jupyterlab>=4.0
 ipykernel>=6.25
 
+# Optional: executes notebooks/agent_tests/ under pytest (tests/test_agent_notebooks.py
+# skips that part without it).
+nbclient>=0.10
+
 # Optional: nicer test runner. The suite also runs with plain `python tests/test_qbs.py`
 pytest>=7.4
 

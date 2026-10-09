@@ -329,6 +329,15 @@ Session metadata (`session_date`, `session_id`, `prompt_version`,
 - The memory and decision history are per session date; nothing carries over to the
   next day except what the next day's prompt says.
 
+## Pre-deployment notebooks
+
+`notebooks/agent_tests/` holds six notebooks (MCP market context, intraday data, LLM
+decisions, memory state, token benchmark, end-to-end dry run) that run on a versioned,
+hash-checked fixture with a look-ahead-safe feed and a fake clock — MOCK by default,
+REAL_LLM only with an explicit paid opt-in and a call cap. See
+[notebooks/agent_tests/README.md](../notebooks/agent_tests/README.md).
+`tests/test_agent_notebooks.py` carries their critical checks into CI.
+
 ## Tests
 
 `tests/test_trading_agent.py` (mock LLM, synthetic bars, temp SQLite; no key, no

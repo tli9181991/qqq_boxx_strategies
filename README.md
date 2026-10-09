@@ -868,6 +868,8 @@ run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
 notebooks/breakout_success_rate.ipynb  the selection -> breakout funnel
+notebooks/agent_tests/                 six pre-deployment notebooks for the trading
+                  agent (MOCK by default; see its README)
 notebooks/momentum_ranker_colab.ipynb  today's ranking, on Colab
 notebooks/finviz_selection_colab.ipynb the high-momentum screen, on Colab,
                   over the Nasdaq-100 or the whole US market
@@ -1736,7 +1738,8 @@ python -m qbs.trading_agent report                      # tokens, cost, validati
 
 The dashboard's **🧠 Trading agent** tab does the same prompt/authorize/pause/stop steps
 and shows decisions, errors, tokens and cost. Full design, configuration and safety
-notes: [docs/TRADING_AGENT.md](docs/TRADING_AGENT.md).
+notes: [docs/TRADING_AGENT.md](docs/TRADING_AGENT.md). Pre-deployment test notebooks:
+[notebooks/agent_tests/](notebooks/agent_tests/README.md).
 
 ---
 
