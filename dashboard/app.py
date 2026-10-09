@@ -2,7 +2,7 @@
 
     streamlit run dashboard/app.py
 
-Six tabs:
+Seven tabs:
 
 * **Daily picks** -- what each of the three selection strategies held on each
   day, with the entries and exits that changed it. The momentum book ranks the
@@ -20,6 +20,8 @@ Six tabs:
 * **News & sentiment** -- the last 12 hours of market headlines, always; plus
   a model's read of them when one is configured and switched on.
 * **Analyst** -- the price panel again, and a chat over the lab's own tools.
+* **Trading agent** -- the optional LLM trading agent's controls and log
+  (Phase 1: a decision dry run, no orders). See docs/TRADING_AGENT.md.
 
 READ THE BANNER AT THE TOP OF THE MARKET TAB
 --------------------------------------------
@@ -1668,9 +1670,10 @@ with st.sidebar:
 
 
 (tab_picks, tab_market, tab_breakout, tab_swing, tab_news,
- tab_analyst) = st.tabs(
+ tab_analyst, tab_agent) = st.tabs(
     ["📋 Daily picks", "📊 Market overview", "📈 Breakout monitor",
-     "🔄 Swing trades", "📰 News & sentiment", "🤖 Analyst"])
+     "🔄 Swing trades", "📰 News & sentiment", "🤖 Analyst",
+     "🧠 Trading agent"])
 
 
 # ==========================================================================
@@ -3593,3 +3596,19 @@ with tab_analyst:
             "last 20 turns are re-sent, and tool output is never replayed: "
             "the analyst fetches a stock again when it needs it."
         )
+
+
+# ==========================================================================
+# Tab 7 -- the LLM trading agent (Phase 1 dry run)
+# ==========================================================================
+
+with tab_agent:
+    # Imported here, not at the top: the agent is optional, and a problem in
+    # it must cost this tab only, never the rest of the dashboard.
+    try:
+        from qbs.trading_agent.dashboard import render as render_trading_agent
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"The trading agent module could not be loaded: "
+                 f"{type(exc).__name__}: {exc}")
+    else:
+        render_trading_agent()

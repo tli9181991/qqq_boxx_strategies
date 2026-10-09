@@ -1,0 +1,40 @@
+{
+  "_comment": "LLM trading agent, Phase 1 dry run. Copy to var/agent/config.json (or point QBS_AGENT_CONFIG at it). QBS_AGENT_* environment variables override these values. Keys are never stored here.",
+  "agent_enabled": false,
+  "execution_mode": "DRY_RUN",
+  "analysis_interval_minutes": 15,
+  "daily_user_prompt": "",
+
+  "provider": "gemini",
+  "model": "gemini-2.5-flash",
+  "temperature": 0.0,
+  "max_output_tokens": 1024,
+  "request_timeout_s": 60,
+  "max_retries": 2,
+  "retry_backoff_s": 2.0,
+
+  "data_delay_seconds": 60,
+  "stale_retry_seconds": 30,
+  "include_closing_candle": false,
+  "max_consecutive_failed_cycles": 3,
+  "extra_holidays": [],
+  "extra_early_closes": [],
+
+  "market_context": {
+    "timeframe_primary": "15m",
+    "timeframe_confirmation": "30m",
+    "timeframe_daily": "1d",
+    "history": {
+      "candles_15m": 32,
+      "candles_30m": 20,
+      "candles_daily": 30
+    },
+    "raw_15m": 8,
+    "raw_30m": 4,
+    "raw_daily": 5
+  },
+  "decision_history": 3,
+
+  "log_full_prompts": false,
+  "pricing_file": ""
+}

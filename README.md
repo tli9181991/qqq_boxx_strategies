@@ -862,6 +862,8 @@ qbs/
     tools.py        ... wrapped for LangChain (in-process, or from a server)
     mcp_server.py   ... served over MCP, stdio or HTTP
     mcp_client.py   ... called from a notebook, a script or the analyst
+  trading_agent/  the optional LLM trading agent, Phase 1: a decision DRY RUN
+                  (no orders) -- see docs/TRADING_AGENT.md
 run_backtest.py   CLI
 dashboard/app.py  Streamlit: daily picks + market overview + analyst
 notebooks/backtest_visualization.ipynb
@@ -877,6 +879,9 @@ tests/test_agent.py 61 tests: the analyst's data layers, .env loading and
                   run driven by a scripted model (no key, no network)
 tests/test_mcp.py the shared toolkit, the MCP server's token gate, and real
                   client <-> server round trips over stdio and HTTP
+tests/test_trading_agent.py the trading agent: authorization, crash recovery,
+                  calendar, completed candles, validation, memory, usage
+                  (mock LLM and synthetic bars; no key, no IBKR)
 
 patreon_pipeline/ nothing to do with the strategy. A Gmail-triggered Patreon
                   downloader that transcribes with Whisper and uploads both the
@@ -1710,6 +1715,28 @@ The trade-off: the server answers from **its own cache and default settings**. T
 dashboard sidebar's slot counts (`n_hold`, the exit rank, the residual book's size) do
 not reach it, and the chat says so under the input box. Leave `QBS_MCP_URL` unset and
 the chat runs the same toolkit in-process on the page's own frames, sidebar included.
+
+---
+
+## The LLM trading agent (Phase 1: dry run)
+
+An optional module that, during an explicitly authorized US session, asks an LLM for one
+structured decision (BUY / SELL / HOLD / ADJUST_STOP_LOSS / NO_TRADE) per watched stock
+on every completed 15-minute candle, validates it in code, and logs it with the market
+snapshot, the tokens, the cost and the latency. **It places no orders**: nothing in it
+imports `qbs.live` or a broker client, and the model is given no tools.
+
+```bash
+export QBS_AGENT_ENABLED=1                              # feature switch, off by default
+python -m qbs.trading_agent prompt set --file today.txt # the Daily User Prompt
+python -m qbs.trading_agent authorize                   # today's ONE-TIME authorization
+python -m qbs.trading_agent run                         # the session loop, until the close
+python -m qbs.trading_agent report                      # tokens, cost, validation, actions
+```
+
+The dashboard's **🧠 Trading agent** tab does the same prompt/authorize/pause/stop steps
+and shows decisions, errors, tokens and cost. Full design, configuration and safety
+notes: [docs/TRADING_AGENT.md](docs/TRADING_AGENT.md).
 
 ---
 
