@@ -78,3 +78,4 @@ cookies.txt
 deploy/patreon/patreon.env
 deploy/windows/patreon.env
 deploy/patreon/config.json
+data/swing_scans.pkl
