@@ -113,13 +113,13 @@ SLOW_BELOW_30, SLOW_BELOW_20 = "#d9534f", DN_STRONG
 FAST_LOW = 30.0
 FAST_LOW_TEXT = {True: DN_STRONG, False: "#ff6b6b"}
 
-# How many slots the residual book runs here. The research default is six,
-# the same as its total-return sibling, because the point of that comparison
-# is that ONLY the score differs. This dashboard runs it deeper on purpose:
-# the residual score is a risk-adjusted one and its whole claim is that the
-# names it picks are less alike, so ten slots of it is not ten times the same
-# bet the way ten momentum slots would be. See docs/RESIDUAL_MOMENTUM.md.
-RESID_N_HOLD = 10
+# How many slots the residual book runs here: the strategy's own, which is
+# what the live residual sleeve trades (cfg.resmom -- six slots, exit rank 10;
+# qbs/live/signals.py refuses any other size). It used to default to ten
+# here, and because the band carries holdings from day to day, a ten-slot
+# book is not the live six plus four more names -- it is a different book.
+# The sidebar can still run it deeper for research.
+RESID_N_HOLD = ResidualMomentumParams().n_hold
 # How many of the NDX momentum ranking the picks tab lists (held or not).
 MOM_TOP_LIST = 10
 # The band, kept as a WIDTH rather than an absolute rank. `exit_rank` is how
@@ -863,9 +863,10 @@ n_screen = st.sidebar.number_input(
          "shows everyone who passed.")
 n_resid = st.sidebar.number_input(
     "Residual book size", 1, 30, RESID_N_HOLD,
-    help="Slots in the residual-momentum book. It gets its own control "
-         "rather than sharing n_hold because it is run deeper here than its "
-         f"total-return sibling: its band follows at +{RESID_BAND}.")
+    help=f"Slots in the residual-momentum book. {RESID_N_HOLD} is the live "
+         "strategy's size, so the picks match what the live sleeve holds; "
+         "change it only for research. Its band follows at "
+         f"+{RESID_BAND}.")
 
 # Now that every slot count is known, name each book after the one it is
 # actually running rather than after the config default.
