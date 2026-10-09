@@ -76,6 +76,7 @@ from qbs.universe_source import (SOURCE_VAR, available_sources, fetch_universe,
 from qbs.screens import finviz_momentum_screen
 from qbs.swing import (SETUPS, SCREENS, SwingParams, fib_retracement,
                        market_pullback, scan as swing_scan)
+from qbs.swing_book import momentum_first_picks
 from qbs import swing_finviz as swf
 from qbs.finviz import blocked_until, cooldown_note
 from qbs.candles import HammerRules, hammer_frame, volume_stats
@@ -2867,6 +2868,40 @@ def render_fib(ticker: str, fib: Optional[Dict], real_bars: bool) -> None:
         + " Reference levels, not signals."))
 
 
+def render_momentum_first(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame):
+    """The momentum-first swing book (docs/SWING_BOOK.md): today's six picks
+    from the screens above, ranked by 6-1 momentum, stops 2x wider."""
+    st.markdown("#### Momentum-first swing book — today's picks")
+    picks = momentum_first_picks(sw, sw_closes)
+    if picks.empty:
+        st.caption("No name passes a swing screen with a momentum score today.")
+        return
+    names = {s_.key: s_.name for s_ in SETUPS}
+    st.dataframe(pd.DataFrame({
+        "Rank": picks["rank"],
+        "Ticker": picks["ticker"],
+        "Setup": picks["setup"].map(names).fillna(picks["setup"]),
+        "Close": picks["close"].map(lambda v: f"{v:,.2f}"),
+        "Stop (2×)": picks["stop"].map(lambda v: "—" if v is None or v != v else f"{v:,.2f}"),
+        "Target": picks["target"].map(lambda v: "—" if v is None or v != v else f"{v:,.2f}"),
+        "R:R": picks["rr"].map(lambda v: "—" if v != v else f"{v:.1f}"),
+        "6-1 momentum": picks["momentum"].map(lambda v: f"{v:+.1%}"),
+        "Max hold": picks["max_hold"].map(lambda v: f"{v} sessions"),
+        "Shares @ $1k": picks["shares"],
+    }), hide_index=True, width="stretch")
+    st.caption(md(
+        "Every name passing a screen above, ranked by **6-1 momentum** (the "
+        "Top-6 book's score); six $1,000 slots in whole shares. Each pick "
+        "keeps its screen's target and time limit; the stop sits **2× the "
+        "screen's distance** below the close. Exit on stop, target or max "
+        "hold, whichever comes first. Backtest on real daily bars, 44 names, "
+        "2024-09 to 2026-09, IB commission and 5 bp slippage: **62.1% CAGR, "
+        "−21.5% max drawdown** (Calmar 2.89), ~158 trades a year costing "
+        "~8% of capital a year; Top-6 momentum on the same names made 83.6% "
+        "with −32.5%. Picks are candidates for new trades, not a held book "
+        "— the dashboard does not track what was bought on earlier days."))
+
+
 def render_swing(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame,
                  sw_last_bar, regime: Dict, real_bars: bool, src: str):
     """The swing results: summary, a table per setup, a chart for a hit.
@@ -2887,6 +2922,8 @@ def render_swing(sw: Dict[str, pd.DataFrame], sw_closes: pd.DataFrame,
         "prices for sizing, not orders. Support and resistance are the "
         "charts' levels (round numbers, merged within a daily range)."),
         icon="ℹ️")
+
+    render_momentum_first(sw, sw_closes)
 
     for s_ in SETUPS:
         frame = sw[s_.key]
