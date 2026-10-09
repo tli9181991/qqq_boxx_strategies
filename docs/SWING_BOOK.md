@@ -94,7 +94,7 @@ only in the data. (`scripts/swing_ohlc_study.py`; IB data not committed.)
 | *Top-6 momentum, $1k slots (same 44)* | | **83.6% / −32.5%** | |
 | *QQQ buy & hold* | | **26.6% / −22.8%** | |
 
-(CAGR / max drawdown. Swing books trade 160–235 times a year at 8–11% of
+(CAGR / max drawdown. Swing books trade 140–235 times a year at 7–11% of
 capital a year in costs; Top-6 momentum trades 41 times at 2%.)
 
 **What real bars change — and do not.**
@@ -105,8 +105,10 @@ capital a year in costs; Top-6 momentum trades 41 times at 2%.)
   −8% drawdown) come closest, and trend pullback (−4.5%) and breakout retest
   (0.0%) are the weakest once stops fill intraday.
 * Real bars help the **momentum-ranked** book: 62.1% a year with a −21.5%
-  drawdown and the best Calmar of anything tested (2.89, against 2.58 for
-  Top-6 momentum on the same names). That is the one swing variant worth a
+  drawdown and the best Calmar of the full books (2.89, against 2.58 for
+  Top-6 momentum on the same names; only the volatility-contraction-only
+  book scored higher, and it sits in cash most of the time at 32 trades a
+  year). That is the one swing variant worth a
   second look: the setups used as **entry timing for strong names**, with
   stops twice the screens' width. It still earns about 20 points a year less
   than simply holding the Top-6 momentum book, and trades four times as often.
