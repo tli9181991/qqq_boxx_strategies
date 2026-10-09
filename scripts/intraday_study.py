@@ -135,7 +135,7 @@ def intraday_rules(sym: str, b: pd.DataFrame, bars_per_day: int,
         "first hour down > 1%: buy, exit at close",
         "last-hour momentum (first 30 min up)",
         "RSI2 < 10 dip in a momentum-book name")}
-    o, h, l, c = b["open"].values, b["high"].values, b["low"].values, b["close"].values
+    o, c = b["open"].values, b["close"].values
     t = b.index
     day = t.normalize()
     r2 = rsi(b["close"], 2).values
@@ -169,7 +169,7 @@ def intraday_rules(sym: str, b: pd.DataFrame, bars_per_day: int,
     for d, g in b.groupby(day):
         if len(g) < bars_per_day - 1:
             continue
-        go, gh, gl, gc = g["open"].values, g["high"].values, g["low"].values, g["close"].values
+        go, gh, gc = g["open"].values, g["high"].values, g["close"].values
         gt = g.index
         first = 1 if bars_per_day == 7 else 2          # bars in the first 30 minutes
         or_high = gh[:first].max()
