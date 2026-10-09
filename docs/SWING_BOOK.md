@@ -69,6 +69,50 @@ tab as a discretionary screen — its stops, targets and Fibonacci levels are
 useful reference prices for a trade you choose, but the screens are not a
 signal to automate.
 
+## Two years on real daily bars (IB)
+
+The tables above use the lab's cached closes: a day's range is the
+close-to-close envelope and a stop is seen only at the close. The same book
+was re-run on **real daily Open/High/Low/Close from IB** for 44 of the
+Nasdaq-100 names (the ones with four years of IB history under one contract;
+ARM, AZN and LRCX had too little and were left out), over the two years
+**2024-09-09 → 2026-09-08**:
+
+* the screens size ATR, stops and level merges from true daily ranges, as the
+  tab does with Source → Online;
+* stops and targets fill **intraday** — at the stop when the low reaches it,
+  at the open on a gap through it; a day touching both counts as a stop.
+
+Every arm uses the same 44 names and identical closes, so the arms differ
+only in the data. (`scripts/swing_ohlc_study.py`; IB data not committed.)
+
+| 44 names, 2 years | Closes only | **Real bars** | Real scans, close exits |
+|---|---|---|---|
+| All setups, best R:R first | 16.9% / −18.7% | **19.9% / −17.8%** | 11.9% / −21.5% |
+| All setups, best momentum first | 48.3% / −26.6% | **47.1% / −24.6%** | 52.9% / −19.7% |
+| Momentum first, stops 2× wider | 55.4% / −21.7% | **62.1% / −21.5%** | 53.0% / −21.2% |
+| *Top-6 momentum, $1k slots (same 44)* | | **83.6% / −32.5%** | |
+| *QQQ buy & hold* | | **26.6% / −22.8%** | |
+
+(CAGR / max drawdown. Swing books trade 160–235 times a year at 8–11% of
+capital a year in costs; Top-6 momentum trades 41 times at 2%.)
+
+**What real bars change — and do not.**
+
+* The verdict on the setups stands. Ranked by reward/risk the book makes
+  ~20% a year, **below QQQ (26.6%)**. Of the six setups on their own, none
+  beats QQQ on real bars; mean reversion (16.5%) and range bounce (14.8%,
+  −8% drawdown) come closest, and trend pullback (−4.5%) and breakout retest
+  (0.0%) are the weakest once stops fill intraday.
+* Real bars help the **momentum-ranked** book: 62.1% a year with a −21.5%
+  drawdown and the best Calmar of anything tested (2.89, against 2.58 for
+  Top-6 momentum on the same names). That is the one swing variant worth a
+  second look: the setups used as **entry timing for strong names**, with
+  stops twice the screens' width. It still earns about 20 points a year less
+  than simply holding the Top-6 momentum book, and trades four times as often.
+* Three quarters of R:R-ranked trades still end at the stop (−4.2% average)
+  or the time limit; the 10% winners at target are too few to pay for them.
+
 ## Caveats
 
 Same as every study here: today's Nasdaq-100 applied to history
@@ -78,6 +122,7 @@ market, and close-only stops.
 ## Reproduce
 
 ```bash
+python scripts/swing_ohlc_study.py --ib path/to/ib_daily   # real bars, 2 years
 python scripts/swing_book_study.py --build-scans   # first run: ~10 min on 4 cores
 python scripts/swing_book_study.py                 # later runs reuse data/swing_scans.pkl
 ```

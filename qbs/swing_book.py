@@ -152,8 +152,17 @@ def run_swing_book(
     start: Optional[str] = None,
     end: Optional[str] = None,
     momentum: Optional[pd.DataFrame] = None,
+    ohlc: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Tuple[pd.Series, List[Trade]]:
     """Simulate the book. Returns (equity in dollars by session, trades).
+
+    With `ohlc` (ticker -> daily Open/High/Low/Close), stops and targets fill
+    INTRADAY, as resting orders would: a stop fills when the day's low
+    reaches it -- at the stop, or at the open if the stock gapped below it --
+    and a target when the day's high reaches it (at the target, or the open
+    on a gap above). A day that touches both is counted as a stop, the
+    conservative order. Names without bars, and every exit without `ohlc`,
+    are checked on the close as before.
 
     `scans` maps each session to `qbs.swing.scan` output computed on prices up
     to that session only. `momentum` (date x ticker 6-1 momentum) is needed
@@ -185,19 +194,28 @@ def run_swing_book(
             if c is None or c != c:
                 continue
             tr.held += 1
-            reason = ""
-            if tr.stop is not None and c <= tr.stop:
+            reason, px_out = "", c
+            bar = None
+            if ohlc is not None and t in ohlc and d in ohlc[t].index:
+                bar = ohlc[t].loc[d]
+            if bar is not None:
+                o, hi, lo = float(bar["Open"]), float(bar["High"]), float(bar["Low"])
+                if tr.stop is not None and lo <= tr.stop:
+                    reason, px_out = "stop", min(o, tr.stop)
+                elif tr.target is not None and hi >= tr.target:
+                    reason, px_out = "target", max(o, tr.target)
+            elif tr.stop is not None and c <= tr.stop:
                 reason = "stop"
             elif tr.target is not None and c >= tr.target:
                 reason = "target"
-            elif tr.held >= tr.max_hold:
-                reason = "time"
+            if not reason and tr.held >= tr.max_hold:
+                reason, px_out = "time", c
             if reason:
-                fill = c * (1 - slip)
+                fill = px_out * (1 - slip)
                 fee = commission(tr.shares, fill, p)
                 cash += tr.shares * fill - fee
-                tr.costs += fee + tr.shares * c * slip
-                tr.exit_date, tr.exit_px, tr.reason = d, c, reason
+                tr.costs += fee + tr.shares * px_out * slip
+                tr.exit_date, tr.exit_px, tr.reason = d, px_out, reason
                 trades.append(tr)
                 del open_[t]
                 exited_today.add(t)

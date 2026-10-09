@@ -91,3 +91,22 @@ def test_idle_cash_earns_the_safe_asset():
     safe = pd.Series(np.linspace(100, 103, 30), index=DAYS)
     eq, _ = run_swing_book(px, safe, {}, SwingBookParams(n_slots=2, **NO_COST))
     assert eq.iloc[-1] == pytest.approx(2000.0 * 1.03)
+
+
+def test_intraday_stop_and_target_with_ohlc():
+    px = _frame(AAA=[100.0] * 30, BBB=[100.0] * 30, CCC=[100.0] * 30)
+    bars = {t: pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                             "Close": 100.0}, index=DAYS) for t in px}
+    bars["AAA"].loc[DAYS[3], ["Low"]] = 94.0          # trades through the stop
+    bars["BBB"].loc[DAYS[3], ["Open", "Low"]] = 90.0  # gaps below it
+    bars["CCC"].loc[DAYS[3], ["High"]] = 116.0        # reaches the target
+    sc = {"trend_pullback": _scan({t: (100.0, 95.0, 115.0, 3.0) for t in px})}
+    p = SwingBookParams(n_slots=3, **NO_COST)
+    _, trades = run_swing_book(px, FLAT_SAFE, {DAYS[0]: sc}, p, ohlc=bars)
+    tt = trade_table(trades).set_index("ticker")
+    assert tt.loc["AAA", "reason"] == "stop" and tt.loc["AAA", "exit_px"] == 95.0
+    assert tt.loc["BBB", "reason"] == "stop" and tt.loc["BBB", "exit_px"] == 90.0
+    assert tt.loc["CCC", "reason"] == "target" and tt.loc["CCC", "exit_px"] == 115.0
+    # Without bars, the same closes never touch either level.
+    _, plain = run_swing_book(px, FLAT_SAFE, {DAYS[0]: sc}, p)
+    assert set(trade_table(plain)["reason"]) == {"time"}
