@@ -602,12 +602,16 @@ def test_llm_gets_no_tools_and_no_broker_is_loaded(cfg):
     ready(cfg)
     clock = Clock(et(9, 31))
     llm = MockProvider([echo()])
+    # Compared against a snapshot: other test files import the broker
+    # themselves, so only what THIS run loads says anything about the agent.
+    before = set(sys.modules)
     run_session(cfg, llm, FakeBars(clock), clock=clock, sleep=clock.sleep,
                 install_signals=False)
     assert llm.calls and all(set(c) == {"system", "user", "settings"} for c in llm.calls)
     assert "DRY_RUN" in SYSTEM_PROMPT
-    assert not any(m == f or m.startswith(f + ".") for m in sys.modules
-                   for f in ("ib_async", "ib_insync", "qbs.live.broker"))
+    loaded = set(sys.modules) - before
+    assert not any(m == f or m.startswith(f + ".") for m in loaded
+                   for f in ("ib_async", "ib_insync", "qbs.live"))
 
 
 # --------------------------------------------------------------------------
