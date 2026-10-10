@@ -1384,8 +1384,13 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
                 extra: Optional[pd.DataFrame] = None,
                 ticker_help: str = "Today's picks come first, then the rest "
                                    "of the universe.",
-                labels: Optional[Dict[str, str]] = None):
+                labels: Optional[Dict[str, str]] = None,
+                show_profile: bool = True):
     """The price / levels / momentum panel, so two tabs can show one panel.
+
+    `show_profile=False` stops after the chart: no single-stock momentum
+    summary and no "Which strategies would take it, and why" table. The picks
+    tab turns them off; the analyst tab keeps them.
 
     Extracted rather than copied: it is ~180 lines of chart, level and gate
     logic, and a second copy would drift from the first the moment either is
@@ -1488,6 +1493,10 @@ def price_panel(uni, px, asof, options, n_hold: int, key_prefix: str,
         )
 
         # ---- the numbers behind the picture -----------------------
+        # The single-stock momentum summary and the "Which strategies would
+        # take it, and why" gates. Switched off where the caller asks.
+        if not show_profile:
+            return st.session_state.get(f"{key_prefix}_ticker")
         # Same params the picks table above was screened with, so the
         # gate rows report the screen actually running, not a default.
         prof = momentum_profile(uni, ticker, asof=asof, safe=px["BOXX"],
@@ -1693,11 +1702,11 @@ with tab_picks:
     asof = st.select_slider("Date", options=dates, value=dates[-1],
                             format_func=lambda d: f"{d:%Y-%m-%d}")
 
-    # Three books, so the panel is narrower than it was -- but each column
-    # holds one short ticker list, and splitting them across two rows would
-    # put the chart out of eyeshot of the names it is meant to explain.
+    # Three books across the page, each a ranked table; the chart they explain
+    # sits directly under them at full width.
     books = ("momentum", "resmom", "finviz")
-    cols = st.columns([1, 1, 1, 3])
+    # The three books side by side; the price chart runs full width below them.
+    cols = st.columns(3)
     RP = ResidualMomentumParams()
     # The long "why" lives in a metric tooltip rather than under the header:
     # three columns is narrow enough that a paragraph there would push this
@@ -1715,7 +1724,7 @@ with tab_picks:
             "are less alike; see docs/RESIDUAL_MOMENTUM.md."),
     }
     picks: Dict[str, set] = {}
-    for col, key in zip(cols[:3], books):
+    for col, key in zip(cols, books):
         frame = selections[key]
         row = frame.loc[asof] if asof in frame.index else None
         raw = row["holdings"] if row is not None and row["holdings"] else ""
@@ -1791,12 +1800,13 @@ with tab_picks:
             if row is not None and row["sells"]:
                 st.caption(f"🔴 Sold: {row['sells']}")
 
-    # ---- right-hand panel: price, EMAs and the levels that matter ---------
-    with cols[3]:
-        universe_names = list(uni.columns)
-        picked = sorted(set().union(*picks.values()))
-        options = picked + [t for t in universe_names if t not in picked]
-        price_panel(uni, px, asof, options, int(n_hold), "picks")
+    # ---- below the tables: price, EMAs and the levels that matter ---------
+    st.divider()
+    universe_names = list(uni.columns)
+    picked = sorted(set().union(*picks.values()))
+    options = picked + [t for t in universe_names if t not in picked]
+    price_panel(uni, px, asof, options, int(n_hold), "picks",
+                show_profile=False)
 
     # ---- what the books agree on -----------------------------------------
     # One "held by both" line stopped being answerable at three books: it no
