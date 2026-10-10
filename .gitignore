@@ -79,3 +79,7 @@ deploy/patreon/patreon.env
 deploy/windows/patreon.env
 deploy/patreon/config.json
 data/swing_scans.pkl
+
+# Agent test notebooks: generated experiment results, kept apart from the
+# committed, hash-checked fixtures in notebooks/agent_tests/fixtures/.
+notebooks/agent_tests/results/

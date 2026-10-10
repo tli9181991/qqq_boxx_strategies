@@ -1,0 +1,26 @@
+{
+  "version": "v1",
+  "source": "synthetic",
+  "seed": 20261008,
+  "real_prices": false,
+  "replay_date": "2026-10-08",
+  "symbols": [
+    "TEAM",
+    "MRVL",
+    "TSM"
+  ],
+  "timezone_of_start": "UTC (bar START time)",
+  "scenario": "TEAM breaks out above 200 around 11:15 ET and retests; MRVL (held, 9 shares) peaks near noon and loses VWAP after 14:00; TSM pulls back to ~294 then recovers above 302 late",
+  "daily_prompt": "Date: 2026-10-08\n\nMonitor only TEAM, MRVL, and TSM.\n\nTEAM:\nWatch for a breakout above $200.\nLook for breakout confirmation or a successful retest.\nMaximum suggested position: 4 shares.\nReference stop loss: $196.\n\nMRVL:\nMonitor my existing 9-share position.\nEvaluate whether to hold or take profit.\nDo not recommend adding new shares.\n\nTSM:\nMonitor for a potential recovery after pullback.\nRecovery confirmation above $302.\nMaximum suggested position: 3 shares.\nDo not force a trade without confirmation.\n\nGeneral:\nUse 15-minute candles for primary analysis.\nUse 30-minute and daily candles as supporting context.\nAvoid unnecessary trading.\nNo short selling.\n",
+  "files": {
+    "MRVL_15m.csv": "17d1a650b5175ef7ea932bb5c32174e9af73159c816854e677d3b4d4a5d5762b",
+    "MRVL_1d.csv": "175845d02b26c5de5e119a1d98e533898cbcac0125f7d6bb7016952f609e71b1",
+    "MRVL_30m.csv": "c95ef130b53ae58f2d1d7a8a34c926867fd7138423fa449130ea497553670211",
+    "TEAM_15m.csv": "460ce0dc7c15e4dfa97228e5a8e7585cc4a58eb3430eb19140ae861a56fa83aa",
+    "TEAM_1d.csv": "fab89a7b6f3dc4f08776fc341c9e2cadb5b69646e8f2b15d7d7df788fadaab4e",
+    "TEAM_30m.csv": "6060716a8a1adeef8b6c55153b5b823386f0e1cf64bd6c1a535fe6b2e98da6c5",
+    "TSM_15m.csv": "c5cd3c83dc12856e069ef37fda2a22344bf312eea848cc953f916e6f26ddd466",
+    "TSM_1d.csv": "5e5acc937d4535811eee441274fcc1b0daa31a83291630cf28d2032afc553761",
+    "TSM_30m.csv": "6587f339b011623d3a28277b6c40c2c6cc94b5a71bd2b2d3cc4104848357130d"
+  }
+}

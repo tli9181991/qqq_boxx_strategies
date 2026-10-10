@@ -99,6 +99,19 @@ KNOWN_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "TAVILY_API_KEY",
               DISABLE_CHAT_VAR,
               DISABLE_NEWS_ANALYSIS_VAR, DISABLE_NEWS_READ_VAR)
 
+# The trading agent (qbs/trading_agent) reads its settings through this same
+# `.env`. Listed here so they are not reported as typos; the authoritative
+# list is `qbs.trading_agent.config.ENV_VARS` (a test keeps the two equal).
+TRADING_AGENT_KEYS = ("QBS_AGENT_CONFIG", "QBS_AGENT_ENABLED", "QBS_AGENT_EXECUTION_MODE",
+                      "QBS_AGENT_INTERVAL_MINUTES", "QBS_AGENT_PROVIDER", "QBS_AGENT_MODEL",
+                      "QBS_AGENT_TEMPERATURE", "QBS_AGENT_MAX_OUTPUT_TOKENS",
+                      "QBS_AGENT_TIMEOUT_S", "QBS_AGENT_MAX_RETRIES", "QBS_AGENT_DATA_DELAY_S",
+                      "QBS_AGENT_DECISION_HISTORY", "QBS_AGENT_DB",
+                      "QBS_AGENT_LOG_FULL_PROMPTS", "QBS_AGENT_PRICING_FILE",
+                      "QBS_AGENT_EXTRA_HOLIDAYS", "QBS_AGENT_EXTRA_EARLY_CLOSES",
+                      "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+KNOWN_KEYS = KNOWN_KEYS + TRADING_AGENT_KEYS
+
 # Values that mean "switch is off, carry on". Everything else non-empty
 # disables -- see `chat_disabled` for why this is not `_env_bool`.
 OFF_VALUES = ("0", "false", "no", "off", "none", "disabled")
