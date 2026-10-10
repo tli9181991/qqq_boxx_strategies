@@ -5160,3 +5160,45 @@ def test_swing_screens_use_real_bars_for_atr_when_given():
     assert Ctx(c, "X", ohlc).real_bars
     assert Ctx(c, "X", ohlc).a == pytest.approx(10, abs=1.5)
     assert Ctx(c, "X").a < 2
+
+
+# --------------------------------------------------------------------------
+# Rank logs for the residual book and the screen
+# --------------------------------------------------------------------------
+
+def _rank_fixture():
+    from qbs.universe import synthetic_universe
+    px = synthetic_prices()
+    uni = synthetic_universe(n=40, start="2023-01-01").reindex(px.index).ffill()
+    return uni, px
+
+
+def test_residual_book_records_its_ranking_on_request():
+    from qbs.strategies import residual_momentum
+    uni, px = _rank_fixture()
+    p = ResidualMomentumParams(min_history=200, beta_window=120)
+    plain = residual_momentum(uni, px[SAFE_ASSET], px["QQQ"], p)
+    logged = residual_momentum(uni, px[SAFE_ASSET], px["QQQ"], p, record_ranks=10)
+    assert plain.rank_log is None, "off by default -- the backtest pays nothing"
+    pd.testing.assert_frame_equal(plain.weights, logged.weights)
+    dt = logged.weights.index[-1]
+    top = [t for t, _, _ in logged.rank_log[dt]]
+    assert 0 < len(top) <= 10 and [r for _, r, _ in logged.rank_log[dt]] == list(range(1, len(top) + 1))
+    # The band keeps a held name until it falls past exit_rank (10 here), so
+    # every holding is inside the logged top 10.
+    assert set(logged.holdings_log[dt]) <= set(top)
+
+
+def test_screen_records_its_ordering_on_request():
+    from qbs.screens import finviz_momentum_screen
+    uni, px = _rank_fixture()
+    p = FinvizScreenParams(n_hold=5, min_volume=None)
+    plain = finviz_momentum_screen(uni, px[SAFE_ASSET], p)
+    logged = finviz_momentum_screen(uni, px[SAFE_ASSET], p, record_ranks=8)
+    assert plain.rank_log is None
+    pd.testing.assert_frame_equal(plain.weights, logged.weights)
+    days = [d for d, v in logged.rank_log.items() if v]
+    assert days, "the fixture must have days with names passing the screen"
+    for d in days[-5:]:
+        ranks = [r for _, r, _ in logged.rank_log[d]]
+        assert ranks == list(range(1, len(ranks) + 1)) and len(ranks) <= 8

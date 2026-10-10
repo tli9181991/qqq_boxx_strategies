@@ -841,8 +841,12 @@ def residual_momentum(
     eligible: Optional[pd.DataFrame] = None,
     name: str = "resmom",
     stop: Optional[StopLossParams] = None,
+    record_ranks: int = 0,
 ) -> StrategySignals:
     """The Top-N book, ranked on residual rather than total momentum.
+
+    `record_ranks` keeps the top N of each day's residual ranking in
+    `rank_log`, exactly as `cross_sectional_momentum` does.
 
     Same six slots, same hysteresis band, same absolute filter against BOXX,
     same cash leg -- the ONLY thing that changes is what the ranking sorts on.
@@ -875,7 +879,7 @@ def residual_momentum(
     )
     sig = cross_sectional_momentum(
         universe_prices, safe_prices, mp, eligible=eligible, name=name,
-        score=score, stop=stop, market=market,
+        score=score, stop=stop, market=market, record_ranks=record_ranks,
     )
     extra = {k: sig.params[k] for k in ("stop", "n_stops") if k in sig.params}
     sig.params = {**p.__dict__, **extra}

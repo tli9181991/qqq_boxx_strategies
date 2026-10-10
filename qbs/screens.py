@@ -285,8 +285,13 @@ def finviz_momentum_screen(
     params: Optional[FinvizScreenParams] = None,
     volumes: Optional[pd.DataFrame] = None,
     name: str = "finviz",
+    record_ranks: int = 0,
 ) -> StrategySignals:
     """Roll the Finviz screen forward and hold its top `n_hold` names.
+
+    `record_ranks` keeps the top N of each rebalance day's ordering -- names
+    passing the screen, by RS rank -- in `rank_log` as `(ticker, rank,
+    one-year return)`, the same shape `cross_sectional_momentum` records.
 
     Parameters
     ----------
@@ -407,6 +412,7 @@ def finviz_momentum_screen(
     events: List[Dict] = []
     holdings_log: Dict[pd.Timestamp, List[str]] = {}
     held_ranks: Dict[pd.Timestamp, Dict[str, float]] = {}
+    rank_log: Dict[pd.Timestamp, List[tuple]] = {}
     n_passing: Dict[pd.Timestamp, float] = {}
     last_n_passing = np.nan
 
@@ -460,6 +466,9 @@ def finviz_momentum_screen(
                     ))
             held = target
             held_ranks[dt] = {t: float(rank.get(t, np.nan)) for t in held}
+            if record_ranks:
+                rank_log[dt] = [(t, int(rank[t]), float(cand[t]))
+                                for t in order.index[:record_ranks]]
         else:
             # Carried forward, not recomputed: on a non-rebalance day the screen
             # was not evaluated, so the last count is the only honest answer.
@@ -492,6 +501,7 @@ def finviz_momentum_screen(
     sig.holding = pd.Series({d: ",".join(v) for d, v in holdings_log.items()})
     sig.holdings_log = holdings_log
     sig.held_ranks = held_ranks
+    sig.rank_log = rank_log or None
     sig.momentum = perf
     sig.params["volume_filter_applied"] = volume_filter_applied
     sig.params["market_cap_filter_applied"] = False

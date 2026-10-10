@@ -337,10 +337,14 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
     # whole point of the strategy, and it is also why the two columns can be
     # read side by side: anything they disagree about is the market component
     # of the ranking, and nothing else.
+    # Each book records the top of its own ranking for the picks tab: the
+    # residual book down to its exit rank (the names it would keep), the
+    # screen down to its slot count.
     res = residual_momentum(
         _uni, _safe, _market,
         ResidualMomentumParams(n_hold=n_resid,
-                               exit_rank=n_resid + RESID_BAND))
+                               exit_rank=n_resid + RESID_BAND),
+        record_ranks=n_resid + RESID_BAND)
 
     vols = load_universe_volumes(list(_uni.columns))
     volume_applied = vols is not None and not vols.empty
@@ -349,7 +353,8 @@ def build_selections(_uni: pd.DataFrame, _safe: pd.Series, _market: pd.Series,
         vols = vols.reindex(index=_uni.index).ffill()
     else:
         vols, screen = None, FinvizScreenParams(n_hold=n_screen, min_volume=None)
-    fin = finviz_momentum_screen(_uni, _safe, screen, volumes=vols)
+    fin = finviz_momentum_screen(_uni, _safe, screen, volumes=vols,
+                                 record_ranks=n_screen)
 
     for key, sig in (("momentum", mom), ("resmom", res), ("finviz", fin)):
         ev = sig.events
@@ -1744,11 +1749,11 @@ with tab_picks:
                     f"quarterly gain > {p_scr.min_quarter_return:.0%} · "
                     + vol_note))
             top = ([t for t in str(row.get("top", "")).split(", ") if t]
-                   if key == "momentum" and row is not None else [])
+                   if row is not None else [])
             if top:
-                # The ranking's top 10, the held names marked. A held name
-                # the band kept below the top 10 is added under them, so the
-                # book is always fully listed.
+                # The top of the book's own ranking, the held names marked. A
+                # held name the band kept below that list is added under it,
+                # so the book is always fully listed.
                 held_rank = dict(zip(names, [
                     x for x in str(row.get("ranks", "")).split(", ")] + [""] * len(names)))
                 extra = [t for t in names if t not in top]
@@ -1766,9 +1771,12 @@ with tab_picks:
                     .format({"Close": "{:,.2f}"}, na_rep="—"),
                     hide_index=True, width="stretch",
                     height=min(460, 38 + 35 * len(tf)))
+                slots = {"momentum": n_hold, "resmom": n_resid,
+                         "finviz": n_screen}[key]
                 st.caption(f"Top {len(top)} of the ranking · ✅ = held "
-                           f"({len(names)} of {int(n_hold)} slots) · Close = "
-                           f"last daily close on {asof:%Y-%m-%d}")
+                           f"({len(names)} of {int(slots)} slots) · Close = "
+                           f"last daily close on {asof:%Y-%m-%d}"
+                           + ("" if names else " · nothing held — fully in cash"))
             elif names:
                 st.dataframe(
                     pd.DataFrame({"Ticker": names,
