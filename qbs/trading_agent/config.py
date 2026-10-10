@@ -117,6 +117,12 @@ class AgentConfig:
                         f"{self.execution_mode!r}; no order execution exists")
         if self.provider not in PROVIDERS:
             errs.append(f"provider must be one of {PROVIDERS}, got {self.provider!r}")
+        else:
+            from .llm import resolve_model
+
+            if not resolve_model(self.provider, self.model):
+                errs.append(f"provider {self.provider!r} has no default model; set "
+                            f"model (QBS_AGENT_MODEL)")
         if (self.analysis_interval_minutes < 15
                 or self.analysis_interval_minutes % 15):
             errs.append("analysis_interval_minutes must be a multiple of 15 "
@@ -225,6 +231,42 @@ def load_config(path: Optional[str] = None,
     return cfg
 
 
+# Fields whose default is None but which hold a number when set.
+_OPTIONAL_FLOAT = {"temperature"}
+
+
+def _set_checked(cfg: AgentConfig, target: Any, name: str, value: Any, label: str) -> bool:
+    """Assign a file value only if it has the field's declared type.
+
+    JSON from a hand-edited file is not trusted: "false" is a truthy string,
+    "60" makes a later comparison raise. A wrong type is recorded as an error
+    and the default stays -- and since every safety default here is the
+    disabled position, a bad value can only switch something OFF.
+    """
+    current = getattr(target, name)
+    ok = False
+    if name in _OPTIONAL_FLOAT:
+        ok = value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+        value = None if value is None else (float(value) if ok else value)
+    elif isinstance(current, bool):
+        ok = isinstance(value, bool)
+    elif isinstance(current, int):
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif isinstance(current, float):
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        value = float(value) if ok else value
+    elif isinstance(current, str):
+        ok = isinstance(value, str)
+    elif isinstance(current, list):
+        ok = isinstance(value, list) and all(isinstance(x, str) for x in value)
+    if ok:
+        setattr(target, name, value)
+    else:
+        cfg.sources[f"error:{label}"] = (f"expected {type(current).__name__}, got "
+                                         f"{type(value).__name__} {value!r}; ignored")
+    return ok
+
+
 def _apply_file(cfg: AgentConfig, raw: Dict[str, Any], path: str) -> None:
     if not isinstance(raw, dict):
         raise TypeError("the config file must hold a JSON object")
@@ -236,13 +278,13 @@ def _apply_file(cfg: AgentConfig, raw: Dict[str, Any], path: str) -> None:
             flat = {**{k: v for k, v in value.items() if k != "history"}, **history}
             for k, v in flat.items():
                 if k in mc_names:
-                    setattr(cfg.market_context, k, v)
+                    _set_checked(cfg, cfg.market_context, k, v, f"market_context.{k}")
                 else:
                     cfg.sources[f"error:market_context.{k}"] = "unknown key, ignored"
             cfg.sources["market_context"] = f"file {path}"
         elif key in names:
-            setattr(cfg, key, value)
-            cfg.sources[key] = f"file {path}"
+            if _set_checked(cfg, cfg, key, value, key):
+                cfg.sources[key] = f"file {path}"
         elif not key.startswith("_"):
             cfg.sources[f"error:{key}"] = "unknown key, ignored"
     if not isinstance(cfg.agent_enabled, bool):

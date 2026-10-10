@@ -80,6 +80,9 @@ class DecisionContext:
     authorized: Sequence[str]
     candle_ts: datetime
     no_short: bool = False
+    # Shorting is forbidden unless the prompt EXPLICITLY allows it. Silence
+    # is not permission.
+    allow_short: bool = False
     max_quantity: Optional[int] = None
     no_add: bool = False
     position_qty: Optional[float] = None     # None = unknown
@@ -236,9 +239,9 @@ def validate_decision(payload: Any, ctx: DecisionContext) -> ValidationResult:
     elif action == "SELL":
         if not qty:
             comp.append("SELL needs a suggested_quantity of at least 1")
-        if ctx.no_short and not pos:
-            comp.append("SELL without a known long position is a short sale, "
-                        "and the prompt says no short selling")
+        if not pos and not ctx.allow_short:
+            comp.append("SELL without a known long position is a short sale, and "
+                        "the prompt does not explicitly allow short selling")
         if pos is not None and qty and pos > 0 and qty > pos:
             comp.append(f"SELL of {qty} shares exceeds the {int(pos)}-share position")
     elif action == "ADJUST_STOP_LOSS":

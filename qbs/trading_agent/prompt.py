@@ -74,6 +74,9 @@ class ParsedPrompt:
     general: str
     no_short: bool
     constraints: Dict[str, SymbolConstraints]
+    # Only an explicit sentence ("Short selling is allowed") sets this, and
+    # never alongside a "no short selling" line.
+    allow_short: bool = False
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
@@ -205,9 +208,14 @@ def parse_prompt(text: str, session_date: Optional[date] = None) -> ParsedPrompt
     low = text.lower()
     no_short = bool(re.search(r"no\s+short(ing|\s+selling)?|(do not|don't|never)\s+"
                               r"(recommend\s+)?short", low))
+    allow_short = (not no_short and bool(re.search(
+        r"short(ing|\s+selling)?\s+(is\s+)?(allowed|permitted|ok)|(may|can)\s+short|"
+        r"allow(ed)?\s+(to\s+)?short", low)) and not re.search(
+        r"short(ing|\s+selling)?\s+(is\s+)?not\s+(allowed|permitted)", low))
     sec_text = {s: "\n".join(v) for s, v in sections.items()}
     constraints = {s: _constraints(sec_text.get(s, "")) for s in symbols}
     return ParsedPrompt(text=text, sha256=sha256(text), prompt_date=prompt_date,
                         symbols=symbols, sections=sec_text,
                         general="\n".join(general), no_short=no_short,
+                        allow_short=allow_short,
                         constraints=constraints, errors=errors, warnings=warnings)

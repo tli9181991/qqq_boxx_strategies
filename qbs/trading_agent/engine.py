@@ -309,7 +309,7 @@ class TradingAgentEngine:
 
         portfolio = self._portfolio(symbol)
         pos = portfolio.get("quantity") if portfolio else None
-        constraints = {"authorized_symbols": prompt.symbols, "no_short": prompt.no_short,
+        constraints = {"authorized_symbols": prompt.symbols, "no_short": not prompt.allow_short,
                        "max_position_shares": c.max_quantity if c else None,
                        "no_adding": c.no_add if c else False,
                        "reference_stop": c.reference_stop if c else None}
@@ -341,7 +341,7 @@ class TradingAgentEngine:
         else:
             vr = parse_and_validate(resp.text, DecisionContext(
                 symbol=symbol, authorized=prompt.symbols, candle_ts=candle_ts,
-                no_short=prompt.no_short, max_quantity=c.max_quantity if c else None,
+                no_short=prompt.no_short, allow_short=prompt.allow_short, max_quantity=c.max_quantity if c else None,
                 no_add=c.no_add if c else False, position_qty=pos,
                 last_price=snap.last_price))
             status = vr.status

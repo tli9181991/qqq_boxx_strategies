@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Union
@@ -299,11 +300,17 @@ def call_with_retries(provider, system: str, user: str, settings: LLMSettings,
     """Call with a hard wall-clock timeout and bounded, backed-off retries.
 
     The timeout is enforced here as well as by the SDK, because an SDK
-    timeout covers one socket read and a stalled stream can outlast it. A
-    timed-out worker thread is abandoned, not awaited. Only transient errors
-    (timeouts, rate limits, 5xx, connection) are retried; a bad key or a bad
-    model name fails at once. `should_continue` is checked before each retry
-    so a stop request is honoured between attempts.
+    timeout covers one socket read and a stalled stream can outlast it.
+
+    **A timeout is never retried.** Python cannot cancel a running thread, so
+    a request that outlived the wall clock may still be in flight -- and may
+    still complete and be billed. Retrying it would run a second paid request
+    concurrently with the first. The abandoned worker is a daemon thread, so
+    it cannot hold up process shutdown either. Other transient errors (rate
+    limits, 5xx, connection) came back from the provider, so nothing is in
+    flight and they are retried with backoff; a bad key or a bad model name
+    fails at once. `should_continue` is checked before each retry so a stop
+    request is honoured between attempts.
     """
     t0 = time.perf_counter()
     timeouts = 0
@@ -311,22 +318,32 @@ def call_with_retries(provider, system: str, user: str, settings: LLMSettings,
     last: Optional[str] = None
     for attempt in range(max_retries + 1):
         attempts += 1
-        pool = cf.ThreadPoolExecutor(max_workers=1)
-        fut = pool.submit(provider.complete, system, user, settings)
-        try:
-            resp = fut.result(timeout=settings.timeout_s)
-            pool.shutdown(wait=False)
-            return CallResult(resp, attempts, attempts - 1, timeouts,
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def work() -> None:
+            try:
+                box["resp"] = provider.complete(system, user, settings)
+            except BaseException as e:  # noqa: BLE001 -- handed to the caller
+                box["exc"] = e
+            finally:
+                done.set()
+
+        threading.Thread(target=work, name="llm-request", daemon=True).start()
+        if not done.wait(settings.timeout_s):
+            timeouts += 1
+            last = (f"TimeoutError: no response within {settings.timeout_s}s; not "
+                    f"retried, the request may still be in flight")
+            break
+        if "resp" in box:
+            return CallResult(box["resp"], attempts, attempts - 1, timeouts,
                               (time.perf_counter() - t0) * 1000)
-        except BaseException as exc:  # noqa: BLE001 -- classified below
-            pool.shutdown(wait=False, cancel_futures=True)
-            if isinstance(exc, cf.TimeoutError):
-                exc = TimeoutError(f"no response within {settings.timeout_s}s")
-            if is_timeout(exc):
-                timeouts += 1
-            last = f"{type(exc).__name__}: {exc}"
-            if not is_retryable(exc) or attempt == max_retries or not should_continue():
-                break
-            sleep(backoff_s * (2 ** attempt))
+        exc = box["exc"]
+        if is_timeout(exc):
+            timeouts += 1
+        last = f"{type(exc).__name__}: {exc}"
+        if not is_retryable(exc) or attempt == max_retries or not should_continue():
+            break
+        sleep(backoff_s * (2 ** attempt))
     return CallResult(None, attempts, attempts - 1, timeouts,
                       (time.perf_counter() - t0) * 1000, last)

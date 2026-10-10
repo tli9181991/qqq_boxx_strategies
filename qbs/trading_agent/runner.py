@@ -100,9 +100,18 @@ def run_session(cfg: AgentConfig, provider=None, data_provider=None, portfolio=N
             _, close = session_bounds(session.session_date, cfg.extra_holidays,
                                       cfg.extra_early_closes)
             due = due_slot(now, **kw)
-            if now >= close and next_slot(now, **kw) is None and (due is None or due in done):
+            # At the close the session ends. The one exception is the closing
+            # candle itself, when configured, and only while RUNNING: a paused
+            # session, or a slot left over from before the pause, must never
+            # keep the runner alive (and its heartbeat blocking another one)
+            # or be analysed after the bell.
+            closing = close if cfg.include_closing_candle else None
+            if now >= close and not (closing is not None and session.state == RUNNING
+                                     and closing not in done):
                 end_reason = "end of regular session"
                 break
+            if now >= close and due != closing:
+                due = None
             if session.state == RUNNING:
                 note = session.adopt_new_prompt()
                 if note:

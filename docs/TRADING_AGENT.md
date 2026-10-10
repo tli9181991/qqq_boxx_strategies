@@ -131,7 +131,8 @@ outside the model:
   ignored, never added. At most 10 symbols.
 - **Hard constraints**: `No short selling`, `Maximum suggested position: 4 shares`,
   `Do not recommend adding`, `existing 9-share position`, `Reference stop loss: $196`,
-  and every `$price` as a key level.
+  and every `$price` as a key level. Short selling is **forbidden unless the prompt
+  explicitly allows it** ("Short selling is allowed"); saying nothing is not permission.
 - A `Date: YYYY-MM-DD` line must match the session date; yesterday's prompt is refused.
 
 Each stock's request carries only its own section plus the `General:` section (the full
@@ -231,8 +232,8 @@ not); no missing or extra keys; enums; confidence in [0, 1]; positive finite pri
 nonnegative integer quantity; the timestamp equals the analysed candle; the symbol is the
 one requested **and** authorized; BUY needs entry, a stop below it and a quantity, and
 respects "no adding" and the maximum position; SELL needs a quantity, never exceeds a
-known position and is a forbidden short sale without a known long under "no short
-selling"; HOLD / NO_TRADE / ADJUST_STOP_LOSS carry no quantity. A price more than 15%
+known position, and without a known long position is a short sale — rejected unless the
+prompt explicitly allows shorting; HOLD / NO_TRADE / ADJUST_STOP_LOSS carry no quantity. A price more than 15%
 from the last trade is accepted but flagged (an evaluation metric for unsupported
 levels). Anything failing is logged as `INVALID_SCHEMA` or `INVALID_COMPLIANCE` and never
 becomes an accepted decision.
@@ -247,8 +248,13 @@ becomes an accepted decision.
 | `mock` | — | — | scripted, for tests and rehearsals |
 
 The provider SDK's own retries are off; `llm.call_with_retries` enforces a wall-clock
-timeout and retries only transient errors (timeouts, rate limits, 5xx, connection) with
-exponential backoff. A bad key or model fails at once. If a model rejects a temperature,
+timeout and retries only transient errors that came back from the provider (rate limits,
+5xx, connection) with exponential backoff. **A timeout is never retried**: the timed-out
+request cannot be cancelled and may still complete and be billed, so a retry would pay
+twice. A bad key or model fails at once. A provider with no default model (OpenAI) is an
+invalid configuration until `QBS_AGENT_MODEL` is set, so it fails before the day's
+authorization is consumed. Values in the JSON config file must have the field's type
+(`false`, not `"false"`); a mistyped value is reported and the default kept. If a model rejects a temperature,
 set `QBS_AGENT_TEMPERATURE=none`.
 
 ## Logging and observability

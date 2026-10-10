@@ -435,12 +435,16 @@ def test_duplicate_analysis_is_prevented(cfg):
 # 12. Timeouts and retries
 # --------------------------------------------------------------------------
 
-def test_timeout_is_retried_then_reported():
+def test_timeout_is_reported_and_never_retried():
+    # A timed-out request may still be in flight (threads cannot be killed),
+    # so a retry would run a second paid request concurrently with it.
     slow = MockProvider(delay_s=0.3)
     res = call_with_retries(slow, "s", "u", LLMSettings("m", timeout_s=0.05),
-                            max_retries=1, backoff_s=0, sleep=lambda s: None)
-    assert res.response is None and res.timeout_events == 2 and res.retries == 1
-    assert "TimeoutError" in res.error
+                            max_retries=3, backoff_s=0, sleep=lambda s: None)
+    assert res.response is None and res.timeout_events == 1 and res.retries == 0
+    assert len(slow.calls) == 1 and "TimeoutError" in res.error
+    worker = [t for t in threading.enumerate() if t.name == "llm-request"]
+    assert all(t.daemon for t in worker)       # cannot hold up shutdown
 
 
 class RateLimitError(Exception):
@@ -748,3 +752,78 @@ def test_env_loader_knows_every_agent_variable():
     assert set(ENV_VARS) | {"QBS_AGENT_CONFIG"} <= set(env.TRADING_AGENT_KEYS)
     assert {k for k in env.TRADING_AGENT_KEYS if k.startswith("QBS_AGENT")} == \
         set(ENV_VARS) | {"QBS_AGENT_CONFIG"}
+
+
+# --------------------------------------------------------------------------
+# Review fixes (PR #43)
+# --------------------------------------------------------------------------
+
+def test_paused_session_still_ends_at_the_close(cfg):
+    """Paused after 15:30 with 15:45 never analysed: the runner must still
+    stop at 16:00, not idle (and heartbeat) forever or analyse 15:45 late."""
+    ready(cfg)
+    clock = Clock(et(15, 31))
+    llm = MockProvider([echo()])
+
+    def pause_once(system, user):
+        sid = ss.open_session(cfg)["session_id"]
+        ss.request_state(cfg, sid, ss.PAUSED)
+        return echo()(system, user)
+
+    llm = MockProvider([pause_once])
+    sess = run_session(cfg, llm, FakeBars(clock), clock=clock, sleep=clock.sleep,
+                       install_signals=False)
+    assert sess.state == ss.STOPPED and clock() < et(16, 1)
+    assert not any(et(15, 45).isoformat() in c["user"] for c in llm.calls)
+    row = store.one(cfg.db_path, "SELECT close_reason FROM sessions")
+    assert "end of regular session" in row["close_reason"]
+
+
+def test_closing_candle_runs_once_when_configured(cfg):
+    ready(cfg)
+    cfg.include_closing_candle = True
+    cfg.data_delay_seconds = 30
+    clock = Clock(et(15, 50))
+    llm = MockProvider([echo()])
+    sess = run_session(cfg, llm, FakeBars(clock), clock=clock, sleep=clock.sleep,
+                       install_signals=False)
+    assert sess.state == ss.STOPPED
+    assert sum(et(16, 0).isoformat() in c["user"] for c in llm.calls) == 3
+
+
+def test_sell_without_a_long_needs_explicit_short_permission():
+    silent = ctx(no_short=False)                 # the prompt says nothing about shorts
+    v = validate_decision(payload(action="SELL", suggested_quantity=2), silent)
+    assert not v.ok and any("does not explicitly allow" in e for e in v.errors)
+    allowed = ctx(no_short=False, allow_short=True)
+    assert validate_decision(payload(action="SELL", suggested_quantity=2), allowed).ok
+    assert parse_prompt("Monitor only TEAM.\nShort selling is allowed.").allow_short
+    assert not parse_prompt("Monitor only TEAM.").allow_short
+    assert not parse_prompt("Monitor only TEAM.\nShort selling is not allowed.").allow_short
+    assert not parse_prompt("Monitor only TEAM.\nNo short selling allowed.").allow_short
+
+
+def test_config_file_values_are_type_checked(tmp_path):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"agent_enabled": "true", "log_full_prompts": "false",
+                             "request_timeout_s": "60", "max_retries": 1.5,
+                             "temperature": None, "extra_holidays": ["2026-12-31"],
+                             "market_context": {"history": {"candles_15m": "32"}}}))
+    c = load_config(path=str(p), environ={})
+    assert c.agent_enabled is False and c.log_full_prompts is False
+    assert c.request_timeout_s == 60.0 and c.max_retries == 2      # defaults kept
+    assert c.temperature is None and c.extra_holidays == ["2026-12-31"]
+    assert c.market_context.candles_15m == 32
+    errs = {k for k in c.sources if k.startswith("error:")}
+    assert {"error:agent_enabled", "error:log_full_prompts", "error:request_timeout_s",
+            "error:max_retries", "error:market_context.candles_15m"} <= errs
+    assert c.validate() == []                    # no TypeError, still usable
+
+
+def test_provider_without_a_default_model_is_invalid(cfg):
+    cfg.provider, cfg.model = "openai", ""
+    assert any("no default model" in e for e in cfg.validate())
+    ss.save_daily_prompt(cfg, PROMPT, et(9, 0))
+    assert not ss.authorize(cfg, et(9, 0))[0]
+    cfg.model = "some-model"
+    assert cfg.validate() == []
